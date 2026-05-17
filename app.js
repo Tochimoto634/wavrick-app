@@ -341,7 +341,21 @@ function normalizeOAuthParentOrigin(origin) {
   return raw;
 }
 
-function buildYoutubeOAuthStartUrl(channelKey, parentOrigin) {
+/** 本番 https://wavrick.com/wavrick/ などサブフォルダ配置向け */
+function getWavrickAppBase() {
+  const origin = normalizeOAuthParentOrigin(window.location.origin);
+  if (!origin) return "";
+  let path = window.location.pathname || "/";
+  if (path.endsWith("/")) path = path.slice(0, -1);
+  else {
+    const last = path.split("/").pop() || "";
+    if (last.includes(".")) path = path.slice(0, path.lastIndexOf("/"));
+  }
+  if (!path || path === "/") return origin;
+  return `${origin}${path}`;
+}
+
+function buildYoutubeOAuthStartUrl(channelKey, parentBase) {
   const cfg = getStoredSupabaseConfig();
   if (!cfg?.supabaseUrl) return "";
   const base = String(cfg.supabaseUrl).replace(/\/+$/, "");
@@ -349,7 +363,7 @@ function buildYoutubeOAuthStartUrl(channelKey, parentOrigin) {
   u.searchParams.set("channel_key_b64", channelKeyToBase64(channelKey));
   u.searchParams.set(
     "parent_origin",
-    normalizeOAuthParentOrigin(parentOrigin || window.location.origin)
+    parentBase || getWavrickAppBase() || normalizeOAuthParentOrigin(window.location.origin)
   );
   // ブラウザの window.open では Authorization ヘッダを付けられないため（anon は公開前提）
   if (cfg.supabaseAnonKey) {
@@ -1369,16 +1383,16 @@ function bindYtForm() {
         );
         return;
       }
-      const parentOrigin = window.location.origin || "";
-      if (!parentOrigin || parentOrigin === "null") {
+      const parentBase = getWavrickAppBase();
+      if (!parentBase || parentBase === "null") {
         setMessage(
           "ytMessage",
-          "このページの origin が取得できません。http(s) のローカルサーバまたは本番URLで開いてください（file:// では利用できません）。",
+          "このページの URL が取得できません。http(s) のローカルサーバまたは本番URLで開いてください（file:// では利用できません）。",
           "err"
         );
         return;
       }
-      const startUrl = buildYoutubeOAuthStartUrl(key, parentOrigin);
+      const startUrl = buildYoutubeOAuthStartUrl(key, parentBase);
       if (!startUrl) {
         setMessage("ytMessage", "Supabase URL を取得できませんでした。", "err");
         return;

@@ -1,0 +1,11 @@
+本番URL（固定）: https://wavrick.com/wavrick/
+
+Google OAuth「承認済みの JavaScript 生成元」に追加:
+  https://wavrick.com
+
+Google OAuth「承認済みのリダイレクト URI」（既存のまま）:
+  https://gdolqgcftxqxaacjyqla.supabase.co/functions/v1/youtube-oauth-callback
+
+Supabase Edge（parent_origin のサブパス対応後）:
+  supabase functions deploy youtube-oauth-start
+  supabase functions deploy youtube-oauth-callback

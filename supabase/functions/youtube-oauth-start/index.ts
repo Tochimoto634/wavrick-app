@@ -4,13 +4,16 @@ import { signOAuthState } from "../_shared/oauth-state.ts";
 
 const SCOPES = "https://www.googleapis.com/auth/youtube.readonly";
 
+/** origin のみ、または /wavrick のようなサブパス付きベース URL */
 function validateParentOrigin(raw: string): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   try {
     const u = new URL(trimmed);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-    return u.origin;
+    let path = u.pathname.replace(/\/+$/, "");
+    if (!path || path === "/") return u.origin;
+    return `${u.origin}${path}`;
   } catch {
     return null;
   }
@@ -37,7 +40,10 @@ Deno.serve(async (req) => {
     return new Response("Query channel_key is required.", { status: 400 });
   }
   if (!parentOrigin) {
-    return new Response("Query parent_origin must be a valid http(s) URL origin.", { status: 400 });
+    return new Response(
+      "Query parent_origin must be a valid http(s) URL (origin or app base path).",
+      { status: 400 }
+    );
   }
 
   const exp = Date.now() + 15 * 60 * 1000;
