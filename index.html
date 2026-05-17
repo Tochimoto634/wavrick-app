@@ -12,7 +12,7 @@
   <nav>
     <a class="logo" href="#" data-go="home">WAVRICK</a>
     <ul>
-      <li><a href="#how">仕組み</a></li>
+      <li><a href="#how" data-scroll-how>仕組み</a></li>
       <li><a href="#" data-go="talents">声優一覧</a></li>
       <li><a href="#" data-go="voice">声優登録</a></li>
       <li><a href="#" data-go="login">ログイン</a></li>
@@ -294,6 +294,12 @@
       </article>
     </div>
 
+    <div class="admin-tabs" role="tablist" aria-label="管理メニュー">
+      <button type="button" class="admin-tab active" data-admin-tab="requests" role="tab" aria-selected="true">依頼</button>
+      <button type="button" class="admin-tab" data-admin-tab="customers" role="tab" aria-selected="false">YouTuber</button>
+      <button type="button" class="admin-tab" data-admin-tab="voices" role="tab" aria-selected="false">声優</button>
+    </div>
+
     <div class="form-card admin-tools">
       <div class="field-row">
         <div class="field">
@@ -316,18 +322,20 @@
       <p id="adminMessage" class="message"></p>
     </div>
 
-    <div class="form-card admin-table-card">
-      <h3>依頼一覧</h3>
+    <div class="form-card admin-table-card admin-panel active" data-admin-panel="requests">
+      <div class="admin-panel-head">
+        <h3>依頼一覧</h3>
+        <p class="section-desc" id="adminRequestsCount">0 件</p>
+      </div>
       <div class="admin-table-wrap">
-        <table class="admin-table">
+        <table class="admin-table admin-table-readable">
           <thead>
             <tr>
               <th>日時</th>
-              <th>名前</th>
-              <th>メール</th>
-              <th>動画URL</th>
-              <th>選択声優</th>
-              <th>データ元</th>
+              <th>依頼者</th>
+              <th>動画</th>
+              <th>声優</th>
+              <th>元</th>
             </tr>
           </thead>
           <tbody id="adminRequestsBody"></tbody>
@@ -335,17 +343,19 @@
       </div>
     </div>
 
-    <div class="form-card admin-table-card">
-      <h3>YouTuber登録一覧</h3>
-      <p class="section-desc">依頼した海外YouTuberのみ。声優は下の一覧に表示されます。</p>
+    <div class="form-card admin-table-card admin-panel" data-admin-panel="customers" hidden>
+      <div class="admin-panel-head">
+        <h3>YouTuber 登録一覧</h3>
+        <p class="section-desc" id="adminCustomersCount">0 件</p>
+      </div>
       <div class="admin-table-wrap">
-        <table class="admin-table">
+        <table class="admin-table admin-table-readable">
           <thead>
             <tr>
-              <th>メール</th>
               <th>名前</th>
-              <th>チャンネルURL</th>
-              <th>データ元</th>
+              <th>メール</th>
+              <th>チャンネル</th>
+              <th>元</th>
             </tr>
           </thead>
           <tbody id="adminCustomersBody"></tbody>
@@ -353,17 +363,21 @@
       </div>
     </div>
 
-    <div class="form-card admin-table-card">
-      <h3>声優登録一覧</h3>
+    <div class="form-card admin-table-card admin-panel" data-admin-panel="voices" hidden>
+      <div class="admin-panel-head">
+        <h3>声優登録一覧</h3>
+        <p class="section-desc" id="adminVoicesCount">0 件</p>
+      </div>
       <div class="admin-table-wrap">
-        <table class="admin-table">
+        <table class="admin-table admin-table-readable">
           <thead>
             <tr>
+              <th></th>
               <th>活動名</th>
               <th>メール</th>
               <th>ジャンル</th>
               <th>単価</th>
-              <th>データ元</th>
+              <th>元</th>
             </tr>
           </thead>
           <tbody id="adminVoicesBody"></tbody>
@@ -425,6 +439,18 @@
         <input id="voiceJobCount" name="jobCount" type="number" min="0" placeholder="例：35">
       </div>
       <div class="field">
+        <label for="voiceAvatarFile">プロフィールアイコン（任意）</label>
+        <div class="avatar-picker">
+          <div id="voiceAvatarPreview" class="talent-avatar talent-avatar-preview" aria-hidden="true">🎤</div>
+          <div class="avatar-picker-actions">
+            <input id="voiceAvatarFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+            <button id="voiceAvatarClearBtn" class="btn-ghost" type="button">アイコンを削除</button>
+          </div>
+        </div>
+        <p class="field-hint">JPG / PNG / WebP（2MBまで）。声優一覧・依頼時の選択画面に表示されます。</p>
+        <input id="voiceAvatarUrl" name="avatarUrl" type="hidden" value="">
+      </div>
+      <div class="field">
         <label for="voiceSampleUrl">音声サンプルURL *</label>
         <input id="voiceSampleUrl" name="sampleUrl" type="url" placeholder="https://..." required>
       </div>
@@ -466,16 +492,13 @@
         <input id="ytPassword" name="password" type="password" placeholder="空欄でも依頼は送信できます">
       </div>
       <div class="field">
-        <label for="ytChannelUrl">YouTubeチャンネルURL *</label>
-        <input id="ytChannelUrl" name="channelUrl" type="url" placeholder="https://youtube.com/@yourchannel" required>
+        <label for="ytChannelUrl">あなたの YouTube チャンネル URL *</label>
+        <input id="ytChannelUrl" name="channelUrl" type="url" placeholder="https://www.youtube.com/@yourchannel" required>
+        <p class="field-hint">本人確認（Google）と同じチャンネル URL を入力してください。</p>
       </div>
       <div class="field">
-        <label for="ytVideoUrl">翻訳したい動画URL *</label>
-        <input id="ytVideoUrl" name="videoUrl" type="url" placeholder="https://youtube.com/watch?v=..." required>
-      </div>
-      <div class="field">
-        <label for="ytVideoChannelUrl">その動画のチャンネルURL *</label>
-        <input id="ytVideoChannelUrl" name="videoChannelUrl" type="url" placeholder="https://youtube.com/@channelname" required>
+        <label for="ytVideoUrl">翻訳したい動画 URL *</label>
+        <input id="ytVideoUrl" name="videoUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." required>
       </div>
       <div class="field">
         <label for="ytTone">希望トーン</label>
@@ -510,7 +533,13 @@
         <div id="castSelfBox" class="cast-box">
           <p class="cast-subtitle">選んだ声優：</p>
           <div class="selected-talent-card">
-            <p id="selectedTalentName" class="selected-talent-name">未選択</p>
+            <div class="selected-talent-row">
+              <div id="selectedTalentAvatar" class="talent-avatar">🎤</div>
+              <div>
+                <p id="selectedTalentName" class="selected-talent-name">未選択</p>
+                <p id="selectedTalentMeta" class="selected-talent-meta">声優一覧から選択してください</p>
+              </div>
+            </div>
             <div class="hero-actions" style="margin-top:0.7rem">
               <button id="chooseTalentBtn" class="btn-ghost" type="button">声優一覧で選ぶ</button>
             </div>
@@ -595,6 +624,6 @@
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="./app.js?v=oauth-b64-6" charset="UTF-8"></script>
+  <script src="./app.js?v=ui-2026-05-1" charset="UTF-8"></script>
 </body>
 </html>

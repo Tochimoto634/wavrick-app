@@ -4,6 +4,7 @@ const pageMap = {
   yt: "page-yt",
   talents: "page-talents",
   login: "page-login",
+  work: "page-work",
   admin: "page-admin"
 };
 
@@ -184,6 +185,10 @@ function showPage(name) {
   if (name === "work") {
     hydrateRemoteWorkData().then(() => {
       window.dispatchEvent(new Event("wavrick-workdata-updated"));
+      const session = getCurrentSession();
+      if (!session) {
+        setMessage("workMessage", "案件管理を使うには、先にログインしてください。", "err");
+      }
     });
   }
   window.scrollTo({ top: 0, behavior: "smooth" });
@@ -195,6 +200,17 @@ function bindNavigation() {
       event.preventDefault();
       const target = node.getAttribute("data-go");
       showPage(target);
+    });
+  });
+
+  document.querySelectorAll('nav a[href="#how"]').forEach((node) => {
+    node.addEventListener("click", (event) => {
+      event.preventDefault();
+      showPage("home");
+      window.setTimeout(() => {
+        const section = document.getElementById("how");
+        if (section) section.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 80);
     });
   });
 }
@@ -472,7 +488,8 @@ function mapVoiceProfileToRemote(data) {
     genres: data.genres || "",
     ratefrom: data.rateFrom ? Number(data.rateFrom) : null,
     jobcount: data.jobCount ? Number(data.jobCount) : null,
-    sampleurl: data.sampleUrl || ""
+    sampleurl: data.sampleUrl || "",
+    avatarurl: data.avatarUrl || ""
   };
 }
 
@@ -486,7 +503,8 @@ function mapVoiceProfileFromRemote(row) {
     genres: row.genres || "",
     rateFrom: row.ratefrom ?? "",
     jobCount: row.jobcount ?? "",
-    sampleUrl: row.sampleurl || ""
+    sampleUrl: row.sampleurl || "",
+    avatarUrl: row.avatarurl || row.avatarUrl || ""
   };
 }
 
@@ -613,6 +631,113 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/`/g, "&#096;");
+}
+
+const MAX_VOICE_AVATAR_BYTES = 2 * 1024 * 1024;
+
+function getTalentAvatarSrc(profile) {
+  if (!profile) return "";
+  return profile.avatarUrl || profile.avatarurl || profile.avatar || "";
+}
+
+function isImageAvatarSrc(src) {
+  return Boolean(src && (String(src).startsWith("data:image/") || /^https?:\/\//i.test(String(src))));
+}
+
+function renderTalentAvatarHtml(profile, className = "talent-avatar", elementId = "") {
+  const idAttr = elementId ? ` id="${escapeAttr(elementId)}"` : "";
+  const src = getTalentAvatarSrc(profile);
+  if (isImageAvatarSrc(src)) {
+    return `<div class="${className} talent-avatar-img-wrap"${idAttr}><img class="talent-avatar-img" src="${escapeAttr(src)}" alt="" loading="lazy"></div>`;
+  }
+  const emoji = src || "🎤";
+  return `<div class="${className} talent-avatar-emoji"${idAttr}>${escapeHtml(emoji)}</div>`;
+}
+
+function truncateText(text, max = 48) {
+  const s = String(text || "");
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}…`;
+}
+
+function updateSelectedTalentUi(payload) {
+  const nameEl = document.getElementById("selectedTalentName");
+  const metaEl = document.getElementById("selectedTalentMeta");
+  const avatarEl = document.getElementById("selectedTalentAvatar");
+  if (!nameEl) return;
+
+  if (!payload || !payload.talentId) {
+    nameEl.textContent = "未選択";
+    if (metaEl) metaEl.textContent = "声優一覧から選択してください";
+    if (avatarEl) avatarEl.outerHTML = renderTalentAvatarHtml({}, "talent-avatar", "selectedTalentAvatar");
+    return;
+  }
+
+  nameEl.textContent = payload.displayName || "未選択";
+  if (metaEl) {
+    const rate = payload.rateFrom ? `¥${Number(payload.rateFrom).toLocaleString()}/分〜` : "料金未設定";
+    const jobs =
+      payload.jobCount !== undefined && payload.jobCount !== null && payload.jobCount !== ""
+        ? `経験 ${Number(payload.jobCount)}件`
+        : "経験 未入力";
+    metaEl.textContent = `${rate} / ${jobs}`;
+  }
+  if (avatarEl) {
+    avatarEl.outerHTML = renderTalentAvatarHtml(payload, "talent-avatar", "selectedTalentAvatar");
+  }
+}
+
+function bindVoiceAvatarPicker() {
+  const fileInput = document.getElementById("voiceAvatarFile");
+  const hidden = document.getElementById("voiceAvatarUrl");
+  const previewHost = document.getElementById("voiceAvatarPreview");
+  const clearBtn = document.getElementById("voiceAvatarClearBtn");
+  if (!fileInput || !hidden || !previewHost) return;
+
+  const setPreview = (src) => {
+    hidden.value = src || "";
+    previewHost.outerHTML = renderTalentAvatarHtml(
+      { avatarUrl: src },
+      "talent-avatar talent-avatar-preview",
+      "voiceAvatarPreview"
+    );
+  };
+
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setMessage("voiceMessage", "画像ファイル（JPG / PNG / WebP など）を選んでください。", "err");
+      fileInput.value = "";
+      return;
+    }
+    if (file.size > MAX_VOICE_AVATAR_BYTES) {
+      setMessage("voiceMessage", "アイコンは 2MB 以下の画像にしてください。", "err");
+      fileInput.value = "";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      setPreview(result);
+      setMessage("voiceMessage", "アイコンを設定しました。", "ok");
+    };
+    reader.onerror = () => {
+      setMessage("voiceMessage", "アイコンの読み込みに失敗しました。", "err");
+    };
+    reader.readAsDataURL(file);
+  });
+
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      fileInput.value = "";
+      setPreview("");
+    });
+  }
 }
 
 function formatDateTime(value) {
@@ -743,7 +868,7 @@ function createTalentCard(profile, withButton = false) {
   return `
     <article class="talent-card">
       <div class="talent-top">
-        <div class="talent-avatar">${profile.avatar || "🎤"}</div>
+        ${renderTalentAvatarHtml(profile)}
         <div>
           <p class="talent-name">${name}</p>
           <p class="talent-meta">${meta}</p>
@@ -834,15 +959,15 @@ function bindTalentPageInteractions() {
       displayName: selected.displayName,
       rateFrom: selected.rateFrom || null,
       jobCount: selected.jobCount || null,
-      genres: selected.genres || ""
+      genres: selected.genres || "",
+      avatarUrl: getTalentAvatarSrc(selected)
     };
     localStorage.setItem("wavrick_selected_talent", JSON.stringify(payload));
 
     // Default to "self select" mode on the yt page.
     const ytRadioSelf = document.querySelector('#ytForm input[name="castMode"][value="self"]');
     if (ytRadioSelf) ytRadioSelf.checked = true;
-    const selectedTalentName = document.getElementById("selectedTalentName");
-    if (selectedTalentName) selectedTalentName.textContent = payload.displayName || "未選択";
+    updateSelectedTalentUi(payload);
 
     showPage("yt");
   });
@@ -851,6 +976,7 @@ function bindTalentPageInteractions() {
 function bindVoiceForm() {
   const form = document.getElementById("voiceForm");
   if (!form) return;
+  bindVoiceAvatarPicker();
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1326,7 +1452,8 @@ function bindYtForm() {
       setMessage("ytMessage", "メールアドレスの形式を確認してください。", "err");
       return;
     }
-    if (!isYouTubeUrl(data.channelUrl) || !isYouTubeUrl(data.videoUrl) || !isYouTubeUrl(data.videoChannelUrl)) {
+    data.videoChannelUrl = data.channelUrl;
+    if (!isYouTubeUrl(data.channelUrl) || !isYouTubeUrl(data.videoUrl)) {
       setMessage("ytMessage", "YouTube URLの形式を確認してください。", "err");
       return;
     }
@@ -1340,19 +1467,15 @@ function bindYtForm() {
     }
 
     const requestChannelKey = normalizeYoutubeChannelKey(data.channelUrl);
-    const videoChannelKey = normalizeYoutubeChannelKey(data.videoChannelUrl);
-    if (!requestChannelKey || !videoChannelKey) {
+    if (!requestChannelKey) {
       setMessage("ytMessage", "チャンネルURLは /@name や /channel/ID 形式で入力してください。", "err");
       return;
     }
     const channelOk =
-      (channelKeysMatch(verifyState.verifiedChannelKey, requestChannelKey) &&
-        channelKeysMatch(verifyState.verifiedChannelKey, videoChannelKey)) ||
+      channelKeysMatch(verifyState.verifiedChannelKey, requestChannelKey) ||
       (verifyState.verifiedChannelId &&
         requestChannelKey.startsWith("channel:") &&
-        videoChannelKey.startsWith("channel:") &&
-        requestChannelKey.slice(8).toLowerCase() === verifyState.verifiedChannelId.toLowerCase() &&
-        videoChannelKey.slice(8).toLowerCase() === verifyState.verifiedChannelId.toLowerCase());
+        requestChannelKey.slice(8).toLowerCase() === verifyState.verifiedChannelId.toLowerCase());
     if (!channelOk) {
       setMessage("ytMessage", "認証済みチャンネルと入力チャンネルが一致しません。URLを確認してください。", "err");
       return;
@@ -1472,9 +1595,8 @@ function bindYtForm() {
 
   function loadSelectedTalentIntoUi() {
     const stored = JSON.parse(localStorage.getItem("wavrick_selected_talent") || "null");
-    if (!stored || !selectedTalentNameEl) return;
-    selectedTalentNameEl.textContent = stored.displayName || "未選択";
-    if (ytRadioSelf) ytRadioSelf.checked = true;
+    updateSelectedTalentUi(stored);
+    if (stored && ytRadioSelf) ytRadioSelf.checked = true;
     refreshCastUi();
   }
 
@@ -1508,18 +1630,17 @@ function bindYtForm() {
     const best = candidates[0].p;
     const tid = getTalentId(best);
 
-    localStorage.setItem(
-      "wavrick_selected_talent",
-      JSON.stringify({
-        talentId: tid,
-        displayName: best.displayName,
-        rateFrom: best.rateFrom || null,
-        jobCount: best.jobCount || null,
-        genres: best.genres || ""
-      })
-    );
+    const recommendPayload = {
+      talentId: tid,
+      displayName: best.displayName,
+      rateFrom: best.rateFrom || null,
+      jobCount: best.jobCount || null,
+      genres: best.genres || "",
+      avatarUrl: getTalentAvatarSrc(best)
+    };
+    localStorage.setItem("wavrick_selected_talent", JSON.stringify(recommendPayload));
 
-    if (selectedTalentNameEl) selectedTalentNameEl.textContent = best.displayName || "未選択";
+    updateSelectedTalentUi(recommendPayload);
     if (recommendMessage) setMessage("recommendMessage", `おすすめしました：${best.displayName}`, "ok");
 
     if (ytRadioSelf) ytRadioSelf.checked = true;
@@ -1539,19 +1660,15 @@ function bindYtForm() {
       const demoHandle = "wavrick_demo";
       const demoChannelUrl = `https://www.youtube.com/@${demoHandle}`;
       const demoVideoUrl = `https://www.youtube.com/watch?v=dQw4w9WgXcQ`;
-      const demoVideoChannelUrl = `https://www.youtube.com/@${demoHandle}`;
 
       const ytNameEl = document.getElementById("ytName");
       const ytEmailEl = document.getElementById("ytEmail");
       const ytChannelUrlEl = document.getElementById("ytChannelUrl");
       const ytVideoUrlEl = document.getElementById("ytVideoUrl");
-      const ytVideoChannelUrlEl = document.getElementById("ytVideoChannelUrl");
-
       if (ytNameEl) ytNameEl.value = "デモ顧客";
       if (ytEmailEl) ytEmailEl.value = demoEmail;
       if (ytChannelUrlEl) ytChannelUrlEl.value = demoChannelUrl;
       if (ytVideoUrlEl) ytVideoUrlEl.value = demoVideoUrl;
-      if (ytVideoChannelUrlEl) ytVideoChannelUrlEl.value = demoVideoChannelUrl;
 
       const btnEmail = document.getElementById("verifyEmailBtn");
       const btnChannel = document.getElementById("verifyChannelBtn");
@@ -1636,6 +1753,7 @@ function buildAdminVoiceRows(voiceProfiles) {
       email: row.email,
       genres: row.genres || "",
       rateFrom: row.rateFrom || "",
+      avatarUrl: row.avatarUrl || "",
       createdAt: row.createdAt || "",
       source: row.source || "local"
     });
@@ -1661,18 +1779,101 @@ function matchesAdminFilters(row, keyword, sourceFilter) {
   return haystack.includes(keyword);
 }
 
-function renderAdminTableRows(targetId, rows, columns) {
-  const body = document.getElementById(targetId);
+function adminSourceBadge(source) {
+  const isRemote = source === "supabase";
+  const label = isRemote ? "Supabase" : "local";
+  return `<span class="admin-badge ${isRemote ? "badge-supabase" : "badge-local"}">${label}</span>`;
+}
+
+function adminLinkCell(url, label) {
+  const raw = String(url || "").trim();
+  if (!raw || raw === "-") return `<span class="admin-muted">-</span>`;
+  const safeUrl = escapeAttr(raw);
+  const text = escapeHtml(label || truncateText(raw, 42));
+  return `<a class="admin-link" href="${safeUrl}" target="_blank" rel="noreferrer">${text}</a>`;
+}
+
+function switchAdminTab(tabName) {
+  document.querySelectorAll("[data-admin-tab]").forEach((btn) => {
+    const active = btn.getAttribute("data-admin-tab") === tabName;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-admin-panel]").forEach((panel) => {
+    const show = panel.getAttribute("data-admin-panel") === tabName;
+    panel.classList.toggle("active", show);
+    if (show) panel.removeAttribute("hidden");
+    else panel.setAttribute("hidden", "");
+  });
+}
+
+function bindAdminTabs() {
+  document.querySelectorAll("[data-admin-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tab = btn.getAttribute("data-admin-tab");
+      if (tab) switchAdminTab(tab);
+    });
+  });
+}
+
+function renderAdminRequestsBody(rows) {
+  const body = document.getElementById("adminRequestsBody");
   if (!body) return;
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="${columns.length}" class="admin-empty">データがありません。</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" class="admin-empty">データがありません。</td></tr>`;
     return;
   }
   body.innerHTML = rows
     .map((row) => {
-      const tds = columns.map((key) => `<td>${escapeHtml(row[key]) || "-"}</td>`).join("");
-      return `<tr>${tds}</tr>`;
+      const who = `<div class="admin-cell-stack"><strong>${escapeHtml(row.name || "-")}</strong><span class="admin-muted">${escapeHtml(row.email || "-")}</span></div>`;
+      return `<tr>
+        <td class="admin-nowrap">${escapeHtml(row.createdAtText || "-")}</td>
+        <td>${who}</td>
+        <td>${adminLinkCell(row.videoUrl)}</td>
+        <td>${escapeHtml(row.selectedTalentName || "-")}</td>
+        <td>${adminSourceBadge(row.source)}</td>
+      </tr>`;
     })
+    .join("");
+}
+
+function renderAdminCustomersBody(rows) {
+  const body = document.getElementById("adminCustomersBody");
+  if (!body) return;
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="4" class="admin-empty">データがありません。</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows
+    .map(
+      (row) => `<tr>
+        <td><strong>${escapeHtml(row.name || "-")}</strong></td>
+        <td>${escapeHtml(row.email || "-")}</td>
+        <td>${adminLinkCell(row.channelUrl)}</td>
+        <td>${adminSourceBadge(row.source)}</td>
+      </tr>`
+    )
+    .join("");
+}
+
+function renderAdminVoicesBody(rows) {
+  const body = document.getElementById("adminVoicesBody");
+  if (!body) return;
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="6" class="admin-empty">データがありません。</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows
+    .map(
+      (row) => `<tr>
+        <td class="admin-avatar-col">${renderTalentAvatarHtml(row, "talent-avatar admin-table-avatar")}</td>
+        <td><strong>${escapeHtml(row.displayName || "-")}</strong></td>
+        <td>${escapeHtml(row.email || "-")}</td>
+        <td>${escapeHtml(truncateText(row.genres || "-", 36))}</td>
+        <td class="admin-nowrap">${escapeHtml(row.rateText || "-")}</td>
+        <td>${adminSourceBadge(row.source)}</td>
+      </tr>`
+    )
     .join("");
 }
 
@@ -1706,40 +1907,42 @@ function renderAdminDashboard() {
   if (statCustomers) statCustomers.textContent = String(filteredYoutubers.length);
   if (statVoices) statVoices.textContent = String(filteredVoices.length);
 
-  renderAdminTableRows(
-    "adminRequestsBody",
+  const countRequests = document.getElementById("adminRequestsCount");
+  const countCustomers = document.getElementById("adminCustomersCount");
+  const countVoices = document.getElementById("adminVoicesCount");
+  if (countRequests) countRequests.textContent = `${filteredRequests.length} 件`;
+  if (countCustomers) countCustomers.textContent = `${filteredYoutubers.length} 件`;
+  if (countVoices) countVoices.textContent = `${filteredVoices.length} 件`;
+
+  renderAdminRequestsBody(
     filteredRequests.map((row) => ({
       createdAtText: formatDateTime(row.createdAt),
       name: row.name || "-",
       email: row.email || "-",
       videoUrl: row.videoUrl || "-",
       selectedTalentName: row.selectedTalentName || "-",
-      source: row.source === "supabase" ? "Supabase" : "localStorage"
-    })),
-    ["createdAtText", "name", "email", "videoUrl", "selectedTalentName", "source"]
+      source: row.source || "local"
+    }))
   );
 
-  renderAdminTableRows(
-    "adminCustomersBody",
+  renderAdminCustomersBody(
     filteredYoutubers.map((row) => ({
       email: row.email || "-",
       name: row.name || "-",
       channelUrl: row.channelUrl || "-",
-      source: row.source === "supabase" ? "Supabase" : "localStorage"
-    })),
-    ["email", "name", "channelUrl", "source"]
+      source: row.source || "local"
+    }))
   );
 
-  renderAdminTableRows(
-    "adminVoicesBody",
+  renderAdminVoicesBody(
     filteredVoices.map((row) => ({
       displayName: row.displayName || "-",
       email: row.email || "-",
       genres: row.genres || "-",
       rateText: row.rateFrom ? `¥${Number(row.rateFrom).toLocaleString()}/分〜` : "-",
-      source: row.source === "supabase" ? "Supabase" : "localStorage"
-    })),
-    ["displayName", "email", "genres", "rateText", "source"]
+      avatarUrl: row.avatarUrl || "",
+      source: row.source || "local"
+    }))
   );
 }
 
@@ -1776,6 +1979,7 @@ async function loadAdminData() {
       email: row.email || "",
       genres: row.genres || "",
       rateFrom: row.rateFrom || "",
+      avatarUrl: row.avatarUrl || "",
       role: "voice",
       createdAt: row.createdAt || ""
     })),
@@ -1841,6 +2045,8 @@ function bindAdminDashboard() {
   const searchInput = document.getElementById("adminSearchInput");
   const sourceFilter = document.getElementById("adminSourceFilter");
   if (!refreshBtn || !exportBtn || !searchInput || !sourceFilter) return;
+
+  bindAdminTabs();
 
   refreshBtn.addEventListener("click", async () => {
     await loadAdminData();
