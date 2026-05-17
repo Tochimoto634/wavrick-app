@@ -1,0 +1,5 @@
+# Hostinger（Apache）向け: 日本語の文字化け防止
+AddDefaultCharset UTF-8
+<IfModule mod_mime.c>
+  AddCharset UTF-8 .html .css .js .json .svg
+</IfModule>
