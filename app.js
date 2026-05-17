@@ -1087,6 +1087,17 @@ function bindVoiceForm() {
   }
 }
 
+function formatMediaPipelineErrorMessage(raw) {
+  const m = String(raw || "");
+  if (/trycloudflare|dns error|lookup address|Name or service not known|音声プロキシ.*トンネル/i.test(m)) {
+    return (
+      "YouTube音声の取得用トンネルが切れています。Macで wavrick-app を開き、ターミナルで ./scripts/cursor-ai-setup.sh を実行してから、もう一度お試しください。" +
+      "（台本生成を使う間は、Mac上で音声プロキシとトンネルを起動したままにしてください。）"
+    );
+  }
+  return m;
+}
+
 async function invokeMediaPipeline(body) {
   const { data, error } = await supabaseClient.functions.invoke("media-pipeline", { body });
   if (!error) return { data, error: null };
@@ -1171,13 +1182,19 @@ function bindMediaPipelineUi() {
       const { data, error } = await invokeMediaPipeline({ videoUrl });
 
       if (error && (!data || data.ok === undefined)) {
-        const hint =
-          " Edge Function `media-pipeline` のデプロイと secrets（OPENAI_API_KEY, XAI_API_KEY, YOUTUBE_AUDIO_PROXY_URL）を確認してください。手順: scripts/ai-pipeline-setup.sh";
-        setMessage("ytMessage", `パイプライン失敗: ${error.message}${hint}`, "err");
+        setMessage(
+          "ytMessage",
+          formatMediaPipelineErrorMessage(error.message) || "パイプラインに失敗しました。",
+          "err"
+        );
         return;
       }
       if (data && data.ok === false) {
-        setMessage("ytMessage", data.error || "パイプラインに失敗しました。", "err");
+        setMessage(
+          "ytMessage",
+          formatMediaPipelineErrorMessage(data.error) || "パイプラインに失敗しました。",
+          "err"
+        );
         return;
       }
       if (!data || !data.ok) {

@@ -72,11 +72,22 @@ async function fetchAudioFromProxy(videoUrl: string): Promise<Uint8Array> {
   const secret = Deno.env.get("YOUTUBE_AUDIO_PROXY_SECRET");
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (secret) headers.Authorization = `Bearer ${secret}`;
-  const r = await fetch(proxyUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ videoUrl })
-  });
+  let r: Response;
+  try {
+    r = await fetch(proxyUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ videoUrl })
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/dns|lookup|trycloudflare|Name or service not known/i.test(msg)) {
+      throw new Error(
+        "YouTube音声プロキシ（Cloudflareトンネル）に接続できません。URLが期限切れの可能性があります。開発PCで ./scripts/cursor-ai-setup.sh を実行し、Supabase の YOUTUBE_AUDIO_PROXY_URL を更新してください。"
+      );
+    }
+    throw new Error(`音声プロキシへの接続に失敗しました: ${msg}`);
+  }
   if (!r.ok) {
     const t = await r.text();
     throw new Error(`音声プロキシが失敗しました (${r.status}): ${t.slice(0, 500)}`);
