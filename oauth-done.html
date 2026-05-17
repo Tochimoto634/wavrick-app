@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WAVRICK — 認証完了</title>
+  <style>
+    body {
+      font-family: "DM Sans", "Noto Sans JP", sans-serif;
+      margin: 2.5rem 1.5rem;
+      color: #1a1a1a;
+      line-height: 1.6;
+      max-width: 28rem;
+    }
+    h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 0.75rem; }
+    p { margin: 0; }
+  </style>
+</head>
+<body>
+  <h1 id="title">認証処理中…</h1>
+  <p id="status">しばらくお待ちください。このウィンドウは自動で閉じます。</p>
+  <script charset="UTF-8">
+    (function () {
+      var storageKey = "wavrick_yt_oauth_v1";
+
+      function readToken() {
+        var q = new URLSearchParams(location.search);
+        var fromQuery = q.get("r");
+        if (fromQuery) return fromQuery;
+        var hash = (location.hash || "").replace(/^#/, "");
+        return hash || "";
+      }
+
+      function decodePayload(token) {
+        var b64 = token.replace(/-/g, "+").replace(/_/g, "/");
+        while (b64.length % 4) b64 += "=";
+        return JSON.parse(atob(b64));
+      }
+
+      var token = readToken();
+      if (!token) {
+        document.getElementById("title").textContent = "認証結果を取得できません";
+        document.getElementById("status").textContent =
+          "このウィンドウを閉じて、http://127.0.0.1:8889 の依頼フォームからやり直してください。";
+        return;
+      }
+
+      var data;
+      try {
+        data = decodePayload(token);
+      } catch (e) {
+        document.getElementById("title").textContent = "認証結果の読み取りに失敗";
+        document.getElementById("status").textContent = "やり直してください。";
+        return;
+      }
+
+      if (!data || data.type !== "WAVRICK_YT_OAUTH") return;
+
+      if (data.ok) {
+        document.getElementById("title").textContent = "チャンネル所有の確認が完了しました";
+        var sub = "依頼フォームに戻ります。";
+        if (data.channelId) sub += "（チャンネル ID: " + data.channelId + "）";
+        document.getElementById("status").textContent = sub;
+      } else {
+        document.getElementById("title").textContent = "チャンネル所有の確認に失敗しました";
+        document.getElementById("status").textContent =
+          "このウィンドウを閉じて、依頼フォームで内容を確認してください。";
+      }
+
+      try {
+        sessionStorage.setItem(storageKey, JSON.stringify({ data: data, ts: Date.now() }));
+      } catch (e) {}
+
+      if (window.opener && !window.opener.closed) {
+        try {
+          window.opener.postMessage(data, window.location.origin);
+        } catch (e) {}
+      }
+
+      setTimeout(function () {
+        window.close();
+      }, 800);
+    })();
+  </script>
+</body>
+</html>

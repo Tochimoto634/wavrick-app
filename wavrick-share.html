@@ -1,0 +1,1479 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WAVRICK - MVP</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <style>
+:root {
+  --black: #0b0b0d;
+  --dark: #15161a;
+  --card: #1d1f25;
+  --line: rgba(255, 255, 255, 0.12);
+  --white: #fff;
+  --body: rgba(255, 255, 255, 0.76);
+  --dim: rgba(255, 255, 255, 0.55);
+  --red: #e03e30;
+  --blue: #4d9fff;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: "DM Sans", "Noto Sans JP", sans-serif;
+  background:
+    radial-gradient(circle at 85% -5%, rgba(224, 62, 48, 0.18), transparent 35%),
+    radial-gradient(circle at 10% 0%, rgba(77, 159, 255, 0.12), transparent 30%),
+    var(--black);
+  color: var(--white);
+  line-height: 1.6;
+}
+
+nav {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  height: 62px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 1.5rem;
+  border-bottom: 1px solid var(--line);
+  background: rgba(10, 10, 10, 0.9);
+  backdrop-filter: blur(16px);
+}
+
+.logo {
+  color: var(--white);
+  text-decoration: none;
+  letter-spacing: 0.15em;
+  font-family: "Bebas Neue", sans-serif;
+  font-size: 1.5rem;
+}
+
+nav ul { list-style: none; display: flex; gap: 1.1rem; align-items: center; }
+nav a { color: var(--body); text-decoration: none; font-size: 0.95rem; }
+.nav-btn {
+  background: linear-gradient(135deg, #ef4b3e, #d8392c);
+  color: #fff;
+  padding: 0.6rem 1rem;
+  border-radius: 10px;
+  font-weight: 700;
+}
+
+.page { display: none; }
+.page.active { display: block; }
+
+.hero {
+  min-height: calc(100vh - 62px);
+  padding: 4rem 1.5rem 3rem;
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.hero-badge {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.3rem 0.9rem;
+  color: var(--dim);
+  font-size: 0.85rem;
+  margin-bottom: 1.1rem;
+}
+
+.hero h1 {
+  font-family: "Bebas Neue", sans-serif;
+  font-size: clamp(2.8rem, 8vw, 6.4rem);
+  line-height: 0.9;
+  letter-spacing: 0.04em;
+}
+.hero h1 span { color: var(--red); }
+.hero-desc { color: var(--body); max-width: 42ch; margin-top: 1rem; }
+.hero-actions { margin-top: 1.8rem; display: flex; flex-wrap: wrap; gap: 0.9rem; }
+
+.quick-points {
+  margin-top: 2rem;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+.qp-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.qp-card strong { font-size: 0.95rem; }
+.qp-card span { font-size: 0.83rem; color: var(--dim); }
+
+.btn-red, .btn-ghost {
+  border: none;
+  border-radius: 12px;
+  padding: 1rem 1.5rem;
+  cursor: pointer;
+  font-weight: 700;
+  font-family: inherit;
+  font-size: 1.02rem;
+  min-height: 52px;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.btn-red {
+  background: linear-gradient(135deg, #f14f41, #d8392c);
+  color: #fff;
+  box-shadow: 0 10px 26px rgba(224, 62, 48, 0.28);
+}
+.btn-red:hover { transform: translateY(-1px); }
+.btn-ghost {
+  background: rgba(255, 255, 255, 0.03);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.btn-ghost:hover {
+  border-color: rgba(255, 255, 255, 0.5);
+  transform: translateY(-1px);
+}
+.full { width: 100%; }
+
+.section {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 2.6rem 1.5rem 4rem;
+}
+.section h2 { font-family: "Bebas Neue", sans-serif; font-size: 2.5rem; letter-spacing: 0.04em; }
+.dark { background: var(--dark); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.section-desc { color: var(--dim); margin-top: 0.2rem; }
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: end;
+  margin-bottom: 1rem;
+}
+
+.grid2 {
+  margin-top: 1rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+.card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.015));
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  padding: 1.35rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+.card h3 { margin-bottom: 0.7rem; }
+.card li { margin-left: 1.2rem; color: var(--body); }
+
+.talent-slider-wrap {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.talent-slider-track {
+  display: flex;
+  gap: 0.9rem;
+  width: max-content;
+  padding: 1rem;
+  animation: slideTalents 28s linear infinite;
+}
+
+.talent-slider-wrap:hover .talent-slider-track { animation-play-state: paused; }
+
+.talent-card {
+  min-width: 250px;
+  max-width: 250px;
+  border-radius: 14px;
+  padding: 1rem;
+  background: #171920;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+.talent-top { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.55rem; }
+.talent-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  background: linear-gradient(135deg, #f14f41, #4d9fff);
+}
+.talent-name { font-weight: 700; }
+.talent-meta { color: var(--dim); font-size: 0.83rem; }
+.talent-bio { color: var(--body); font-size: 0.86rem; min-height: 2.8em; }
+.talent-tags { margin-top: 0.7rem; display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.talent-tag {
+  font-size: 0.74rem;
+  color: #d9e7ff;
+  border: 1px solid rgba(77, 159, 255, 0.45);
+  border-radius: 999px;
+  padding: 0.18rem 0.55rem;
+}
+
+.talent-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+.talent-grid .talent-card { min-width: 0; max-width: none; }
+.talent-cta {
+  margin-top: 0.75rem;
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.04);
+  color: #fff;
+  border-radius: 10px;
+  padding: 0.6rem 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.talent-cta:hover { border-color: rgba(77, 159, 255, 0.7); }
+
+@keyframes slideTalents {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+.form-page {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+}
+
+.form-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1.1rem;
+}
+.form-subtitle {
+  color: var(--dim);
+  margin: 0 0 1rem;
+  font-size: 0.95rem;
+}
+.back-btn {
+  border: 1px solid rgba(77, 159, 255, 0.45);
+  background: rgba(77, 159, 255, 0.08);
+  color: var(--blue);
+  border-radius: 10px;
+  padding: 0.6rem 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.form-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 1.4rem;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
+}
+
+.login-session {
+  margin-top: 1rem;
+}
+.login-session h3 {
+  margin-bottom: 0.35rem;
+}
+
+.verify-box {
+  border: 1px solid rgba(77, 159, 255, 0.35);
+  background: rgba(77, 159, 255, 0.08);
+  border-radius: 14px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+.verify-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.8rem;
+}
+.verify-head h3 {
+  font-size: 1rem;
+}
+.verify-badge {
+  font-size: 0.8rem;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 0.25rem 0.7rem;
+  border: 1px solid rgba(255, 139, 139, 0.6);
+  color: #ff8b8b;
+}
+.verify-badge.done {
+  border-color: rgba(110, 231, 168, 0.8);
+  color: #6ee7a8;
+}
+.verify-note {
+  color: var(--body);
+  font-size: 0.88rem;
+  margin: 0.45rem 0 0.7rem;
+}
+.verify-steps {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.55rem;
+}
+.verify-step-btn {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.03);
+  color: #fff;
+  cursor: pointer;
+  text-align: left;
+  font-weight: 600;
+  padding: 0.72rem 0.85rem;
+}
+.verify-step-btn.done {
+  border-color: rgba(110, 231, 168, 0.7);
+  background: rgba(110, 231, 168, 0.12);
+}
+
+.cast-mode-box {
+  margin: 1rem 0 0.6rem;
+  border: 1px solid rgba(77, 159, 255, 0.35);
+  background: rgba(77, 159, 255, 0.06);
+  border-radius: 14px;
+  padding: 1rem;
+}
+.cast-mode-title {
+  font-size: 1rem;
+  margin-bottom: 0.7rem;
+}
+.cast-mode-radios {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.5rem;
+  margin-bottom: 0.8rem;
+}
+.cast-radio {
+  display: flex;
+  gap: 0.65rem;
+  align-items: center;
+  font-weight: 700;
+}
+.cast-subtitle {
+  color: var(--dim);
+  font-weight: 700;
+  margin-bottom: 0.6rem;
+  font-size: 0.92rem;
+}
+.cast-box {
+  margin-top: 0.2rem;
+}
+.selected-talent-card {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 12px;
+  padding: 0.85rem;
+}
+.selected-talent-name {
+  font-weight: 900;
+  font-size: 1.02rem;
+  margin-bottom: 0.1rem;
+}
+
+.talent-filter {
+  margin-bottom: 1rem;
+  border: 1px solid rgba(77, 159, 255, 0.35);
+  background: rgba(77, 159, 255, 0.06);
+  border-radius: 14px;
+  padding: 1rem;
+}
+.filter-title {
+  font-weight: 900;
+  margin-bottom: 0.7rem;
+}
+.talent-filter input, .talent-filter select {
+  width: 100%;
+}
+
+.field { margin-bottom: 0.9rem; }
+.field label { display: block; font-size: 0.92rem; color: var(--body); margin-bottom: 0.4rem; font-weight: 600; }
+.field input, .field textarea, .field select {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #111319;
+  color: #fff;
+  padding: 0.88rem 0.92rem;
+  font-family: inherit;
+  font-size: 0.98rem;
+}
+.field input:focus, .field textarea:focus, .field select:focus {
+  outline: none;
+  border-color: rgba(77, 159, 255, 0.8);
+  box-shadow: 0 0 0 4px rgba(77, 159, 255, 0.16);
+}
+.field textarea { min-height: 94px; resize: vertical; }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; }
+
+.ai-status {
+  border: 1px solid rgba(77, 159, 255, 0.4);
+  border-radius: 10px;
+  padding: 0.8rem;
+  margin-bottom: 0.8rem;
+  background: rgba(77, 159, 255, 0.08);
+}
+
+.message { min-height: 1.4em; margin-top: 0.55rem; color: var(--dim); font-size: 0.9rem; }
+.message.ok { color: #6ee7a8; }
+.message.err { color: #ff8b8b; }
+.hidden { display: none; }
+.btn-red:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+footer {
+  border-top: 1px solid var(--line);
+  padding: 1rem 1.5rem 1.6rem;
+  color: var(--dim);
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.86rem;
+}
+
+@media (max-width: 760px) {
+  nav ul { display: none; }
+  .grid2, .field-row, .quick-points { grid-template-columns: 1fr; }
+  .talent-grid { grid-template-columns: 1fr; }
+  .form-header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+  footer { flex-direction: column; }
+  .section-head { align-items: flex-start; flex-direction: column; }
+  .btn-red, .btn-ghost { width: 100%; }
+}
+  </style>
+</head>
+<body>
+  <nav>
+    <a class="logo" href="#" data-go="home">WAVRICK</a>
+    <ul>
+      <li><a href="#how">仕組み</a></li>
+      <li><a href="#" data-go="talents">声優一覧</a></li>
+      <li><a href="#" data-go="voice">声優登録</a></li>
+      <li><a href="#" data-go="login">ログイン</a></li>
+      <li><a href="#" class="nav-btn" data-go="yt">依頼する</a></li>
+    </ul>
+  </nav>
+
+  <main id="page-home" class="page active">
+    <section class="hero">
+      <p class="hero-badge">日本の声優 × 海外YouTuber</p>
+      <h1>YOUR VOICE.<br><span>JAPAN</span> AWAITS.</h1>
+      <p class="hero-desc">動画を日本語化したい海外クリエイターと、日本の声優をつなぐマッチングサービスです。<br>最短3分で依頼スタート、フォーム入力だけで進められます。</p>
+      <div class="hero-actions">
+        <button class="btn-red" data-go="yt">仕事を依頼する（YouTuber）</button>
+        <button class="btn-ghost" data-go="voice">声優として登録する</button>
+      </div>
+      <div class="quick-points">
+        <div class="qp-card"><strong>かんたん入力</strong><span>専門知識なしで使えるUI</span></div>
+        <div class="qp-card"><strong>AI下書き</strong><span>台本のたたき台を自動作成</span></div>
+        <div class="qp-card"><strong>安心導線</strong><span>迷わない2つの入口設計</span></div>
+      </div>
+    </section>
+
+    <section id="how" class="section dark">
+      <h2>かんたん4ステップ</h2>
+      <div class="grid2">
+        <article class="card">
+          <h3>YouTuber向け</h3>
+          <ol>
+            <li>アカウント登録</li>
+            <li>動画URL入力</li>
+            <li>AIで台本生成</li>
+            <li>声優マッチングと納品</li>
+          </ol>
+        </article>
+        <article class="card">
+          <h3>声優向け</h3>
+          <ol>
+            <li>プロフィール登録</li>
+            <li>サンプル音声提出</li>
+            <li>案件受注</li>
+            <li>納品して報酬受取</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>登録中の声優</h2>
+          <p class="section-desc">登録された声優情報が横に流れて表示されます。クリックで詳細一覧にも移動できます。</p>
+        </div>
+        <button class="btn-ghost" data-go="talents">声優一覧を見る</button>
+      </div>
+      <div class="talent-slider-wrap">
+        <div id="talentSliderTrack" class="talent-slider-track"></div>
+      </div>
+    </section>
+  </main>
+
+  <section id="page-talents" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>声優一覧（YouTuberが選択可能）</h2>
+    </div>
+    <p class="form-subtitle">仮の声優データを表示しています。登録フォームから追加した声優もここに表示されます。</p>
+    <div class="talent-filter">
+      <div class="filter-title">絞り込み（任意）</div>
+      <div class="field-row">
+        <div class="field">
+          <label for="filterBudgetMax">予算上限（円/分〜）</label>
+          <select id="filterBudgetMax">
+            <option value="">未設定</option>
+            <option value="5000">〜¥5,000</option>
+            <option value="8000">〜¥8,000</option>
+            <option value="12000">〜¥12,000</option>
+            <option value="20000">〜¥20,000</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="filterJobMin">件数下限</label>
+          <select id="filterJobMin">
+            <option value="">未設定</option>
+            <option value="10">10件以上</option>
+            <option value="30">30件以上</option>
+            <option value="50">50件以上</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="filterGenres">ジャンル（カンマ区切り）</label>
+        <input id="filterGenres" type="text" placeholder="例：旅行,教育">
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="applyTalentFilterBtn" class="btn-red" type="button">絞り込み適用</button>
+        <button id="resetTalentFilterBtn" class="btn-ghost" type="button">リセット</button>
+      </div>
+    </div>
+    <div id="talentGrid" class="talent-grid"></div>
+  </section>
+
+  <section id="page-login" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>ログイン</h2>
+    </div>
+    <p class="form-subtitle">登録済みの顧客・声優は、メールアドレスですぐログインできます。</p>
+    <form id="loginForm" class="form-card">
+      <div class="field">
+        <label for="loginRole">ログイン種別 *</label>
+        <select id="loginRole" name="role" required>
+          <option value="customer">顧客（海外YouTuber）</option>
+          <option value="voice">声優</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="loginEmail">メールアドレス *</label>
+        <input id="loginEmail" name="email" type="email" placeholder="you@example.com" required>
+      </div>
+      <button class="btn-red full" type="submit">ログインする</button>
+      <p id="loginMessage" class="message"></p>
+    </form>
+    <div id="loginSessionCard" class="form-card login-session hidden">
+      <h3>ログイン中</h3>
+      <p id="loginSessionText" class="section-desc"></p>
+      <div class="hero-actions">
+        <button id="loginJumpButton" class="btn-ghost" type="button">ページへ移動</button>
+        <button id="logoutButton" class="back-btn" type="button">ログアウト</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="page-voice" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>声優登録フォーム</h2>
+    </div>
+    <p class="form-subtitle">5分で入力できます。* は必須項目です。</p>
+    <form id="voiceForm" class="form-card">
+      <div class="field-row">
+        <div class="field">
+          <label for="voiceLastName">姓 *</label>
+          <input id="voiceLastName" name="lastName" type="text" required>
+        </div>
+        <div class="field">
+          <label for="voiceFirstName">名 *</label>
+          <input id="voiceFirstName" name="firstName" type="text" required>
+        </div>
+      </div>
+      <div class="field">
+        <label for="voiceDisplayName">活動名 *</label>
+        <input id="voiceDisplayName" name="displayName" type="text" required>
+      </div>
+      <div class="field">
+        <label for="voiceEmail">メール *</label>
+        <input id="voiceEmail" name="email" type="email" required>
+      </div>
+      <div class="field">
+        <label for="voiceBio">自己紹介 *</label>
+        <textarea id="voiceBio" name="bio" required></textarea>
+      </div>
+      <div class="field">
+        <label for="voiceGenres">得意ジャンル（カンマ区切り）</label>
+        <input id="voiceGenres" name="genres" type="text" placeholder="ゲーム実況, 教育, 旅行">
+      </div>
+      <div class="field">
+        <label for="voiceRateFrom">希望単価（円/分〜）任意</label>
+        <select id="voiceRateFrom" name="rateFrom">
+          <option value="">未設定</option>
+          <option value="3000">¥3,000〜</option>
+          <option value="5000">¥5,000〜</option>
+          <option value="8000" selected>¥8,000〜</option>
+          <option value="12000">¥12,000〜</option>
+          <option value="20000">¥20,000〜</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="voiceJobCount">これまでの依頼件数 任意</label>
+        <input id="voiceJobCount" name="jobCount" type="number" min="0" placeholder="例：35">
+      </div>
+      <div class="field">
+        <label for="voiceSampleUrl">音声サンプルURL *</label>
+        <input id="voiceSampleUrl" name="sampleUrl" type="url" placeholder="https://..." required>
+      </div>
+      <button class="btn-red full" type="submit">登録する</button>
+      <button id="voiceSkipButton" class="btn-ghost full" type="button">デモ入力で次へ（スキップ）</button>
+      <p id="voiceMessage" class="message"></p>
+    </form>
+  </section>
+
+  <section id="page-yt" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>YouTuber依頼フォーム</h2>
+    </div>
+    <p class="form-subtitle">動画URLを入れて、希望条件を選ぶだけで依頼できます。</p>
+    <form id="ytForm" class="form-card">
+      <div class="verify-box">
+        <div class="verify-head">
+          <h3>顧客本人確認（依頼前に必須）</h3>
+          <span id="verifyBadge" class="verify-badge">未完了</span>
+        </div>
+        <p class="verify-note">著作権保護のため、本人確認が完了するまで依頼は送信できません。</p>
+        <div class="verify-steps">
+          <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) メール認証を完了（デモ）</button>
+          <button id="verifyChannelBtn" class="verify-step-btn" type="button">2) チャンネル所有確認を完了（デモ）</button>
+          <button id="verifyIdBtn" class="verify-step-btn" type="button">3) 身分証確認を完了（デモ）</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="ytName">名前 *</label>
+        <input id="ytName" name="name" type="text" required>
+      </div>
+      <div class="field">
+        <label for="ytEmail">メール *</label>
+        <input id="ytEmail" name="email" type="email" required>
+      </div>
+      <div class="field">
+        <label for="ytChannelUrl">YouTubeチャンネルURL *</label>
+        <input id="ytChannelUrl" name="channelUrl" type="url" placeholder="https://youtube.com/@yourchannel" required>
+      </div>
+      <div class="field">
+        <label for="ytVideoUrl">翻訳したい動画URL *</label>
+        <input id="ytVideoUrl" name="videoUrl" type="url" placeholder="https://youtube.com/watch?v=..." required>
+      </div>
+      <div class="field">
+        <label for="ytVideoChannelUrl">その動画のチャンネルURL *</label>
+        <input id="ytVideoChannelUrl" name="videoChannelUrl" type="url" placeholder="https://youtube.com/@channelname" required>
+      </div>
+      <div class="field">
+        <label for="ytTone">希望トーン</label>
+        <select id="ytTone" name="tone">
+          <option value="明るく元気">明るく元気</option>
+          <option value="落ち着いた知的">落ち着いた知的</option>
+          <option value="エネルギッシュ">エネルギッシュ</option>
+          <option value="親しみやすい">親しみやすい</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="ytDeadline">希望納期</label>
+        <select id="ytDeadline" name="deadline">
+          <option value="72時間以内">72時間以内</option>
+          <option value="1週間以内" selected>1週間以内</option>
+          <option value="2週間以内">2週間以内</option>
+        </select>
+      </div>
+      <div class="cast-mode-box">
+        <h3 class="cast-mode-title">声優の選び方</h3>
+        <div class="cast-mode-radios">
+          <label class="cast-radio">
+            <input type="radio" name="castMode" value="self" checked>
+            自分で選ぶ
+          </label>
+          <label class="cast-radio">
+            <input type="radio" name="castMode" value="recommend">
+            ジャンルなどを絞って、こちらで斡旋
+          </label>
+        </div>
+
+        <div id="castSelfBox" class="cast-box">
+          <p class="cast-subtitle">選んだ声優：</p>
+          <div class="selected-talent-card">
+            <p id="selectedTalentName" class="selected-talent-name">未選択</p>
+            <div class="hero-actions" style="margin-top:0.7rem">
+              <button id="chooseTalentBtn" class="btn-ghost" type="button">声優一覧で選ぶ</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="castRecommendBox" class="cast-box hidden">
+          <p class="cast-subtitle">斡旋のための希望（任意）</p>
+          <div class="field">
+            <label for="recGenres">希望ジャンル（カンマ区切り）</label>
+            <input id="recGenres" name="recGenres" type="text" placeholder="例：旅行,教育">
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="recBudgetMax">予算上限（円/分〜）</label>
+              <select id="recBudgetMax" name="recBudgetMax">
+                <option value="">未設定</option>
+                <option value="5000">〜¥5,000</option>
+                <option value="8000" selected>〜¥8,000</option>
+                <option value="12000">〜¥12,000</option>
+                <option value="20000">〜¥20,000</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="recJobMin">件数下限（任意）</label>
+              <select id="recJobMin" name="recJobMin">
+                <option value="">未設定</option>
+                <option value="10">10件以上</option>
+                <option value="30" selected>30件以上</option>
+                <option value="50">50件以上</option>
+              </select>
+            </div>
+          </div>
+          <button id="recommendTalentBtn" class="btn-red full" type="button">おすすめ声優を提案（デモ）</button>
+          <p id="recommendMessage" class="message"></p>
+        </div>
+      </div>
+      <button id="generateScriptButton" class="btn-ghost full" type="button">AI台本を仮生成（デモ）</button>
+      <div id="aiStatus" class="ai-status hidden">
+        <p>1/3 動画を確認中...</p>
+        <p>2/3 Whisperで文字起こし中...</p>
+        <p>3/3 翻訳して台本生成中...</p>
+      </div>
+      <div id="scriptPreview" class="field hidden">
+        <label for="ytScript">生成台本（デモ）</label>
+        <textarea id="ytScript" name="script"></textarea>
+      </div>
+      <button id="ytSubmitButton" class="btn-red full" type="submit" disabled>本人確認後に依頼を送信</button>
+      <button id="ytSkipButton" class="btn-ghost full" type="button">デモ入力で声優選択へ（スキップ）</button>
+      <p id="ytMessage" class="message"></p>
+    </form>
+  </section>
+
+  <footer>
+    <span>© 2026 WAVRICK</span>
+    <span>これはMVP（試作版）です</span>
+  </footer>
+
+  <script>
+const pageMap = {
+  home: "page-home",
+  voice: "page-voice",
+  yt: "page-yt",
+  talents: "page-talents",
+  login: "page-login"
+};
+
+const mockTalents = [
+  {
+    displayName: "山本 あかり",
+    firstName: "あかり",
+    lastName: "山本",
+    bio: "明るく親しみやすい声。旅行・料理Vlogの吹替が得意です。",
+    genres: "旅行, 料理, Vlog",
+    rateFrom: 8000,
+    jobCount: 42,
+    sampleUrl: "https://example.com/akari-sample.mp3",
+    avatar: "🌸"
+  },
+  {
+    displayName: "田中 美咲",
+    firstName: "美咲",
+    lastName: "田中",
+    bio: "落ち着いたナレーション向き。教育・ドキュメンタリー案件に対応。",
+    genres: "教育, ドキュメンタリー",
+    rateFrom: 12000,
+    jobCount: 78,
+    sampleUrl: "https://example.com/misaki-sample.mp3",
+    avatar: "🎙️"
+  },
+  {
+    displayName: "鈴木 健太",
+    firstName: "健太",
+    lastName: "鈴木",
+    bio: "エネルギッシュな声質。ゲーム実況やエンタメ系に相性が良いです。",
+    genres: "ゲーム実況, エンタメ",
+    rateFrom: 7000,
+    jobCount: 56,
+    sampleUrl: "https://example.com/kenta-sample.mp3",
+    avatar: "🎮"
+  },
+  {
+    displayName: "佐藤 りな",
+    firstName: "りな",
+    lastName: "佐藤",
+    bio: "かわいめ〜清楚系まで幅広く対応。アニメ調の演技も得意です。",
+    genres: "アニメ, 美容, ライフスタイル",
+    rateFrom: 5000,
+    jobCount: 18,
+    sampleUrl: "https://example.com/rina-sample.mp3",
+    avatar: "✨"
+  }
+];
+
+function getTalentId(profile) {
+  const email = (profile.email || "").toLowerCase().trim();
+  if (email) return `voice:${email}`;
+  const name = (profile.displayName || "").toLowerCase().trim();
+  if (name) return `mock:${name}`;
+  return `mock:${Math.random().toString(16).slice(2)}`;
+}
+
+function parseGenres(genresString) {
+  return (genresString || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function computeGenreOverlapScore(profile, desiredGenres) {
+  const pGenres = parseGenres(profile.genres).map((g) => g.toLowerCase());
+  const dGenres = parseGenres(desiredGenres).map((g) => g.toLowerCase());
+  if (!dGenres.length) return 0;
+  const set = new Set(pGenres);
+  let score = 0;
+  for (const dg of dGenres) if (set.has(dg)) score += 1;
+  return score;
+}
+
+function showPage(name) {
+  const pageId = pageMap[name];
+  if (!pageId) return;
+  document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
+  const target = document.getElementById(pageId);
+  if (target) target.classList.add("active");
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function bindNavigation() {
+  document.querySelectorAll("[data-go]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      event.preventDefault();
+      const target = node.getAttribute("data-go");
+      showPage(target);
+    });
+  });
+}
+
+function isYouTubeUrl(value) {
+  return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(value);
+}
+
+function normalizeYoutubeChannelKey(urlValue) {
+  try {
+    const raw = urlValue.trim();
+    if (!raw) return "";
+    const parsed = new URL(raw.startsWith("http") ? raw : `https://${raw}`);
+    const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
+    if (host !== "youtube.com" && host !== "m.youtube.com") return "";
+
+    const path = parsed.pathname.replace(/\/+$/, "");
+    if (!path || path === "/") return "";
+    const parts = path.split("/").filter(Boolean);
+    const first = parts[0] || "";
+    const second = parts[1] || "";
+
+    if (first.startsWith("@")) return `handle:${first.toLowerCase()}`;
+    if (first === "channel" && second) return `channel:${second}`;
+    if (first === "user" && second) return `user:${second.toLowerCase()}`;
+    if (first === "c" && second) return `custom:${second.toLowerCase()}`;
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function saveLocal(key, payload) {
+  const rows = JSON.parse(localStorage.getItem(key) || "[]");
+  rows.push({ ...payload, createdAt: new Date().toISOString() });
+  localStorage.setItem(key, JSON.stringify(rows));
+}
+
+function upsertLocalByEmail(key, payload) {
+  const rows = JSON.parse(localStorage.getItem(key) || "[]");
+  const email = (payload.email || "").toLowerCase().trim();
+  const next = rows.filter((row) => (row.email || "").toLowerCase().trim() !== email);
+  next.push({ ...payload, updatedAt: new Date().toISOString() });
+  localStorage.setItem(key, JSON.stringify(next));
+}
+
+function setMessage(id, text, status) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  node.textContent = text;
+  node.classList.remove("ok", "err");
+  if (status) node.classList.add(status);
+}
+
+function loadVoiceProfiles() {
+  const localProfiles = JSON.parse(localStorage.getItem("wavrick_voice_profiles") || "[]");
+  return [...mockTalents, ...localProfiles];
+}
+
+function createTalentCard(profile, withButton = false) {
+  const genres = parseGenres(profile.genres).slice(0, 3);
+
+  const tagsHtml = genres.length
+    ? genres.map((genre) => `<span class="talent-tag">${genre}</span>`).join("")
+    : `<span class="talent-tag">ジャンル未設定</span>`;
+
+  const name = profile.displayName || `${profile.lastName || ""} ${profile.firstName || ""}`.trim() || "未設定";
+  const rateFrom = profile.rateFrom ? Number(profile.rateFrom) : null;
+  const rateText = rateFrom !== null ? `¥${rateFrom.toLocaleString()}/分〜` : "料金未設定";
+  const jobCount = profile.jobCount !== undefined && profile.jobCount !== null && profile.jobCount !== "" ? Number(profile.jobCount) : null;
+  const jobsText = jobCount !== null && !Number.isNaN(jobCount) ? `経験 ${jobCount}件` : "経験 未入力";
+  const meta = profile.sampleUrl ? `${rateText} / ${jobsText}` : `${rateText} / ${jobsText}`;
+  const tid = getTalentId(profile);
+
+  return `
+    <article class="talent-card">
+      <div class="talent-top">
+        <div class="talent-avatar">${profile.avatar || "🎤"}</div>
+        <div>
+          <p class="talent-name">${name}</p>
+          <p class="talent-meta">${meta}</p>
+        </div>
+      </div>
+      <p class="talent-bio">${profile.bio || "自己紹介はこれから登録されます。"}</p>
+      <div class="talent-tags">${tagsHtml}</div>
+      ${
+        withButton
+          ? `<button class="talent-cta" type="button" data-select-talent-id="${tid}">この声優に依頼する</button>`
+          : ""
+      }
+    </article>
+  `;
+}
+
+function renderTalents() {
+  const profiles = loadVoiceProfiles();
+  const sliderTrack = document.getElementById("talentSliderTrack");
+  const talentGrid = document.getElementById("talentGrid");
+  if (!sliderTrack || !talentGrid) return;
+
+  const sliderCards = profiles.map((profile) => createTalentCard(profile, false)).join("");
+  sliderTrack.innerHTML = sliderCards + sliderCards;
+  const filtered = getFilteredTalentsForGrid(profiles);
+  talentGrid.innerHTML = filtered.map((profile) => createTalentCard(profile, true)).join("");
+}
+
+function getFilteredTalentsForGrid(profiles) {
+  const budgetSel = document.getElementById("filterBudgetMax");
+  const jobSel = document.getElementById("filterJobMin");
+  const genreInput = document.getElementById("filterGenres");
+
+  const budgetMax = budgetSel && budgetSel.value ? Number(budgetSel.value) : null;
+  const jobMin = jobSel && jobSel.value ? Number(jobSel.value) : null;
+  const genreText = genreInput ? genreInput.value : "";
+
+  const desired = parseGenres(genreText).map((g) => g.toLowerCase());
+
+  return profiles.filter((p) => {
+    const rate = p.rateFrom !== undefined && p.rateFrom !== null && p.rateFrom !== "" ? Number(p.rateFrom) : null;
+    const jobs = p.jobCount !== undefined && p.jobCount !== null && p.jobCount !== "" ? Number(p.jobCount) : 0;
+
+    if (budgetMax !== null && rate !== null && !Number.isNaN(rate) && rate > budgetMax) return false;
+    if (jobMin !== null && !Number.isNaN(jobs) && jobs < jobMin) return false;
+
+    if (desired.length) {
+      const score = computeGenreOverlapScore(p, genreText);
+      if (score <= 0) return false;
+    }
+
+    return true;
+  });
+}
+
+function bindTalentPageInteractions() {
+  const applyBtn = document.getElementById("applyTalentFilterBtn");
+  const resetBtn = document.getElementById("resetTalentFilterBtn");
+
+  if (applyBtn) {
+    applyBtn.addEventListener("click", () => renderTalents());
+  }
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      const budgetSel = document.getElementById("filterBudgetMax");
+      const jobSel = document.getElementById("filterJobMin");
+      const genreInput = document.getElementById("filterGenres");
+      if (budgetSel) budgetSel.value = "";
+      if (jobSel) jobSel.value = "";
+      if (genreInput) genreInput.value = "";
+      renderTalents();
+    });
+  }
+
+  document.addEventListener("click", (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest("[data-select-talent-id]") : null;
+    if (!btn) return;
+
+    const tid = btn.getAttribute("data-select-talent-id");
+    if (!tid) return;
+
+    const profiles = loadVoiceProfiles();
+    const selected = profiles.find((p) => getTalentId(p) === tid);
+    if (!selected) return;
+
+    const payload = {
+      talentId: tid,
+      displayName: selected.displayName,
+      rateFrom: selected.rateFrom || null,
+      jobCount: selected.jobCount || null,
+      genres: selected.genres || ""
+    };
+    localStorage.setItem("wavrick_selected_talent", JSON.stringify(payload));
+
+    const ytRadioSelf = document.querySelector('#ytForm input[name="castMode"][value="self"]');
+    if (ytRadioSelf) ytRadioSelf.checked = true;
+    const selectedTalentName = document.getElementById("selectedTalentName");
+    if (selectedTalentName) selectedTalentName.textContent = payload.displayName || "未選択";
+
+    showPage("yt");
+  });
+}
+
+function bindVoiceForm() {
+  const form = document.getElementById("voiceForm");
+  if (!form) return;
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    setMessage("voiceMessage", "");
+
+    const data = Object.fromEntries(new FormData(form).entries());
+    if (!data.email.includes("@")) {
+      setMessage("voiceMessage", "メールアドレスの形式を確認してください。", "err");
+      return;
+    }
+    if (!data.sampleUrl.startsWith("http")) {
+      setMessage("voiceMessage", "音声サンプルURLは http(s) で始めてください。", "err");
+      return;
+    }
+
+    saveLocal("wavrick_voice_profiles", data);
+    upsertLocalByEmail("wavrick_voice_accounts", {
+      role: "voice",
+      email: data.email,
+      displayName: data.displayName || `${data.lastName || ""} ${data.firstName || ""}`.trim()
+    });
+    form.reset();
+    setMessage("voiceMessage", "登録を受け付けました（ローカル保存）。", "ok");
+    renderTalents();
+  });
+
+  const skipBtn = document.getElementById("voiceSkipButton");
+  if (skipBtn) {
+    skipBtn.addEventListener("click", () => {
+      const demoEmail = `demo-voice-${Date.now()}@example.com`;
+      const demoData = {
+        lastName: "デモ",
+        firstName: "声優",
+        displayName: "デモ声優",
+        email: demoEmail,
+        bio: "デモ用の声優プロフィールです。後で本物の入力に置き換えてください。",
+        genres: "旅行, 教育",
+        rateFrom: "8000",
+        jobCount: "12",
+        sampleUrl: "https://example.com/demo-sample.mp3"
+      };
+
+      saveLocal("wavrick_voice_profiles", demoData);
+      upsertLocalByEmail("wavrick_voice_accounts", {
+        role: "voice",
+        email: demoEmail,
+        displayName: demoData.displayName
+      });
+      renderTalents();
+      showPage("talents");
+    });
+  }
+}
+
+function bindAiDemo() {
+  const button = document.getElementById("generateScriptButton");
+  const status = document.getElementById("aiStatus");
+  const scriptPreview = document.getElementById("scriptPreview");
+  const scriptField = document.getElementById("ytScript");
+  const videoUrlField = document.getElementById("ytVideoUrl");
+  if (!button || !status || !scriptPreview || !scriptField || !videoUrlField) return;
+
+  button.addEventListener("click", () => {
+    if (!isYouTubeUrl(videoUrlField.value)) {
+      setMessage("ytMessage", "先に正しいYouTube動画URLを入力してください。", "err");
+      return;
+    }
+
+    setMessage("ytMessage", "");
+    status.classList.remove("hidden");
+    scriptPreview.classList.add("hidden");
+    button.disabled = true;
+    button.textContent = "処理中...";
+
+    setTimeout(() => {
+      scriptField.value = "こんにちは。今回はチャンネルの成長戦略を紹介します。最初にコンテンツテーマの決め方、次に投稿頻度、最後に視聴者とのコミュニケーションについて話します。";
+      status.classList.add("hidden");
+      scriptPreview.classList.remove("hidden");
+      button.disabled = false;
+      button.textContent = "AI台本を仮生成（デモ）";
+      setMessage("ytMessage", "台本デモを生成しました。内容を編集して送信できます。", "ok");
+    }, 2800);
+  });
+}
+
+function bindYtForm() {
+  const form = document.getElementById("ytForm");
+  if (!form) return;
+  const submitButton = document.getElementById("ytSubmitButton");
+  const verifyBadge = document.getElementById("verifyBadge");
+  const verifyEmailBtn = document.getElementById("verifyEmailBtn");
+  const verifyChannelBtn = document.getElementById("verifyChannelBtn");
+  const verifyIdBtn = document.getElementById("verifyIdBtn");
+
+  const verifyState = {
+    email: false,
+    channel: false,
+    id: false,
+    verifiedChannelKey: ""
+  };
+
+  function refreshVerificationUi() {
+    const verified = verifyState.email && verifyState.channel && verifyState.id;
+    if (submitButton) {
+      submitButton.disabled = !verified;
+      submitButton.textContent = verified ? "依頼を送信する" : "本人確認後に依頼を送信";
+    }
+    if (verifyBadge) {
+      verifyBadge.textContent = verified ? "完了" : "未完了";
+      verifyBadge.classList.toggle("done", verified);
+    }
+  }
+
+  function markStepDone(key, button, label) {
+    verifyState[key] = true;
+    if (button) {
+      button.classList.add("done");
+      button.textContent = label + "（完了）";
+      button.disabled = true;
+    }
+    refreshVerificationUi();
+  }
+
+  if (verifyEmailBtn) {
+    verifyEmailBtn.addEventListener("click", () => {
+      markStepDone("email", verifyEmailBtn, "1) メール認証を完了");
+      setMessage("ytMessage", "メール認証を完了しました。", "ok");
+    });
+  }
+
+  if (verifyChannelBtn) {
+    verifyChannelBtn.addEventListener("click", () => {
+      const channelField = document.getElementById("ytChannelUrl");
+      const key = normalizeYoutubeChannelKey(channelField ? channelField.value : "");
+      if (!key) {
+        setMessage("ytMessage", "先にチャンネルURLを正しい形式で入力してください。", "err");
+        return;
+      }
+      verifyState.verifiedChannelKey = key;
+      markStepDone("channel", verifyChannelBtn, "2) チャンネル所有確認を完了");
+      setMessage("ytMessage", "チャンネル所有確認を完了しました。", "ok");
+    });
+  }
+
+  if (verifyIdBtn) {
+    verifyIdBtn.addEventListener("click", () => {
+      markStepDone("id", verifyIdBtn, "3) 身分証確認を完了");
+      setMessage("ytMessage", "本人確認が完了しました。依頼を送信できます。", "ok");
+    });
+  }
+
+  refreshVerificationUi();
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    setMessage("ytMessage", "");
+    const data = Object.fromEntries(new FormData(form).entries());
+    const verified = verifyState.email && verifyState.channel && verifyState.id;
+
+    if (!data.email.includes("@")) {
+      setMessage("ytMessage", "メールアドレスの形式を確認してください。", "err");
+      return;
+    }
+    if (!isYouTubeUrl(data.channelUrl) || !isYouTubeUrl(data.videoUrl) || !isYouTubeUrl(data.videoChannelUrl)) {
+      setMessage("ytMessage", "YouTube URLの形式を確認してください。", "err");
+      return;
+    }
+    if (!verified) {
+      setMessage("ytMessage", "依頼送信の前に、本人確認3ステップを完了してください。", "err");
+      return;
+    }
+
+    const requestChannelKey = normalizeYoutubeChannelKey(data.channelUrl);
+    const videoChannelKey = normalizeYoutubeChannelKey(data.videoChannelUrl);
+    if (!requestChannelKey || !videoChannelKey) {
+      setMessage("ytMessage", "チャンネルURLは /@name や /channel/ID 形式で入力してください。", "err");
+      return;
+    }
+    if (
+      verifyState.verifiedChannelKey !== requestChannelKey ||
+      verifyState.verifiedChannelKey !== videoChannelKey
+    ) {
+      setMessage("ytMessage", "認証済みチャンネルと入力チャンネルが一致しません。URLを確認してください。", "err");
+      return;
+    }
+
+    const castMode = data.castMode || "self";
+    const selected = JSON.parse(localStorage.getItem("wavrick_selected_talent") || "null");
+    if (!selected || !selected.talentId) {
+      setMessage("ytMessage", "声優を選択してください（声優一覧かおすすめ提案で選べます）。", "err");
+      return;
+    }
+    data.castMode = castMode;
+    data.selectedTalentId = selected.talentId;
+    data.selectedTalentName = selected.displayName || "";
+
+    saveLocal("wavrick_youtube_requests", data);
+    upsertLocalByEmail("wavrick_customer_accounts", {
+      role: "customer",
+      email: data.email,
+      name: data.name,
+      channelUrl: data.channelUrl
+    });
+    form.reset();
+    document.getElementById("scriptPreview").classList.add("hidden");
+    setMessage("ytMessage", "依頼を受け付けました（ローカル保存）。", "ok");
+  });
+
+  const ytRadioSelf = form.querySelector('input[name="castMode"][value="self"]');
+  const ytRadioRecommend = form.querySelector('input[name="castMode"][value="recommend"]');
+  const castSelfBox = document.getElementById("castSelfBox");
+  const castRecommendBox = document.getElementById("castRecommendBox");
+  const chooseTalentBtn = document.getElementById("chooseTalentBtn");
+  const recommendBtn = document.getElementById("recommendTalentBtn");
+  const recommendMessage = document.getElementById("recommendMessage");
+  const selectedTalentNameEl = document.getElementById("selectedTalentName");
+
+  function refreshCastUi() {
+    const mode = form.querySelector('input[name="castMode"]:checked')?.value || "self";
+    if (mode === "self") {
+      if (castSelfBox) castSelfBox.classList.remove("hidden");
+      if (castRecommendBox) castRecommendBox.classList.add("hidden");
+    } else {
+      if (castSelfBox) castSelfBox.classList.add("hidden");
+      if (castRecommendBox) castRecommendBox.classList.remove("hidden");
+    }
+  }
+
+  function loadSelectedTalentIntoUi() {
+    const stored = JSON.parse(localStorage.getItem("wavrick_selected_talent") || "null");
+    if (!stored || !selectedTalentNameEl) return;
+    selectedTalentNameEl.textContent = stored.displayName || "未選択";
+    if (ytRadioSelf) ytRadioSelf.checked = true;
+    refreshCastUi();
+  }
+
+  function recommendTalent() {
+    const recGenres = document.getElementById("recGenres")?.value || "";
+    const recBudgetMax = document.getElementById("recBudgetMax")?.value || "";
+    const recJobMin = document.getElementById("recJobMin")?.value || "";
+
+    const budgetMax = recBudgetMax ? Number(recBudgetMax) : null;
+    const jobMin = recJobMin ? Number(recJobMin) : null;
+
+    const profiles = loadVoiceProfiles();
+    const candidates = profiles
+      .map((p) => {
+        const genreScore = computeGenreOverlapScore(p, recGenres);
+        const rateOk = budgetMax === null ? true : (p.rateFrom ? Number(p.rateFrom) <= budgetMax : false);
+        const jobsOk = jobMin === null ? true : ((p.jobCount ? Number(p.jobCount) : 0) >= jobMin);
+        const total = genreScore * 10 + (rateOk ? 3 : 0) + (jobsOk ? 2 : 0);
+        return { p, genreScore, rateOk, jobsOk, total };
+      })
+      .filter((x) => (recGenres.trim() ? x.genreScore > 0 : true) && x.rateOk && x.jobsOk);
+
+    if (!candidates.length) {
+      if (recommendMessage) {
+        setMessage("recommendMessage", "条件に合う声優が見つかりません。絞り込みをゆるくしてみてください。", "err");
+      }
+      return;
+    }
+
+    candidates.sort((a, b) => b.total - a.total);
+    const best = candidates[0].p;
+    const tid = getTalentId(best);
+
+    localStorage.setItem(
+      "wavrick_selected_talent",
+      JSON.stringify({
+        talentId: tid,
+        displayName: best.displayName,
+        rateFrom: best.rateFrom || null,
+        jobCount: best.jobCount || null,
+        genres: best.genres || ""
+      })
+    );
+
+    if (selectedTalentNameEl) selectedTalentNameEl.textContent = best.displayName || "未選択";
+    if (recommendMessage) setMessage("recommendMessage", `おすすめしました：${best.displayName}`, "ok");
+
+    if (ytRadioSelf) ytRadioSelf.checked = true;
+    refreshCastUi();
+  }
+
+  if (ytRadioSelf) ytRadioSelf.addEventListener("change", refreshCastUi);
+  if (ytRadioRecommend) ytRadioRecommend.addEventListener("change", refreshCastUi);
+  if (chooseTalentBtn) chooseTalentBtn.addEventListener("click", () => showPage("talents"));
+  if (recommendBtn) recommendBtn.addEventListener("click", recommendTalent);
+
+  const ytSkipBtn = document.getElementById("ytSkipButton");
+  if (ytSkipBtn) {
+    ytSkipBtn.addEventListener("click", () => {
+      const demoEmail = `demo-customer-${Date.now()}@example.com`;
+      const demoHandle = "wavrick_demo";
+      const demoChannelUrl = `https://www.youtube.com/@${demoHandle}`;
+      const demoVideoUrl = `https://www.youtube.com/watch?v=dQw4w9WgXcQ`;
+      const demoVideoChannelUrl = `https://www.youtube.com/@${demoHandle}`;
+
+      const ytNameEl = document.getElementById("ytName");
+      const ytEmailEl = document.getElementById("ytEmail");
+      const ytChannelUrlEl = document.getElementById("ytChannelUrl");
+      const ytVideoUrlEl = document.getElementById("ytVideoUrl");
+      const ytVideoChannelUrlEl = document.getElementById("ytVideoChannelUrl");
+
+      if (ytNameEl) ytNameEl.value = "デモ顧客";
+      if (ytEmailEl) ytEmailEl.value = demoEmail;
+      if (ytChannelUrlEl) ytChannelUrlEl.value = demoChannelUrl;
+      if (ytVideoUrlEl) ytVideoUrlEl.value = demoVideoUrl;
+      if (ytVideoChannelUrlEl) ytVideoChannelUrlEl.value = demoVideoChannelUrl;
+
+      const btnEmail = document.getElementById("verifyEmailBtn");
+      const btnChannel = document.getElementById("verifyChannelBtn");
+      const btnId = document.getElementById("verifyIdBtn");
+      if (btnEmail) btnEmail.click();
+      if (btnChannel) btnChannel.click();
+      if (btnId) btnId.click();
+
+      showPage("talents");
+    });
+  }
+
+  refreshCastUi();
+  loadSelectedTalentIntoUi();
+}
+
+function bindLogin() {
+  const form = document.getElementById("loginForm");
+  const message = document.getElementById("loginMessage");
+  const sessionCard = document.getElementById("loginSessionCard");
+  const sessionText = document.getElementById("loginSessionText");
+  const jumpButton = document.getElementById("loginJumpButton");
+  const logoutButton = document.getElementById("logoutButton");
+  if (!form || !message || !sessionCard || !sessionText || !jumpButton || !logoutButton) return;
+
+  function setLoginMessage(text, status) {
+    message.textContent = text;
+    message.classList.remove("ok", "err");
+    if (status) message.classList.add(status);
+  }
+
+  function renderSession() {
+    const session = JSON.parse(localStorage.getItem("wavrick_session") || "null");
+    if (!session) {
+      sessionCard.classList.add("hidden");
+      return;
+    }
+    sessionCard.classList.remove("hidden");
+    sessionText.textContent = `${session.roleLabel}: ${session.displayName} でログイン中`;
+    jumpButton.textContent = session.role === "voice" ? "声優登録ページへ" : "依頼ページへ";
+  }
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(form).entries());
+    const email = (data.email || "").toLowerCase().trim();
+    const role = data.role;
+    if (!email.includes("@")) {
+      setLoginMessage("メールアドレスの形式を確認してください。", "err");
+      return;
+    }
+
+    const key = role === "voice" ? "wavrick_voice_accounts" : "wavrick_customer_accounts";
+    const roleLabel = role === "voice" ? "声優" : "顧客";
+    const accounts = JSON.parse(localStorage.getItem(key) || "[]");
+    const account = accounts.find((row) => (row.email || "").toLowerCase().trim() === email);
+    if (!account) {
+      setLoginMessage(`${roleLabel}として未登録のメールです。先に登録してください。`, "err");
+      return;
+    }
+
+    const displayName = account.displayName || account.name || account.email;
+    localStorage.setItem(
+      "wavrick_session",
+      JSON.stringify({
+        role,
+        roleLabel,
+        email,
+        displayName,
+        createdAt: new Date().toISOString()
+      })
+    );
+    setLoginMessage("ログインしました。", "ok");
+    renderSession();
+  });
+
+  jumpButton.addEventListener("click", () => {
+    const session = JSON.parse(localStorage.getItem("wavrick_session") || "null");
+    if (!session) return;
+    showPage(session.role === "voice" ? "voice" : "yt");
+  });
+
+  logoutButton.addEventListener("click", () => {
+    localStorage.removeItem("wavrick_session");
+    setLoginMessage("ログアウトしました。", "ok");
+    renderSession();
+  });
+
+  renderSession();
+}
+
+function init() {
+  bindNavigation();
+  bindVoiceForm();
+  bindAiDemo();
+  bindYtForm();
+  bindLogin();
+  bindTalentPageInteractions();
+  renderTalents();
+}
+
+init();
+  </script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+WAVRICK ターミナル（シンプル版）
+
+■ 普段必要なのはターミナル 1枚だけ
+
+  cd /Users/musashi/wavrick-app
+  ./scripts/start-dev-server.sh
+
+  ブラウザ → http://127.0.0.1:8889
+
+  このターミナルは開発中ずっと開いたまま。
+  Ctrl+C を押すとサイトが開けなくなる。
+
+
+■ 2枚目が要るのは、このときだけ
+
+  ・supabase functions deploy ...
+  ・supabase secrets set ...
+  ・./scripts/cursor-ai-setup.sh（AI台本）
+
+  → 新しいタブを開いて実行。終わったら閉じてOK。
+  → サイト（8889）には影響しない。
+
+
+■ 迷ったら
+
+  ./scripts/wavrick-status.sh
+
+  「サイト動いてる？」が一目で分かります。

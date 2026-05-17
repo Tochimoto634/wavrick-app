@@ -1,0 +1,11 @@
+# Minimal config so `supabase functions deploy` picks up function settings.
+# See: https://supabase.com/docs/guides/functions
+
+[functions.youtube-oauth-start]
+verify_jwt = false
+
+[functions.youtube-oauth-callback]
+verify_jwt = false
+
+[functions.media-pipeline]
+verify_jwt = false

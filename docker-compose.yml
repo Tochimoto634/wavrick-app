@@ -1,0 +1,13 @@
+# YouTube 音声抽出プロキシ（media-pipeline Edge から呼ばれる）
+# 起動: docker compose up --build
+# ローカル URL: http://localhost:5055/extract
+# ※ Supabase Edge から届けるには ngrok 等で公開 URL が必要（scripts/ai-pipeline-setup.sh 参照）
+
+services:
+  youtube-audio-proxy:
+    build: ./services/youtube-audio-proxy
+    ports:
+      - "5055:8080"
+    environment:
+      PROXY_SECRET: wavrick-local-dev-secret
+      PORT: "8080"

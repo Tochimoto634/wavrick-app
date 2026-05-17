@@ -1,0 +1,22 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local runtime / tunnels
+.local/
+
+# Supabase CLI cache
+supabase/.temp/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets (never commit)
+.env
+.env.*
+*.pem
+credentials.json

@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WAVRICK - MVP</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <nav>
+    <a class="logo" href="#" data-go="home">WAVRICK</a>
+    <ul>
+      <li><a href="#how">仕組み</a></li>
+      <li><a href="#" data-go="talents">声優一覧</a></li>
+      <li><a href="#" data-go="voice">声優登録</a></li>
+      <li><a href="#" data-go="login">ログイン</a></li>
+      <li><a href="#" data-go="work">案件管理</a></li>
+      <li><a id="adminNavLink" href="#" data-go="admin" class="hidden">運営管理</a></li>
+      <li><a href="#" class="nav-btn" data-go="yt">依頼する</a></li>
+    </ul>
+  </nav>
+
+  <main id="page-home" class="page active">
+    <section class="hero">
+      <p class="hero-badge">日本の声優 × 海外YouTuber</p>
+      <h1>YOUR VOICE.<br><span>JAPAN</span> AWAITS.</h1>
+      <p class="hero-desc">動画を日本語化したい海外クリエイターと、日本の声優をつなぐマッチングサービスです。<br>最短3分で依頼スタート、フォーム入力だけで進められます。</p>
+      <div class="hero-actions">
+        <button class="btn-red" data-go="yt">仕事を依頼する（YouTuber）</button>
+        <button class="btn-ghost" data-go="voice">声優として登録する</button>
+      </div>
+      <div class="quick-points">
+        <div class="qp-card"><strong>かんたん入力</strong><span>専門知識なしで使えるUI</span></div>
+        <div class="qp-card"><strong>AI下書き</strong><span>台本のたたき台を自動作成</span></div>
+        <div class="qp-card"><strong>安心導線</strong><span>迷わない2つの入口設計</span></div>
+      </div>
+    </section>
+
+    <section id="how" class="section dark">
+      <h2>かんたん4ステップ</h2>
+      <div class="grid2">
+        <article class="card">
+          <h3>YouTuber向け</h3>
+          <ol>
+            <li>アカウント登録</li>
+            <li>動画URL入力</li>
+            <li>AIで台本生成</li>
+            <li>声優マッチングと納品</li>
+          </ol>
+        </article>
+        <article class="card">
+          <h3>声優向け</h3>
+          <ol>
+            <li>プロフィール登録</li>
+            <li>サンプル音声提出</li>
+            <li>案件受注</li>
+            <li>納品して報酬受取</li>
+          </ol>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>登録中の声優</h2>
+          <p class="section-desc">登録された声優情報が横に流れて表示されます。クリックで詳細一覧にも移動できます。</p>
+        </div>
+        <button class="btn-ghost" data-go="talents">声優一覧を見る</button>
+      </div>
+      <div class="talent-slider-wrap">
+        <div id="talentSliderTrack" class="talent-slider-track"></div>
+      </div>
+    </section>
+  </main>
+
+  <section id="page-talents" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>声優一覧（YouTuberが選択可能）</h2>
+    </div>
+    <p class="form-subtitle">仮の声優データを表示しています。登録フォームから追加した声優もここに表示されます。</p>
+    <div class="talent-filter">
+      <div class="filter-title">絞り込み（任意）</div>
+      <div class="field-row">
+        <div class="field">
+          <label for="filterBudgetMax">予算上限（円/分〜）</label>
+          <select id="filterBudgetMax">
+            <option value="">未設定</option>
+            <option value="5000">〜¥5,000</option>
+              <option value="8000">〜¥8,000</option>
+            <option value="12000">〜¥12,000</option>
+            <option value="20000">〜¥20,000</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="filterJobMin">件数下限</label>
+          <select id="filterJobMin">
+            <option value="">未設定</option>
+            <option value="10">10件以上</option>
+            <option value="30">30件以上</option>
+            <option value="50">50件以上</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="filterGenres">ジャンル（カンマ区切り）</label>
+        <input id="filterGenres" type="text" placeholder="例：旅行,教育">
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="applyTalentFilterBtn" class="btn-red" type="button">絞り込み適用</button>
+        <button id="resetTalentFilterBtn" class="btn-ghost" type="button">リセット</button>
+      </div>
+    </div>
+    <div id="talentGrid" class="talent-grid"></div>
+  </section>
+
+  <section id="page-work" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>案件ワークスペース</h2>
+    </div>
+    <p class="form-subtitle">進捗・チャット・見積/支払い・納品・通知を1画面で管理します。</p>
+
+    <div class="form-card admin-tools">
+      <div class="field-row">
+        <div class="field">
+          <label for="workRequestSelect">対象案件</label>
+          <select id="workRequestSelect"></select>
+        </div>
+        <div class="field">
+          <label for="workStatusSelect">ステータス</label>
+          <select id="workStatusSelect"></select>
+        </div>
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="saveWorkStatusBtn" class="btn-red" type="button">ステータス更新</button>
+      </div>
+      <p id="workMessage" class="message"></p>
+    </div>
+
+    <div class="form-card">
+      <h3>ステータス可視化</h3>
+      <div id="workStatusTimeline" class="status-timeline"></div>
+    </div>
+
+    <div class="form-card">
+      <h3>チャット / メッセージ</h3>
+      <div id="workChatList" class="chat-list"></div>
+      <div class="field">
+        <label for="workChatInput">メッセージ</label>
+        <textarea id="workChatInput" placeholder="依頼内容の補足、確認事項、修正依頼など"></textarea>
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="sendWorkChatBtn" class="btn-red" type="button">送信</button>
+      </div>
+    </div>
+
+    <div class="form-card">
+      <h3>見積もり・支払い</h3>
+      <div class="field-row">
+        <div class="field">
+          <label for="workQuoteAmount">見積金額（円）</label>
+          <input id="workQuoteAmount" type="number" min="0" placeholder="12000">
+        </div>
+        <div class="field">
+          <label for="workPaymentStatus">支払いステータス</label>
+          <select id="workPaymentStatus">
+            <option value="unpaid">未払い</option>
+            <option value="approved">承認済み（未決済）</option>
+            <option value="paid">支払い完了</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="workStripeUrl">Stripe決済リンク（任意）</label>
+        <input id="workStripeUrl" type="url" placeholder="https://buy.stripe.com/...">
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="saveWorkQuoteBtn" class="btn-red" type="button">見積・支払い情報を保存</button>
+      </div>
+    </div>
+
+    <div class="form-card">
+      <h3>納品物管理</h3>
+      <div id="workDeliveriesList" class="delivery-list"></div>
+      <div class="field">
+        <label for="workDeliveryUrl">納品URL</label>
+        <input id="workDeliveryUrl" type="url" placeholder="https://...">
+      </div>
+      <div class="field">
+        <label for="workDeliveryNote">メモ</label>
+        <input id="workDeliveryNote" type="text" placeholder="v2: ノイズ除去版">
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="addWorkDeliveryBtn" class="btn-red" type="button">納品物を追加</button>
+        <button id="addRevisionRequestBtn" class="btn-ghost" type="button">修正依頼を追加</button>
+      </div>
+      <p id="workRevisionCount" class="section-desc"></p>
+    </div>
+
+    <div class="form-card">
+      <h3>通知</h3>
+      <div id="workNotificationsList" class="notice-list"></div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="markAllNoticeReadBtn" class="btn-ghost" type="button">すべて既読にする</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="page-login" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>ログイン</h2>
+    </div>
+    <p class="form-subtitle">登録済みの顧客・声優は、メールアドレスですぐログインできます。</p>
+    <form id="loginForm" class="form-card">
+      <div class="field">
+        <label for="loginRole">ログイン種別 *</label>
+        <select id="loginRole" name="role" required>
+          <option value="customer">顧客（海外YouTuber）</option>
+          <option value="voice">声優</option>
+          <option value="admin">運営</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="loginEmail">メールアドレス *</label>
+        <input id="loginEmail" name="email" type="email" placeholder="you@example.com" required>
+      </div>
+      <div id="loginPasswordField" class="field">
+        <label for="loginPassword">パスワード *</label>
+        <input id="loginPassword" name="password" type="password" placeholder="6文字以上">
+      </div>
+      <div id="adminPasscodeField" class="field hidden">
+        <label for="loginAdminPasscode">運営パスワード（Supabase Auth / フォールバック）*</label>
+        <input id="loginAdminPasscode" name="adminPasscode" type="password" placeholder="運営パスワード">
+      </div>
+      <button class="btn-red full" type="submit">ログインする</button>
+      <p id="loginMessage" class="message"></p>
+      <p class="section-desc">Supabase未接続時の運営ログイン初期値: admin@wavrick.local / wavrick-admin</p>
+    </form>
+    <div class="form-card backend-config">
+      <h3>Supabase接続設定（任意）</h3>
+      <p class="section-desc">設定すると、ローカル保存に加えてSupabaseにも保存します。未設定でも動作します。</p>
+      <div class="field">
+        <label for="sbUrl">Supabase URL</label>
+        <input id="sbUrl" type="url" placeholder="https://xxxx.supabase.co">
+      </div>
+      <div class="field">
+        <label for="sbAnonKey">Supabase anon key</label>
+        <input id="sbAnonKey" type="text" placeholder="eyJ...">
+      </div>
+      <div class="hero-actions">
+        <button id="saveSbConfigBtn" class="btn-red" type="button">接続設定を保存</button>
+        <button id="clearSbConfigBtn" class="btn-ghost" type="button">設定を削除</button>
+      </div>
+      <p id="sbConfigMessage" class="message"></p>
+    </div>
+    <div id="loginSessionCard" class="form-card login-session hidden">
+      <h3>ログイン中</h3>
+      <p id="loginSessionText" class="section-desc"></p>
+      <div class="hero-actions">
+        <button id="loginJumpButton" class="btn-ghost" type="button">ページへ移動</button>
+        <button id="logoutButton" class="back-btn" type="button">ログアウト</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="page-admin" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>運営ダッシュボード</h2>
+    </div>
+    <p class="form-subtitle">登録ユーザーと依頼案件を一覧で管理できます。運営ログイン時のみ表示されます。</p>
+
+    <div class="admin-stats" id="adminStats">
+      <article class="admin-stat-card">
+        <h3>依頼総数</h3>
+        <p id="adminStatRequests" class="admin-stat-value">0</p>
+      </article>
+      <article class="admin-stat-card">
+        <h3>新規依頼（24h）</h3>
+        <p id="adminStatRequestsToday" class="admin-stat-value">0</p>
+      </article>
+      <article class="admin-stat-card">
+        <h3>YouTuber登録数</h3>
+        <p id="adminStatCustomers" class="admin-stat-value">0</p>
+      </article>
+      <article class="admin-stat-card">
+        <h3>声優登録数</h3>
+        <p id="adminStatVoices" class="admin-stat-value">0</p>
+      </article>
+    </div>
+
+    <div class="form-card admin-tools">
+      <div class="field-row">
+        <div class="field">
+          <label for="adminSearchInput">検索（メール/名前/URL）</label>
+          <input id="adminSearchInput" type="text" placeholder="例: example.com">
+        </div>
+        <div class="field">
+          <label for="adminSourceFilter">データ元</label>
+          <select id="adminSourceFilter">
+            <option value="all">すべて</option>
+            <option value="local">localStorage</option>
+            <option value="supabase">Supabase</option>
+          </select>
+        </div>
+      </div>
+      <div class="hero-actions" style="margin-top:0.2rem">
+        <button id="adminRefreshBtn" class="btn-red" type="button">最新データに更新</button>
+        <button id="adminExportRequestsBtn" class="btn-ghost" type="button">依頼一覧CSVを出力</button>
+      </div>
+      <p id="adminMessage" class="message"></p>
+    </div>
+
+    <div class="form-card admin-table-card">
+      <h3>依頼一覧</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>日時</th>
+              <th>名前</th>
+              <th>メール</th>
+              <th>動画URL</th>
+              <th>選択声優</th>
+              <th>データ元</th>
+            </tr>
+          </thead>
+          <tbody id="adminRequestsBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="form-card admin-table-card">
+      <h3>YouTuber登録一覧</h3>
+      <p class="section-desc">依頼した海外YouTuberのみ。声優は下の一覧に表示されます。</p>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>メール</th>
+              <th>名前</th>
+              <th>チャンネルURL</th>
+              <th>データ元</th>
+            </tr>
+          </thead>
+          <tbody id="adminCustomersBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="form-card admin-table-card">
+      <h3>声優登録一覧</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>活動名</th>
+              <th>メール</th>
+              <th>ジャンル</th>
+              <th>単価</th>
+              <th>データ元</th>
+            </tr>
+          </thead>
+          <tbody id="adminVoicesBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="page-voice" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>声優登録フォーム</h2>
+    </div>
+    <p class="form-subtitle">5分で入力できます。* は必須項目です。</p>
+    <form id="voiceForm" class="form-card">
+      <div class="field-row">
+        <div class="field">
+          <label for="voiceLastName">姓 *</label>
+          <input id="voiceLastName" name="lastName" type="text" required>
+        </div>
+        <div class="field">
+          <label for="voiceFirstName">名 *</label>
+          <input id="voiceFirstName" name="firstName" type="text" required>
+        </div>
+      </div>
+      <div class="field">
+        <label for="voiceDisplayName">活動名 *</label>
+        <input id="voiceDisplayName" name="displayName" type="text" required>
+      </div>
+      <div class="field">
+        <label for="voiceEmail">メール *</label>
+        <input id="voiceEmail" name="email" type="email" required>
+      </div>
+      <div class="field">
+        <label for="voicePassword">ログイン用パスワード（Supabase用）</label>
+        <input id="voicePassword" name="password" type="password" placeholder="6文字以上">
+      </div>
+      <div class="field">
+        <label for="voiceBio">自己紹介 *</label>
+        <textarea id="voiceBio" name="bio" required></textarea>
+      </div>
+      <div class="field">
+        <label for="voiceGenres">得意ジャンル（カンマ区切り）</label>
+        <input id="voiceGenres" name="genres" type="text" placeholder="ゲーム実況, 教育, 旅行">
+      </div>
+      <div class="field">
+        <label for="voiceRateFrom">希望単価（円/分〜）任意</label>
+        <select id="voiceRateFrom" name="rateFrom">
+          <option value="">未設定</option>
+          <option value="3000">¥3,000〜</option>
+          <option value="5000">¥5,000〜</option>
+          <option value="8000" selected>¥8,000〜</option>
+          <option value="12000">¥12,000〜</option>
+          <option value="20000">¥20,000〜</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="voiceJobCount">これまでの依頼件数 任意</label>
+        <input id="voiceJobCount" name="jobCount" type="number" min="0" placeholder="例：35">
+      </div>
+      <div class="field">
+        <label for="voiceSampleUrl">音声サンプルURL *</label>
+        <input id="voiceSampleUrl" name="sampleUrl" type="url" placeholder="https://..." required>
+      </div>
+      <button class="btn-red full" type="submit">登録する</button>
+      <button id="voiceSkipButton" class="btn-ghost full" type="button">デモ入力で次へ（スキップ）</button>
+      <p id="voiceMessage" class="message"></p>
+    </form>
+  </section>
+
+  <section id="page-yt" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>YouTuber依頼フォーム</h2>
+    </div>
+    <p class="form-subtitle">動画URLを入れて、希望条件を選ぶだけで依頼できます。</p>
+    <form id="ytForm" class="form-card">
+      <div class="verify-box">
+        <div class="verify-head">
+          <h3>YouTuber（依頼者）本人確認（依頼前に必須）</h3>
+          <span id="verifyBadge" class="verify-badge">未完了</span>
+        </div>
+        <p class="verify-note">著作権保護のため、本人確認が完了するまで依頼は送信できません。チャンネル確認は Google にログインし、YouTube Data API で「自分のチャンネル」と入力URLが一致するか検証します（ポップアップが開きます）。</p>
+        <div class="verify-steps">
+          <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) メール認証を完了（デモ）</button>
+          <button id="verifyChannelBtn" class="verify-step-btn" type="button">2) Googleでチャンネル所有を確認</button>
+          <button id="verifyIdBtn" class="verify-step-btn" type="button">3) 身分証確認を完了（デモ）</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="ytName">名前 *</label>
+        <input id="ytName" name="name" type="text" required>
+      </div>
+      <div class="field">
+        <label for="ytEmail">メール *</label>
+        <input id="ytEmail" name="email" type="email" required>
+      </div>
+      <div class="field">
+        <label for="ytPassword">ログイン用パスワード（任意・6文字以上）</label>
+        <input id="ytPassword" name="password" type="password" placeholder="空欄でも依頼は送信できます">
+      </div>
+      <div class="field">
+        <label for="ytChannelUrl">YouTubeチャンネルURL *</label>
+        <input id="ytChannelUrl" name="channelUrl" type="url" placeholder="https://youtube.com/@yourchannel" required>
+      </div>
+      <div class="field">
+        <label for="ytVideoUrl">翻訳したい動画URL *</label>
+        <input id="ytVideoUrl" name="videoUrl" type="url" placeholder="https://youtube.com/watch?v=..." required>
+      </div>
+      <div class="field">
+        <label for="ytVideoChannelUrl">その動画のチャンネルURL *</label>
+        <input id="ytVideoChannelUrl" name="videoChannelUrl" type="url" placeholder="https://youtube.com/@channelname" required>
+      </div>
+      <div class="field">
+        <label for="ytTone">希望トーン</label>
+        <select id="ytTone" name="tone">
+          <option value="明るく元気">明るく元気</option>
+          <option value="落ち着いた知的">落ち着いた知的</option>
+          <option value="エネルギッシュ">エネルギッシュ</option>
+          <option value="親しみやすい">親しみやすい</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="ytDeadline">希望納期</label>
+        <select id="ytDeadline" name="deadline">
+          <option value="72時間以内">72時間以内</option>
+          <option value="1週間以内" selected>1週間以内</option>
+          <option value="2週間以内">2週間以内</option>
+        </select>
+      </div>
+      <div class="cast-mode-box">
+        <h3 class="cast-mode-title">声優の選び方</h3>
+        <div class="cast-mode-radios">
+          <label class="cast-radio">
+            <input type="radio" name="castMode" value="self" checked>
+            自分で選ぶ
+          </label>
+          <label class="cast-radio">
+            <input type="radio" name="castMode" value="recommend">
+            ジャンルなどを絞って、こちらで斡旋
+          </label>
+        </div>
+
+        <div id="castSelfBox" class="cast-box">
+          <p class="cast-subtitle">選んだ声優：</p>
+          <div class="selected-talent-card">
+            <p id="selectedTalentName" class="selected-talent-name">未選択</p>
+            <div class="hero-actions" style="margin-top:0.7rem">
+              <button id="chooseTalentBtn" class="btn-ghost" type="button">声優一覧で選ぶ</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="castRecommendBox" class="cast-box hidden">
+          <p class="cast-subtitle">斡旋のための希望（任意）</p>
+          <div class="field">
+            <label for="recGenres">希望ジャンル（カンマ区切り）</label>
+            <input id="recGenres" name="recGenres" type="text" placeholder="例：旅行,教育">
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="recBudgetMax">予算上限（円/分〜）</label>
+              <select id="recBudgetMax" name="recBudgetMax">
+                <option value="">未設定</option>
+                <option value="5000">〜¥5,000</option>
+                <option value="8000" selected>〜¥8,000</option>
+                <option value="12000">〜¥12,000</option>
+                <option value="20000">〜¥20,000</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="recJobMin">件数下限（任意）</label>
+              <select id="recJobMin" name="recJobMin">
+                <option value="">未設定</option>
+                <option value="10">10件以上</option>
+                <option value="30" selected>30件以上</option>
+                <option value="50">50件以上</option>
+              </select>
+            </div>
+          </div>
+          <button id="recommendTalentBtn" class="btn-red full" type="button">おすすめ声優を提案（デモ）</button>
+          <p id="recommendMessage" class="message"></p>
+        </div>
+      </div>
+      <button id="generateScriptButton" class="btn-ghost full" type="button">動画URLから台本を自動生成（Whisper + Grok）</button>
+      <p class="section-desc" style="margin-top:0.5rem">初回のみ Supabase Edge（media-pipeline）と API キー・音声プロキシの設定が必要です。ターミナルで scripts/ai-pipeline-setup.sh を実行すると手順が表示されます。</p>
+      <div id="aiStatus" class="ai-status hidden">
+        <p id="aiStep1">1/3 動画から音声を取得中...</p>
+        <p id="aiStep2">2/3 Whisper で文字起こし中...</p>
+        <p id="aiStep3">3/3 Grok で翻訳・台本化中...</p>
+      </div>
+      <div id="scriptPreview" class="field hidden">
+        <label for="ytScript">生成台本（編集可）</label>
+        <textarea id="ytScript" name="script"></textarea>
+      </div>
+      <button id="ytSubmitButton" class="btn-red full" type="submit" disabled>本人確認後に依頼を送信</button>
+      <button id="ytSkipButton" class="btn-ghost full" type="button">デモ入力で声優選択へ（スキップ）</button>
+      <p id="ytMessage" class="message"></p>
+    </form>
+  </section>
+
+  <!-- 日本語文言（HTML 側に置く → app.js の文字化けを防ぐ） -->
+  <div id="wavrickI18n" hidden aria-hidden="true">
+    <span data-i18n="yt_oauth_success">YouTube チャンネルの所有を Google アカウントで確認しました。</span>
+    <span data-i18n="yt_oauth_channel_id_prefix">（チャンネル ID: </span>
+    <span data-i18n="yt_oauth_channel_id_suffix">）</span>
+    <span data-i18n="yt_channel_done">2) チャンネル所有確認（Google）</span>
+    <span data-i18n="yt_channel_btn">2) Googleでチャンネル所有を確認</span>
+    <span data-i18n="yt_channel_opening">Google の画面を開いています...</span>
+    <span data-i18n="yt_channel_wait">Google の認証を完了してください...</span>
+    <span data-i18n="yt_oauth_fail">所有確認に失敗しました。</span>
+    <span data-i18n="oauth_CANCELLED">Google の認証がキャンセルされたか、拒否されました。</span>
+    <span data-i18n="oauth_TOKEN_FAILED">トークンの取得に失敗しました。</span>
+    <span data-i18n="oauth_NO_ACCESS_TOKEN">アクセストークンがありません。</span>
+    <span data-i18n="oauth_CHANNEL_RESOLVE_FAILED">チャンネルURLからチャンネルを特定できませんでした。@ハンドルまたは /channel/UC... 形式を確認してください。</span>
+    <span data-i18n="oauth_CHANNEL_MISMATCH">ログインした Google アカウントは、このチャンネルの所有者として確認できませんでした。チャンネルURLと同じアカウントでログインしてください。</span>
+    <span data-i18n="yt_oauth_postmessage_fail">認証ウィンドウは閉じましたが、結果を受け取れませんでした。必ず http://127.0.0.1:8889 で開き直してから、もう一度「2) Googleでチャンネル所有を確認」を押してください。</span>
+  </div>
+
+  <footer>
+    <span>© 2026 WAVRICK</span>
+    <span>これはMVP（試作版）です</span>
+  </footer>
+
+  <script>
+    window.WAVRICK_CONFIG = window.WAVRICK_CONFIG || {
+      supabaseUrl: "https://gdolqgcftxqxaacjyqla.supabase.co",
+      supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdkb2xxZ2NmdHhxeGFhY2p5cWxhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4Mjg2NTksImV4cCI6MjA5NDQwNDY1OX0.OzuD8nAAx1ksQmD1p3Dupltbkv93vTxtRGtPoXiz7w0"
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="./app.js?v=oauth-b64-6" charset="UTF-8"></script>
+</body>
+</html>
