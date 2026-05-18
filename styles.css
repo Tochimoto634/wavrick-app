@@ -670,34 +670,6 @@ nav a { color: var(--body); text-decoration: none; font-size: 0.95rem; }
   background: rgba(110, 231, 168, 0.12);
 }
 
-.verify-identity-block {
-  margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  display: flex;
-  flex-direction: column;
-  gap: 0.65rem;
-}
-
-.verify-agree-field {
-  display: flex;
-  gap: 0.55rem;
-  align-items: flex-start;
-  font-size: 0.88rem;
-  color: var(--body);
-  cursor: pointer;
-  line-height: 1.45;
-}
-
-.verify-agree-field input {
-  margin-top: 0.2rem;
-  flex-shrink: 0;
-}
-
-.verify-id-file-field {
-  margin-bottom: 0;
-}
-
 .admin-identity-col {
   max-width: 11rem;
   font-size: 0.86rem;

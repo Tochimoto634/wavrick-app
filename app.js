@@ -1502,17 +1502,10 @@ function bindYtForm() {
   const verifyBadge = document.getElementById("verifyBadge");
   const verifyEmailBtn = document.getElementById("verifyEmailBtn");
   const verifyChannelBtn = document.getElementById("verifyChannelBtn");
-  const verifyIdBtn = document.getElementById("verifyIdBtn");
-  const ytIdentityAgree = document.getElementById("ytIdentityAgree");
-  const ytIdProofFile = document.getElementById("ytIdProofFile");
-  const ytIdProofHint = document.getElementById("ytIdProofHint");
-
-  let ytIdentityProof = { dataUrl: "", fileName: "" };
 
   const verifyState = {
     email: false,
     channel: false,
-    id: false,
     verifiedChannelKey: "",
     verifiedChannelId: ""
   };
@@ -1620,7 +1613,7 @@ function bindYtForm() {
   }
 
   function refreshVerificationUi() {
-    const verified = verifyState.email && verifyState.channel && verifyState.id;
+    const verified = verifyState.email && verifyState.channel;
     if (submitButton) {
       submitButton.disabled = !verified;
       submitButton.textContent = verified ? "依頼を送信する" : "本人確認後に依頼を送信";
@@ -1765,53 +1758,6 @@ function bindYtForm() {
     });
   }
 
-  if (ytIdProofFile) {
-    ytIdProofFile.addEventListener("change", () => {
-      const f = ytIdProofFile.files && ytIdProofFile.files[0];
-      if (!f) {
-        ytIdentityProof = { dataUrl: "", fileName: "" };
-        if (ytIdProofHint) ytIdProofHint.textContent = "";
-        return;
-      }
-      if (f.size > 1.5 * 1024 * 1024) {
-        setMessage("ytMessage", "身分証画像は 1.5MB までにしてください。", "err");
-        ytIdProofFile.value = "";
-        ytIdentityProof = { dataUrl: "", fileName: "" };
-        if (ytIdProofHint) ytIdProofHint.textContent = "";
-        return;
-      }
-      const reader = new FileReader();
-      reader.onload = () => {
-        ytIdentityProof = { dataUrl: String(reader.result || ""), fileName: f.name || "upload" };
-        if (ytIdProofHint) ytIdProofHint.textContent = `${f.name}（依頼送信時に同梱されます）`;
-      };
-      reader.onerror = () => {
-        setMessage("ytMessage", "画像の読み込みに失敗しました。", "err");
-        ytIdProofFile.value = "";
-        ytIdentityProof = { dataUrl: "", fileName: "" };
-        if (ytIdProofHint) ytIdProofHint.textContent = "";
-      };
-      reader.readAsDataURL(f);
-    });
-  }
-
-  if (verifyIdBtn) {
-    verifyIdBtn.addEventListener("click", () => {
-      if (!ytIdentityAgree || !ytIdentityAgree.checked) {
-        setMessage("ytMessage", "身分証ステップの誓約にチェックを入れてから完了してください。", "err");
-        return;
-      }
-      markStepDone("id", verifyIdBtn, "3) 誓約・身分証完了");
-      setMessage(
-        "ytMessage",
-        ytIdentityProof.dataUrl
-          ? "誓約と身分証画像を確認しました。依頼送信でデータに含まれます（運営が目視確認するまで審査中扱い）。"
-          : "誓約を確認しました。依頼を送信できます。",
-        "ok"
-      );
-    });
-  }
-
   refreshVerificationUi();
 
   form.addEventListener("submit", async (event) => {
@@ -1819,7 +1765,7 @@ function bindYtForm() {
     setMessage("ytMessage", "");
     initSupabaseClient();
     const data = Object.fromEntries(new FormData(form).entries());
-    const verified = verifyState.email && verifyState.channel && verifyState.id;
+    const verified = verifyState.email && verifyState.channel;
 
     if (!data.email.includes("@")) {
       setMessage("ytMessage", "メールアドレスの形式を確認してください。", "err");
@@ -1831,7 +1777,7 @@ function bindYtForm() {
       return;
     }
     if (!verified) {
-      setMessage("ytMessage", "依頼送信の前に、本人確認3ステップを完了してください。", "err");
+      setMessage("ytMessage", "依頼送信の前に、本人確認（①メール ②チャンネル所有）を完了してください。", "err");
       return;
     }
     if (isSupabaseEnabled() && data.password && data.password.length < 6) {
@@ -1882,12 +1828,7 @@ function bindYtForm() {
     }
 
     const { password: _customerPassword, ...ytDataForSave } = data;
-    ytDataForSave.identityProofAgreedAt = new Date().toISOString();
-    ytDataForSave.identityProofImageDataUrl = ytIdentityProof.dataUrl || "";
-    ytDataForSave.identityProofFileName = ytIdentityProof.fileName || "";
-    ytDataForSave.identityProofText = ytIdentityProof.dataUrl
-      ? "誓約済み・身分証画像同梱（運営確認前）"
-      : "誓約済み（画像は任意で未添付）";
+    ytDataForSave.identityProofText = "メール確認+YouTubeチャンネル所有確認まで";
     saveLocal("wavrick_youtube_requests", ytDataForSave);
     const workflows = getWorkflows();
     workflows[ytDataForSave.requestId] = {
@@ -1926,23 +1867,17 @@ function bindYtForm() {
       })
     );
     form.reset();
-    ytIdentityProof = { dataUrl: "", fileName: "" };
-    if (ytIdProofFile) ytIdProofFile.value = "";
-    if (ytIdProofHint) ytIdProofHint.textContent = "";
-    if (ytIdentityAgree) ytIdentityAgree.checked = false;
-    verifyState.email = false;
-    verifyState.channel = false;
-    verifyState.id = false;
-    verifyState.verifiedChannelKey = "";
-    verifyState.verifiedChannelId = "";
-    [verifyEmailBtn, verifyChannelBtn, verifyIdBtn].forEach((btn) => {
+    [verifyEmailBtn, verifyChannelBtn].forEach((btn) => {
       if (!btn) return;
       btn.disabled = false;
       btn.classList.remove("done");
     });
     if (verifyEmailBtn) verifyEmailBtn.textContent = "1) 確認メールを送信";
     if (verifyChannelBtn) verifyChannelBtn.textContent = "2) Googleでチャンネル所有を確認";
-    if (verifyIdBtn) verifyIdBtn.textContent = "3) 誓約・身分証を完了";
+    verifyState.email = false;
+    verifyState.channel = false;
+    verifyState.verifiedChannelKey = "";
+    verifyState.verifiedChannelId = "";
     refreshVerificationUi();
     tryApplyYtEmailVerificationFromSession();
     const sp = document.getElementById("scriptPreview");
@@ -2071,16 +2006,12 @@ function bindYtForm() {
 
       const btnEmail = document.getElementById("verifyEmailBtn");
       const btnChannel = document.getElementById("verifyChannelBtn");
-      const btnId = document.getElementById("verifyIdBtn");
-      const agree = document.getElementById("ytIdentityAgree");
       if (btnEmail) btnEmail.click();
       if (btnChannel) {
         const verifyKey = normalizeYoutubeChannelKey(demoChannelUrl);
         verifyState.verifiedChannelKey = verifyKey;
         markStepDone("channel", btnChannel, "2) デモ: チャンネル所有（本番はGoogle）");
       }
-      if (agree) agree.checked = true;
-      if (btnId) btnId.click();
 
       showPage("talents");
     });

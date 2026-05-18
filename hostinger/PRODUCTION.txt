@@ -14,8 +14,6 @@ Supabase Auth（メール認証リンク用）Dashboard → Authentication → U
 
 メール送信: Dashboard → Authentication → Providers → Email を有効化
 
-身分証（依頼の Supabase 保存用）: SQL Editor で次を1回実行
-  supabase-migration-identity-proof.sql
-  （未実行だと identityprooftext 列がなく Supabase への依頼 insert が失敗することがあります）
+身分証列（identityprooftext）: 依頼フローは①メール②チャンネル所有のみ。保存値は運営向けメモ程度。
 
 Hostinger 配置: public_html 直下（index.html など）

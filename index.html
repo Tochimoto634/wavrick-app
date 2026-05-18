@@ -468,25 +468,13 @@
     <form id="ytForm" class="form-card">
       <div class="verify-box">
         <div class="verify-head">
-          <h3>YouTuber（依頼者）本人確認（依頼前に必須）</h3>
+          <h3>YouTuber（依頼者）本人確認（①メール ②チャンネル所有）</h3>
           <span id="verifyBadge" class="verify-badge">未完了</span>
         </div>
-        <p class="verify-note">著作権保護のため、本人確認が完了するまで依頼は送信できません。チャンネル確認は Google にログインし、YouTube Data API で「自分のチャンネル」と入力URLが一致するか検証します（ポップアップが開きます）。</p>
+        <p class="verify-note">著作権保護のため、本人確認が完了するまで依頼は送信できません。①でメールを確認し、②で Google にログインして YouTube チャンネルの所有者と入力URLが一致するか検証します（ポップアップが開きます）。</p>
         <div class="verify-steps">
           <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) 確認メールを送信</button>
           <button id="verifyChannelBtn" class="verify-step-btn" type="button">2) Googleでチャンネル所有を確認</button>
-        </div>
-        <div class="verify-identity-block">
-          <label class="verify-agree-field">
-            <input type="checkbox" id="ytIdentityAgree" autocomplete="off" />
-            <span>本人であること、および身分証の取り扱い（運営が確認するまで審査中となりうること）に同意します。</span>
-          </label>
-          <div class="field verify-id-file-field">
-            <label for="ytIdProofFile">身分証画像（任意・1.5MBまで・JPEG / PNG / WebP）</label>
-            <input id="ytIdProofFile" type="file" accept="image/jpeg,image/png,image/webp" />
-            <p id="ytIdProofHint" class="field-hint"></p>
-          </div>
-          <button id="verifyIdBtn" class="verify-step-btn" type="button">3) 誓約・身分証を完了</button>
         </div>
       </div>
       <div class="field">
@@ -661,6 +649,6 @@
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="./app.js?v=ui-2026-05-8" charset="UTF-8"></script>
+  <script src="./app.js?v=ui-2026-05-9" charset="UTF-8"></script>
 </body>
 </html>
