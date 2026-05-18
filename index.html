@@ -333,6 +333,7 @@
               <th>依頼者</th>
               <th>動画</th>
               <th>声優</th>
+              <th>身分証</th>
               <th>元</th>
             </tr>
           </thead>
@@ -474,7 +475,18 @@
         <div class="verify-steps">
           <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) 確認メールを送信</button>
           <button id="verifyChannelBtn" class="verify-step-btn" type="button">2) Googleでチャンネル所有を確認</button>
-          <button id="verifyIdBtn" class="verify-step-btn" type="button">3) 身分証確認を完了（デモ）</button>
+        </div>
+        <div class="verify-identity-block">
+          <label class="verify-agree-field">
+            <input type="checkbox" id="ytIdentityAgree" autocomplete="off" />
+            <span>本人であること、および身分証の取り扱い（運営が確認するまで審査中となりうること）に同意します。</span>
+          </label>
+          <div class="field verify-id-file-field">
+            <label for="ytIdProofFile">身分証画像（任意・1.5MBまで・JPEG / PNG / WebP）</label>
+            <input id="ytIdProofFile" type="file" accept="image/jpeg,image/png,image/webp" />
+            <p id="ytIdProofHint" class="field-hint"></p>
+          </div>
+          <button id="verifyIdBtn" class="verify-step-btn" type="button">3) 誓約・身分証を完了</button>
         </div>
       </div>
       <div class="field">
@@ -649,6 +661,6 @@
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="./app.js?v=ui-2026-05-7" charset="UTF-8"></script>
+  <script src="./app.js?v=ui-2026-05-8" charset="UTF-8"></script>
 </body>
 </html>

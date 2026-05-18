@@ -573,7 +573,8 @@ function mapYoutubeRequestToRemote(data) {
     recgenres: data.recGenres || "",
     recbudgetmax: data.recBudgetMax || "",
     recjobmin: data.recJobMin || "",
-    script: data.script || ""
+    script: data.script || "",
+    identityprooftext: data.identityProofText || ""
   };
 }
 
@@ -605,7 +606,9 @@ function mapYoutubeRequestFromRemote(row) {
     videoChannelUrl: row.videochannelurl || "",
     selectedTalentName: row.selectedtalentname || "",
     castMode: row.castmode || "",
-    createdAt: row.created_at || ""
+    createdAt: row.created_at || "",
+    script: row.script || "",
+    identityProofText: row.identityprooftext || row.identityProofText || ""
   };
 }
 
@@ -1500,6 +1503,11 @@ function bindYtForm() {
   const verifyEmailBtn = document.getElementById("verifyEmailBtn");
   const verifyChannelBtn = document.getElementById("verifyChannelBtn");
   const verifyIdBtn = document.getElementById("verifyIdBtn");
+  const ytIdentityAgree = document.getElementById("ytIdentityAgree");
+  const ytIdProofFile = document.getElementById("ytIdProofFile");
+  const ytIdProofHint = document.getElementById("ytIdProofHint");
+
+  let ytIdentityProof = { dataUrl: "", fileName: "" };
 
   const verifyState = {
     email: false,
@@ -1757,10 +1765,50 @@ function bindYtForm() {
     });
   }
 
+  if (ytIdProofFile) {
+    ytIdProofFile.addEventListener("change", () => {
+      const f = ytIdProofFile.files && ytIdProofFile.files[0];
+      if (!f) {
+        ytIdentityProof = { dataUrl: "", fileName: "" };
+        if (ytIdProofHint) ytIdProofHint.textContent = "";
+        return;
+      }
+      if (f.size > 1.5 * 1024 * 1024) {
+        setMessage("ytMessage", "身分証画像は 1.5MB までにしてください。", "err");
+        ytIdProofFile.value = "";
+        ytIdentityProof = { dataUrl: "", fileName: "" };
+        if (ytIdProofHint) ytIdProofHint.textContent = "";
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        ytIdentityProof = { dataUrl: String(reader.result || ""), fileName: f.name || "upload" };
+        if (ytIdProofHint) ytIdProofHint.textContent = `${f.name}（依頼送信時に同梱されます）`;
+      };
+      reader.onerror = () => {
+        setMessage("ytMessage", "画像の読み込みに失敗しました。", "err");
+        ytIdProofFile.value = "";
+        ytIdentityProof = { dataUrl: "", fileName: "" };
+        if (ytIdProofHint) ytIdProofHint.textContent = "";
+      };
+      reader.readAsDataURL(f);
+    });
+  }
+
   if (verifyIdBtn) {
     verifyIdBtn.addEventListener("click", () => {
-      markStepDone("id", verifyIdBtn, "3) 身分証確認を完了");
-      setMessage("ytMessage", "本人確認が完了しました。依頼を送信できます。", "ok");
+      if (!ytIdentityAgree || !ytIdentityAgree.checked) {
+        setMessage("ytMessage", "身分証ステップの誓約にチェックを入れてから完了してください。", "err");
+        return;
+      }
+      markStepDone("id", verifyIdBtn, "3) 誓約・身分証完了");
+      setMessage(
+        "ytMessage",
+        ytIdentityProof.dataUrl
+          ? "誓約と身分証画像を確認しました。依頼送信でデータに含まれます（運営が目視確認するまで審査中扱い）。"
+          : "誓約を確認しました。依頼を送信できます。",
+        "ok"
+      );
     });
   }
 
@@ -1834,6 +1882,12 @@ function bindYtForm() {
     }
 
     const { password: _customerPassword, ...ytDataForSave } = data;
+    ytDataForSave.identityProofAgreedAt = new Date().toISOString();
+    ytDataForSave.identityProofImageDataUrl = ytIdentityProof.dataUrl || "";
+    ytDataForSave.identityProofFileName = ytIdentityProof.fileName || "";
+    ytDataForSave.identityProofText = ytIdentityProof.dataUrl
+      ? "誓約済み・身分証画像同梱（運営確認前）"
+      : "誓約済み（画像は任意で未添付）";
     saveLocal("wavrick_youtube_requests", ytDataForSave);
     const workflows = getWorkflows();
     workflows[ytDataForSave.requestId] = {
@@ -1872,7 +1926,27 @@ function bindYtForm() {
       })
     );
     form.reset();
-    document.getElementById("scriptPreview").classList.add("hidden");
+    ytIdentityProof = { dataUrl: "", fileName: "" };
+    if (ytIdProofFile) ytIdProofFile.value = "";
+    if (ytIdProofHint) ytIdProofHint.textContent = "";
+    if (ytIdentityAgree) ytIdentityAgree.checked = false;
+    verifyState.email = false;
+    verifyState.channel = false;
+    verifyState.id = false;
+    verifyState.verifiedChannelKey = "";
+    verifyState.verifiedChannelId = "";
+    [verifyEmailBtn, verifyChannelBtn, verifyIdBtn].forEach((btn) => {
+      if (!btn) return;
+      btn.disabled = false;
+      btn.classList.remove("done");
+    });
+    if (verifyEmailBtn) verifyEmailBtn.textContent = "1) 確認メールを送信";
+    if (verifyChannelBtn) verifyChannelBtn.textContent = "2) Googleでチャンネル所有を確認";
+    if (verifyIdBtn) verifyIdBtn.textContent = "3) 誓約・身分証を完了";
+    refreshVerificationUi();
+    tryApplyYtEmailVerificationFromSession();
+    const sp = document.getElementById("scriptPreview");
+    if (sp) sp.classList.add("hidden");
     if (requestResult.ok && signupResult.ok && isSupabaseEnabled()) {
       setMessage("ytMessage", "依頼を受け付けました（Auth + Supabase + ローカル保存）。", "ok");
     } else if (requestResult.ok) {
@@ -1998,12 +2072,14 @@ function bindYtForm() {
       const btnEmail = document.getElementById("verifyEmailBtn");
       const btnChannel = document.getElementById("verifyChannelBtn");
       const btnId = document.getElementById("verifyIdBtn");
+      const agree = document.getElementById("ytIdentityAgree");
       if (btnEmail) btnEmail.click();
       if (btnChannel) {
         const verifyKey = normalizeYoutubeChannelKey(demoChannelUrl);
         verifyState.verifiedChannelKey = verifyKey;
         markStepDone("channel", btnChannel, "2) デモ: チャンネル所有（本番はGoogle）");
       }
+      if (agree) agree.checked = true;
       if (btnId) btnId.click();
 
       showPage("talents");
@@ -2096,7 +2172,8 @@ function matchesAdminFilters(row, keyword, sourceFilter) {
     row.channelUrl,
     row.videoUrl,
     row.selectedTalentName,
-    row.genres
+    row.genres,
+    row.identityProofText
   ]
     .filter(Boolean)
     .join(" ")
@@ -2145,17 +2222,19 @@ function renderAdminRequestsBody(rows) {
   const body = document.getElementById("adminRequestsBody");
   if (!body) return;
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="5" class="admin-empty">データがありません。</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="admin-empty">データがありません。</td></tr>`;
     return;
   }
   body.innerHTML = rows
     .map((row) => {
       const who = `<div class="admin-cell-stack"><strong>${escapeHtml(row.name || "-")}</strong><span class="admin-muted">${escapeHtml(row.email || "-")}</span></div>`;
+      const idCell = escapeHtml(row.identityProofText || "-");
       return `<tr>
         <td class="admin-nowrap">${escapeHtml(row.createdAtText || "-")}</td>
         <td>${who}</td>
         <td>${adminLinkCell(row.videoUrl)}</td>
         <td>${escapeHtml(row.selectedTalentName || "-")}</td>
+        <td class="admin-identity-col">${idCell}</td>
         <td>${adminSourceBadge(row.source)}</td>
       </tr>`;
     })
@@ -2246,6 +2325,7 @@ function renderAdminDashboard() {
       email: row.email || "-",
       videoUrl: row.videoUrl || "-",
       selectedTalentName: row.selectedTalentName || "-",
+      identityProofText: row.identityProofText || "",
       source: row.source || "local"
     }))
   );
@@ -2284,7 +2364,8 @@ async function loadAdminData() {
       channelUrl: row.channelUrl || "",
       videoUrl: row.videoUrl || "",
       selectedTalentName: row.selectedTalentName || "",
-      createdAt: row.createdAt || ""
+      createdAt: row.createdAt || "",
+      identityProofText: row.identityProofText || ""
     })),
     "local"
   );
@@ -2380,7 +2461,7 @@ function bindAdminDashboard() {
 
   exportBtn.addEventListener("click", () => {
     const lines = [
-      toCsvLine(["createdAt", "name", "email", "videoUrl", "selectedTalentName", "source"])
+      toCsvLine(["createdAt", "name", "email", "videoUrl", "selectedTalentName", "identityProofText", "source"])
     ];
     adminDataState.requests.forEach((row) => {
       lines.push(
@@ -2390,6 +2471,7 @@ function bindAdminDashboard() {
           row.email || "",
           row.videoUrl || "",
           row.selectedTalentName || "",
+          row.identityProofText || "",
           row.source
         ])
       );
