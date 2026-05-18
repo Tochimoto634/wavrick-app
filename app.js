@@ -216,7 +216,26 @@ function bindNavigation() {
 }
 
 function isYouTubeUrl(value) {
-  return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(value);
+  const raw = String(value || "").trim().replace(/[\r\n]+/g, "");
+  if (!raw) return false;
+  try {
+    const normalized = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    const base = host.startsWith("www.") ? host.slice(4) : host;
+    if (base === "youtu.be") return u.pathname.replace(/^\//, "").length >= 6;
+    if (
+      base === "youtube.com" ||
+      base === "m.youtube.com" ||
+      base === "music.youtube.com" ||
+      base === "youtube-nocookie.com"
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//i.test(raw);
+  }
 }
 
 function decodeUriComponentSafe(value) {
@@ -1325,6 +1344,9 @@ function formatMediaPipelineErrorMessage(raw) {
       "（台本生成を使う間は、Mac上で音声プロキシとトンネルを起動したままにしてください。）"
     );
   }
+  if (/解釈できません|動画URLとして/i.test(m)) {
+    return `${m} 例: watch?v=11文字のID、youtu.be/ID、/shorts/ID、/live/ID のURLを試してください。`;
+  }
   return m;
 }
 
@@ -1381,7 +1403,11 @@ function bindMediaPipelineUi() {
   button.addEventListener("click", async () => {
     const videoUrl = videoUrlField.value.trim();
     if (!isYouTubeUrl(videoUrl)) {
-      setMessage("ytMessage", "先に正しい YouTube 動画URLを入力してください。", "err");
+      setMessage(
+        "ytMessage",
+        "YouTube の動画URLとして認識できませんでした。例: https://www.youtube.com/watch?v=… / https://youtu.be/… / m.youtube.com のURLも利用できます。",
+        "err"
+      );
       return;
     }
     if (!initSupabaseClient()) {

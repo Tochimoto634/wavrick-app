@@ -30,7 +30,12 @@ function extractYouTubeVideoId(raw: string): string | null {
       const id = u.pathname.replace(/^\//, "").split("/")[0] || "";
       return /^[\w-]{11}$/.test(id) ? id : null;
     }
-    if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
+    if (
+      host === "youtube.com" ||
+      host === "m.youtube.com" ||
+      host === "music.youtube.com" ||
+      host === "youtube-nocookie.com"
+    ) {
       if (u.pathname === "/watch") {
         const v = u.searchParams.get("v");
         return v && /^[\w-]{11}$/.test(v) ? v : null;
@@ -39,6 +44,8 @@ function extractYouTubeVideoId(raw: string): string | null {
       if (shorts?.[1]) return shorts[1];
       const embed = u.pathname.match(/^\/embed\/([\w-]{11})/);
       if (embed?.[1]) return embed[1];
+      const live = u.pathname.match(/^\/live\/([\w-]{11})/);
+      if (live?.[1]) return live[1];
     }
     return null;
   } catch {
