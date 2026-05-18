@@ -161,22 +161,52 @@ nav a { color: var(--body); text-decoration: none; font-size: 0.95rem; }
 .card h3 { margin-bottom: 0.7rem; }
 .card li { margin-left: 1.2rem; color: var(--body); }
 
-.talent-slider-wrap {
-  overflow: hidden;
+.talent-slider-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
   border: 1px solid var(--line);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.02);
+  padding: 0.65rem 0;
+  overflow: hidden;
+}
+
+.talent-slider-row {
+  overflow: hidden;
 }
 
 .talent-slider-track {
   display: flex;
   gap: 0.9rem;
   width: max-content;
-  padding: 1rem;
-  animation: slideTalents 28s linear infinite;
+  padding: 0.35rem 1rem;
+  animation: slideTalentsLeft 28s linear infinite;
 }
 
-.talent-slider-wrap:hover .talent-slider-track { animation-play-state: paused; }
+.talent-slider-track--right {
+  animation-name: slideTalentsRight;
+}
+
+.talent-slider-rows:hover .talent-slider-track {
+  animation-play-state: paused;
+}
+
+.talent-card--clickable {
+  cursor: pointer;
+  transition: border-color 0.2s, transform 0.15s, box-shadow 0.15s;
+}
+
+.talent-card--clickable:hover {
+  border-color: rgba(77, 159, 255, 0.55);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25);
+}
+
+.talent-card--clickable:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
 
 .talent-card {
   min-width: 250px;
@@ -273,9 +303,95 @@ nav a { color: var(--body); text-decoration: none; font-size: 0.95rem; }
 }
 .talent-cta:hover { border-color: rgba(77, 159, 255, 0.7); }
 
-@keyframes slideTalents {
+@keyframes slideTalentsLeft {
   from { transform: translateX(0); }
   to { transform: translateX(-50%); }
+}
+
+@keyframes slideTalentsRight {
+  from { transform: translateX(-50%); }
+  to { transform: translateX(0); }
+}
+
+.talent-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+}
+
+.talent-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(4px);
+}
+
+.talent-modal-panel {
+  position: relative;
+  z-index: 1;
+  width: min(520px, 100%);
+  max-height: min(88vh, 720px);
+  overflow-y: auto;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #14161c;
+  padding: 1.35rem 1.25rem 1.25rem;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.talent-modal-close {
+  position: absolute;
+  top: 0.65rem;
+  right: 0.75rem;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font-size: 1.6rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.talent-modal-close:hover { color: var(--white); }
+
+.talent-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  padding-right: 1.5rem;
+}
+
+.talent-modal-title {
+  font-family: "Bebas Neue", sans-serif;
+  font-size: 1.85rem;
+  letter-spacing: 0.04em;
+  margin: 0 0 0.2rem;
+}
+
+.talent-modal-bio {
+  color: var(--body);
+  margin-bottom: 0.85rem;
+  white-space: pre-wrap;
+}
+
+.talent-modal-sample {
+  margin: 0.75rem 0 1rem;
+  font-size: 0.92rem;
+}
+
+.talent-modal-sample a {
+  color: var(--blue);
+  word-break: break-all;
+}
+
+.talent-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
 }
 
 .form-page {

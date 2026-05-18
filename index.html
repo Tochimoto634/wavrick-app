@@ -66,13 +66,11 @@
       <div class="section-head">
         <div>
           <h2>登録中の声優</h2>
-          <p class="section-desc">登録された声優情報が横に流れて表示されます。クリックで詳細一覧にも移動できます。</p>
+          <p class="section-desc">登録された声優が流れて表示されます。カードをクリックするとプロフィールを開けます。</p>
         </div>
         <button class="btn-ghost" data-go="talents">声優一覧を見る</button>
       </div>
-      <div class="talent-slider-wrap">
-        <div id="talentSliderTrack" class="talent-slider-track"></div>
-      </div>
+      <div id="talentSliderRows" class="talent-slider-rows" aria-label="登録中の声優"></div>
     </section>
   </main>
 
@@ -612,6 +610,28 @@
     <span data-i18n="yt_oauth_postmessage_fail">認証ウィンドウは閉じましたが、結果を受け取れませんでした。必ず http://127.0.0.1:8889 で開き直してから、もう一度「2) Googleでチャンネル所有を確認」を押してください。</span>
   </div>
 
+
+  <div id="talentProfileModal" class="talent-modal hidden" role="dialog" aria-modal="true" aria-labelledby="talentModalTitle">
+    <div class="talent-modal-backdrop" data-close-talent-modal tabindex="-1"></div>
+    <div class="talent-modal-panel">
+      <button type="button" class="talent-modal-close" data-close-talent-modal aria-label="閉じる">×</button>
+      <div class="talent-modal-head">
+        <div id="talentModalAvatar" class="talent-avatar talent-avatar-preview"></div>
+        <div>
+          <h2 id="talentModalTitle" class="talent-modal-title">声優プロフィール</h2>
+          <p id="talentModalMeta" class="talent-meta"></p>
+        </div>
+      </div>
+      <p id="talentModalBio" class="talent-modal-bio"></p>
+      <div id="talentModalTags" class="talent-tags"></div>
+      <p id="talentModalSample" class="talent-modal-sample"></p>
+      <div class="talent-modal-actions">
+        <button type="button" class="btn-red" id="talentModalRequestBtn">この声優に依頼する</button>
+        <button type="button" class="btn-ghost" data-go="talents" data-close-talent-modal>声優一覧へ</button>
+      </div>
+    </div>
+  </div>
+
   <footer>
     <span>© 2026 WAVRICK</span>
     <span>これはMVP（試作版）です</span>
@@ -624,6 +644,6 @@
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="./app.js?v=ui-2026-05-4" charset="UTF-8"></script>
+  <script src="./app.js?v=ui-2026-05-5" charset="UTF-8"></script>
 </body>
 </html>

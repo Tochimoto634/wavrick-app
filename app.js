@@ -864,23 +864,49 @@ function loadVoiceProfiles() {
   return [...map.values()];
 }
 
-function createTalentCard(profile, withButton = false) {
+const TALENT_HOME_SLIDER_ROWS = 6;
+
+function getTalentDisplayMeta(profile) {
+  const name = profile.displayName || `${profile.lastName || ""} ${profile.firstName || ""}`.trim() || "未設定";
+  const rateFrom = profile.rateFrom ? Number(profile.rateFrom) : null;
+  const rateText = rateFrom !== null && !Number.isNaN(rateFrom) ? `¥${rateFrom.toLocaleString()}/分〜` : "料金未設定";
+  const jobCount =
+    profile.jobCount !== undefined && profile.jobCount !== null && profile.jobCount !== ""
+      ? Number(profile.jobCount)
+      : null;
+  const jobsText = jobCount !== null && !Number.isNaN(jobCount) ? `経験 ${jobCount}件` : "経験 未入力";
+  return { name, meta: `${rateText} / ${jobsText}` };
+}
+
+function splitProfilesIntoSliderRows(profiles, rowCount) {
+  const rows = Array.from({ length: rowCount }, () => []);
+  if (!profiles.length) return rows;
+  profiles.forEach((profile, index) => {
+    rows[index % rowCount].push(profile);
+  });
+  for (let i = 0; i < rowCount; i++) {
+    if (!rows[i].length) rows[i] = [...profiles];
+  }
+  return rows;
+}
+
+function createTalentCard(profile, withButton = false, options = {}) {
+  const { clickable = false } = options;
   const genres = parseGenres(profile.genres).slice(0, 3);
 
   const tagsHtml = genres.length
     ? genres.map((genre) => `<span class="talent-tag">${genre}</span>`).join("")
     : `<span class="talent-tag">ジャンル未設定</span>`;
 
-  const name = profile.displayName || `${profile.lastName || ""} ${profile.firstName || ""}`.trim() || "未設定";
-  const rateFrom = profile.rateFrom ? Number(profile.rateFrom) : null;
-  const rateText = rateFrom !== null ? `¥${rateFrom.toLocaleString()}/分〜` : "料金未設定";
-  const jobCount = profile.jobCount !== undefined && profile.jobCount !== null && profile.jobCount !== "" ? Number(profile.jobCount) : null;
-  const jobsText = jobCount !== null && !Number.isNaN(jobCount) ? `経験 ${jobCount}件` : "経験 未入力";
-  const meta = profile.sampleUrl ? `${rateText} / ${jobsText}` : `${rateText} / ${jobsText}`;
+  const { name, meta } = getTalentDisplayMeta(profile);
   const tid = getTalentId(profile);
+  const cardClass = clickable ? "talent-card talent-card--clickable" : "talent-card";
+  const clickAttrs = clickable
+    ? ` data-talent-id="${tid}" role="button" tabindex="0" aria-label="${name}のプロフィールを開く"`
+    : "";
 
   return `
-    <article class="talent-card">
+    <article class="${cardClass}"${clickAttrs}>
       <div class="talent-top">
         ${renderTalentAvatarHtml(profile)}
         <div>
@@ -899,14 +925,150 @@ function createTalentCard(profile, withButton = false) {
   `;
 }
 
+function renderHomeTalentSlider(profiles) {
+  const sliderRows = document.getElementById("talentSliderRows");
+  if (!sliderRows) return;
+
+  const rows = splitProfilesIntoSliderRows(profiles, TALENT_HOME_SLIDER_ROWS);
+  sliderRows.innerHTML = rows
+    .map((rowProfiles, rowIndex) => {
+      const scrollLeft = rowIndex % 2 === 0;
+      const trackClass = scrollLeft ? "talent-slider-track" : "talent-slider-track talent-slider-track--right";
+      const duration = 24 + (rowIndex % 4) * 4;
+      const cards = rowProfiles.map((p) => createTalentCard(p, false, { clickable: true })).join("");
+      const duplicated = cards + cards;
+      return `
+        <div class="talent-slider-row">
+          <div class="talent-slider-track ${trackClass}" style="animation-duration: ${duration}s">
+            ${duplicated}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+let talentModalProfile = null;
+
+function closeTalentProfileModal() {
+  const modal = document.getElementById("talentProfileModal");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  talentModalProfile = null;
+  document.body.style.overflow = "";
+}
+
+function openTalentProfileModal(profile) {
+  const modal = document.getElementById("talentProfileModal");
+  if (!modal || !profile) return;
+
+  talentModalProfile = profile;
+  const { name, meta } = getTalentDisplayMeta(profile);
+  const genres = parseGenres(profile.genres);
+
+  const titleEl = document.getElementById("talentModalTitle");
+  const metaEl = document.getElementById("talentModalMeta");
+  const bioEl = document.getElementById("talentModalBio");
+  const tagsEl = document.getElementById("talentModalTags");
+  const sampleEl = document.getElementById("talentModalSample");
+  const avatarEl = document.getElementById("talentModalAvatar");
+
+  if (titleEl) titleEl.textContent = name;
+  if (metaEl) metaEl.textContent = meta;
+  if (bioEl) bioEl.textContent = profile.bio || "自己紹介はこれから登録されます。";
+  if (tagsEl) {
+    tagsEl.innerHTML = genres.length
+      ? genres.map((g) => `<span class="talent-tag">${g}</span>`).join("")
+      : `<span class="talent-tag">ジャンル未設定</span>`;
+  }
+  if (sampleEl) {
+    const url = (profile.sampleUrl || "").trim();
+    sampleEl.innerHTML = url
+      ? `音声サンプル: <a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+      : "音声サンプル: 未登録";
+  }
+  if (avatarEl) {
+    avatarEl.outerHTML = renderTalentAvatarHtml(profile, "talent-avatar talent-avatar-preview", "talentModalAvatar");
+  }
+
+  modal.classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+}
+
+function selectTalentForYtRequest(profile) {
+  if (!profile) return;
+  const tid = getTalentId(profile);
+  const payload = {
+    talentId: tid,
+    displayName: profile.displayName || getTalentDisplayMeta(profile).name,
+    rateFrom: profile.rateFrom || null,
+    jobCount: profile.jobCount || null,
+    genres: profile.genres || "",
+    avatarUrl: getTalentAvatarSrc(profile)
+  };
+  localStorage.setItem("wavrick_selected_talent", JSON.stringify(payload));
+  const ytRadioSelf = document.querySelector('#ytForm input[name="castMode"][value="self"]');
+  if (ytRadioSelf) ytRadioSelf.checked = true;
+  updateSelectedTalentUi(payload);
+  showPage("yt");
+}
+
+function bindTalentProfileModal() {
+  const modal = document.getElementById("talentProfileModal");
+  if (!modal || modal.dataset.bound === "1") return;
+  modal.dataset.bound = "1";
+
+  modal.querySelectorAll("[data-close-talent-modal]").forEach((el) => {
+    el.addEventListener("click", () => closeTalentProfileModal());
+  });
+
+  const requestBtn = document.getElementById("talentModalRequestBtn");
+  if (requestBtn) {
+    requestBtn.addEventListener("click", () => {
+      if (!talentModalProfile) return;
+      selectTalentForYtRequest(talentModalProfile);
+      closeTalentProfileModal();
+    });
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && modal && !modal.classList.contains("hidden")) {
+      closeTalentProfileModal();
+    }
+  });
+}
+
+function bindTalentSliderClicks() {
+  const sliderRows = document.getElementById("talentSliderRows");
+  if (!sliderRows || sliderRows.dataset.bound === "1") return;
+  sliderRows.dataset.bound = "1";
+
+  sliderRows.addEventListener("click", (e) => {
+    const card = e.target && e.target.closest ? e.target.closest("[data-talent-id]") : null;
+    if (!card) return;
+    const tid = card.getAttribute("data-talent-id");
+    if (!tid) return;
+    const profile = loadVoiceProfiles().find((p) => getTalentId(p) === tid);
+    if (profile) openTalentProfileModal(profile);
+  });
+
+  sliderRows.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const card = e.target && e.target.closest ? e.target.closest("[data-talent-id]") : null;
+    if (!card) return;
+    e.preventDefault();
+    const tid = card.getAttribute("data-talent-id");
+    const profile = loadVoiceProfiles().find((p) => getTalentId(p) === tid);
+    if (profile) openTalentProfileModal(profile);
+  });
+}
+
 function renderTalents() {
   const profiles = loadVoiceProfiles();
-  const sliderTrack = document.getElementById("talentSliderTrack");
   const talentGrid = document.getElementById("talentGrid");
-  if (!sliderTrack || !talentGrid) return;
+  if (!talentGrid) return;
 
-  const sliderCards = profiles.map((profile) => createTalentCard(profile, false)).join("");
-  sliderTrack.innerHTML = sliderCards + sliderCards;
+  renderHomeTalentSlider(profiles);
   const filtered = getFilteredTalentsForGrid(profiles);
   talentGrid.innerHTML = filtered.map((profile) => createTalentCard(profile, true)).join("");
 }
@@ -967,23 +1129,7 @@ function bindTalentPageInteractions() {
     const profiles = loadVoiceProfiles();
     const selected = profiles.find((p) => getTalentId(p) === tid);
     if (!selected) return;
-
-    const payload = {
-      talentId: tid,
-      displayName: selected.displayName,
-      rateFrom: selected.rateFrom || null,
-      jobCount: selected.jobCount || null,
-      genres: selected.genres || "",
-      avatarUrl: getTalentAvatarSrc(selected)
-    };
-    localStorage.setItem("wavrick_selected_talent", JSON.stringify(payload));
-
-    // Default to "self select" mode on the yt page.
-    const ytRadioSelf = document.querySelector('#ytForm input[name="castMode"][value="self"]');
-    if (ytRadioSelf) ytRadioSelf.checked = true;
-    updateSelectedTalentUi(payload);
-
-    showPage("yt");
+    selectTalentForYtRequest(selected);
   });
 }
 
@@ -2541,6 +2687,8 @@ async function init() {
   bindSupabaseConfig();
   bindLogin();
   bindTalentPageInteractions();
+  bindTalentProfileModal();
+  bindTalentSliderClicks();
   renderTalents();
   if (isSupabaseEnabled()) {
     await refreshRemoteVoiceProfiles();
