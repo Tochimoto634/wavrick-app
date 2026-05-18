@@ -819,7 +819,8 @@ async function signUpUserWithSupabase(email, password, role) {
     email,
     password,
     options: {
-      data: { role }
+      data: { role },
+      emailRedirectTo: getYtEmailAuthRedirectUrl()
     }
   });
   if (result.error) {
@@ -829,6 +830,89 @@ async function signUpUserWithSupabase(email, password, role) {
     }
     return { ok: false, reason: "signup_failed", error: result.error };
   }
+  return { ok: true };
+}
+
+const WAVRICK_VERIFIED_EMAIL_KEY = "wavrick_verified_email";
+let ytEmailVerificationBridge = null;
+let supabaseAuthListenerBound = false;
+
+function getYtEmailAuthRedirectUrl() {
+  const base = getWavrickAppBase() || window.location.origin;
+  return `${base.replace(/\/$/, "")}/?auth=yt_email`;
+}
+
+function markVerifiedEmailInStorage(email) {
+  const normalized = (email || "").toLowerCase().trim();
+  if (!normalized) return;
+  try {
+    sessionStorage.setItem(WAVRICK_VERIFIED_EMAIL_KEY, normalized);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function isEmailVerifiedForForm(email) {
+  const normalized = (email || "").toLowerCase().trim();
+  if (!normalized) return false;
+  try {
+    return sessionStorage.getItem(WAVRICK_VERIFIED_EMAIL_KEY) === normalized;
+  } catch (_) {
+    return false;
+  }
+}
+
+function tryApplyYtEmailVerificationFromSession() {
+  if (!ytEmailVerificationBridge) return;
+  const formEmail = ytEmailVerificationBridge.getFormEmail();
+  if (!formEmail || !isEmailVerifiedForForm(formEmail)) return;
+  ytEmailVerificationBridge.markEmailDone();
+  setMessage("ytMessage", wavrickI18n("yt_email_verify_success"), "ok");
+}
+
+async function syncYtEmailVerificationFromSupabaseSession() {
+  if (!initSupabaseClient()) return;
+  const { data, error } = await supabaseClient.auth.getSession();
+  if (error || !data?.session?.user?.email) return;
+  const user = data.session.user;
+  if (user.email_confirmed_at || user.confirmed_at) {
+    markVerifiedEmailInStorage(user.email);
+    tryApplyYtEmailVerificationFromSession();
+  }
+}
+
+function bindSupabaseAuthForYtEmail() {
+  if (!initSupabaseClient() || supabaseAuthListenerBound) return;
+  supabaseAuthListenerBound = true;
+  supabaseClient.auth.onAuthStateChange((event, session) => {
+    if ((event === "SIGNED_IN" || event === "TOKEN_REFRESHED") && session?.user?.email) {
+      if (session.user.email_confirmed_at || session.user.confirmed_at) {
+        markVerifiedEmailInStorage(session.user.email);
+        tryApplyYtEmailVerificationFromSession();
+        if (event === "SIGNED_IN") {
+          showPage("yt");
+        }
+      }
+    }
+  });
+}
+
+async function sendYtEmailVerificationLink(email) {
+  if (!initSupabaseClient()) {
+    return { ok: false, reason: "supabase_not_enabled" };
+  }
+  const normalized = (email || "").toLowerCase().trim();
+  if (!normalized.includes("@")) {
+    return { ok: false, reason: "invalid_email" };
+  }
+  const { error } = await supabaseClient.auth.signInWithOtp({
+    email: normalized,
+    options: {
+      emailRedirectTo: getYtEmailAuthRedirectUrl(),
+      shouldCreateUser: true
+    }
+  });
+  if (error) return { ok: false, reason: "send_failed", error };
   return { ok: true };
 }
 
@@ -1523,10 +1607,48 @@ function bindYtForm() {
     refreshVerificationUi();
   }
 
+  ytEmailVerificationBridge = {
+    getFormEmail: () => {
+      const el = document.getElementById("ytEmail");
+      return el ? el.value.trim() : "";
+    },
+    markEmailDone: () => markStepDone("email", verifyEmailBtn, "1) メール認証")
+  };
+
+  if (isEmailVerifiedForForm(ytEmailVerificationBridge.getFormEmail())) {
+    markStepDone("email", verifyEmailBtn, "1) メール認証");
+  }
+
   if (verifyEmailBtn) {
-    verifyEmailBtn.addEventListener("click", () => {
-      markStepDone("email", verifyEmailBtn, "1) メール認証を完了");
-      setMessage("ytMessage", "メール認証を完了しました。", "ok");
+    verifyEmailBtn.addEventListener("click", async () => {
+      const email = ytEmailVerificationBridge.getFormEmail();
+      if (!email.includes("@")) {
+        setMessage("ytMessage", "先にメールアドレスを入力してください。", "err");
+        return;
+      }
+      if (!isSupabaseEnabled() && !initSupabaseClient()) {
+        markStepDone("email", verifyEmailBtn, "1) メール認証を完了");
+        setMessage(
+          "ytMessage",
+          "Supabase 未接続のためデモで完了扱いにしました。本番では接続設定を確認してください。",
+          "ok"
+        );
+        return;
+      }
+      bindSupabaseAuthForYtEmail();
+      verifyEmailBtn.disabled = true;
+      const prevLabel = verifyEmailBtn.textContent;
+      verifyEmailBtn.textContent = wavrickI18n("yt_email_verify_sending");
+      const result = await sendYtEmailVerificationLink(email);
+      verifyEmailBtn.disabled = false;
+      if (!result.ok) {
+        verifyEmailBtn.textContent = prevLabel;
+        const detail = result.error?.message ? ` (${result.error.message})` : "";
+        setMessage("ytMessage", `${wavrickI18n("yt_email_verify_fail")}${detail}`, "err");
+        return;
+      }
+      verifyEmailBtn.textContent = wavrickI18n("yt_email_verify_sent_btn");
+      setMessage("ytMessage", wavrickI18n("yt_email_verify_sent"), "ok");
     });
   }
 
@@ -2682,6 +2804,11 @@ async function init() {
   bindVoiceForm();
   bindMediaPipelineUi();
   bindYtForm();
+  bindSupabaseAuthForYtEmail();
+  if (new URLSearchParams(window.location.search).get("auth") === "yt_email") {
+    showPage("yt");
+  }
+  await syncYtEmailVerificationFromSupabaseSession();
   bindWorkPage();
   bindAdminDashboard();
   bindSupabaseConfig();

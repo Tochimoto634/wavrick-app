@@ -6,5 +6,12 @@ Google OAuth「承認済みの JavaScript 生成元」:
 Google OAuth「承認済みのリダイレクト URI」:
   https://gdolqgcftxqxaacjyqla.supabase.co/functions/v1/youtube-oauth-callback
 
+Supabase Auth（メール認証リンク用）Dashboard → Authentication → URL Configuration:
+  Site URL: https://wavrick.com
+  Redirect URLs に追加:
+    https://wavrick.com/**
+    http://127.0.0.1:8889/**
+
+メール送信: Dashboard → Authentication → Providers → Email を有効化
+
 Hostinger 配置: public_html 直下（index.html など）
-旧 /wavrick/ フォルダは不要（あれば削除またはリダイレクト可）

@@ -472,7 +472,7 @@
         </div>
         <p class="verify-note">著作権保護のため、本人確認が完了するまで依頼は送信できません。チャンネル確認は Google にログインし、YouTube Data API で「自分のチャンネル」と入力URLが一致するか検証します（ポップアップが開きます）。</p>
         <div class="verify-steps">
-          <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) メール認証を完了（デモ）</button>
+          <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) 確認メールを送信</button>
           <button id="verifyChannelBtn" class="verify-step-btn" type="button">2) Googleでチャンネル所有を確認</button>
           <button id="verifyIdBtn" class="verify-step-btn" type="button">3) 身分証確認を完了（デモ）</button>
         </div>
@@ -607,7 +607,12 @@
     <span data-i18n="oauth_NO_ACCESS_TOKEN">アクセストークンがありません。</span>
     <span data-i18n="oauth_CHANNEL_RESOLVE_FAILED">チャンネルURLからチャンネルを特定できませんでした。@ハンドルまたは /channel/UC... 形式を確認してください。</span>
     <span data-i18n="oauth_CHANNEL_MISMATCH">ログインした Google アカウントは、このチャンネルの所有者として確認できませんでした。チャンネルURLと同じアカウントでログインしてください。</span>
-    <span data-i18n="yt_oauth_postmessage_fail">認証ウィンドウは閉じましたが、結果を受け取れませんでした。必ず http://127.0.0.1:8889 で開き直してから、もう一度「2) Googleでチャンネル所有を確認」を押してください。</span>
+    <span data-i18n="yt_oauth_postmessage_fail">認証ウィンドウは閉じましたが、結果を受け取れませんでした。依頼フォームと同じURL（本番は https://wavrick.com ）で開き直してから、もう一度「2) Googleでチャンネル所有を確認」を押してください。</span>
+    <span data-i18n="yt_email_verify_sending">確認メールを送信中...</span>
+    <span data-i18n="yt_email_verify_sent">確認メールを送信しました。メール内のリンクを開くと、このフォームに戻って認証完了になります。</span>
+    <span data-i18n="yt_email_verify_sent_btn">1) 確認メールを送信済み（メールを開いてください）</span>
+    <span data-i18n="yt_email_verify_success">メール認証が完了しました。</span>
+    <span data-i18n="yt_email_verify_fail">確認メールの送信に失敗しました。</span>
   </div>
 
 
@@ -644,6 +649,6 @@
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="./app.js?v=ui-2026-05-5" charset="UTF-8"></script>
+  <script src="./app.js?v=ui-2026-05-6" charset="UTF-8"></script>
 </body>
 </html>
