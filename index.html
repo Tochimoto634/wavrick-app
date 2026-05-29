@@ -6,19 +6,21 @@
   <title>WAVRICK - MVP</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@300;400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./styles.css?v=deploy-2026-05-26">
+  <script>if("scrollRestoration"in history)history.scrollRestoration="manual";window.scrollTo(0,0);</script>
 </head>
 <body>
-  <nav>
+  <nav id="mainNav">
     <a class="logo" href="#" data-go="home">WAVRICK</a>
     <ul>
-      <li><a href="#how" data-scroll-how>仕組み</a></li>
-      <li><a href="#" data-go="talents">声優一覧</a></li>
-      <li><a href="#" data-go="voice">声優登録</a></li>
-      <li><a href="#" data-go="login">ログイン</a></li>
-      <li><a href="#" data-go="work">案件管理</a></li>
-      <li><a id="adminNavLink" href="#" data-go="admin" class="hidden">運営管理</a></li>
-      <li><a href="#" class="nav-btn" data-go="yt">依頼する</a></li>
+      <li id="navVoiceItem"><a href="#" data-go="voice">声優登録</a></li>
+      <li id="navLoginItem"><a href="#" id="loginNavLink" data-go="login">ログイン</a></li>
+      <li id="navVoiceStatus" class="hidden"><span id="navVoiceStatusLabel" class="nav-voice-status"></span></li>
+      <li id="navWorkItem" class="hidden"><a href="#" id="workNavLink" data-go="work">案件管理</a></li>
+      <li id="navAccountItem" class="hidden"><a href="#" id="accountNavLink" data-go="account">マイページ</a></li>
+      <li id="navRecordItem" class="hidden"><a id="recordNavLink" href="./record-workspace.html">収録ブース</a></li>
+      <li id="navAdminItem" class="hidden"><a id="adminNavLink" href="#" data-go="admin">運営管理</a></li>
+      <li id="navYtItem"><a href="#" class="nav-btn" data-go="yt">依頼する</a></li>
     </ul>
   </nav>
 
@@ -84,13 +86,13 @@
       <div class="filter-title">絞り込み（任意）</div>
       <div class="field-row">
         <div class="field">
-          <label for="filterBudgetMax">予算上限（円/分〜）</label>
+          <label for="filterBudgetMax">予算上限（USD/分）</label>
           <select id="filterBudgetMax">
             <option value="">未設定</option>
-            <option value="5000">〜¥5,000</option>
-              <option value="8000">〜¥8,000</option>
-            <option value="12000">〜¥12,000</option>
-            <option value="20000">〜¥20,000</option>
+            <option value="20">〜$20/min</option>
+            <option value="30">〜$30/min</option>
+            <option value="40">〜$40/min</option>
+            <option value="60">〜$60/min</option>
           </select>
         </div>
         <div class="field">
@@ -107,6 +109,23 @@
         <label for="filterGenres">ジャンル（カンマ区切り）</label>
         <input id="filterGenres" type="text" placeholder="例：旅行,教育">
       </div>
+      <div class="field">
+        <label for="filterSortOrder">並べ替え</label>
+        <select id="filterSortOrder">
+          <option value="">指定なし</option>
+          <option value="jobs_desc">取引件数が多い順</option>
+          <option value="price_desc">価格が高い順</option>
+          <option value="price_asc">価格が安い順</option>
+          <option value="rating_desc">評価が高い順</option>
+          <option value="speed_asc">対応が早い順</option>
+        </select>
+      </div>
+      <div class="filter-online-toggle">
+        <label class="filter-online-label">
+          <input type="checkbox" id="filterOnlineOnly">
+          <span>オンラインのみ表示</span>
+        </label>
+      </div>
       <div class="hero-actions" style="margin-top:0.2rem">
         <button id="applyTalentFilterBtn" class="btn-red" type="button">絞り込み適用</button>
         <button id="resetTalentFilterBtn" class="btn-ghost" type="button">リセット</button>
@@ -115,95 +134,126 @@
     <div id="talentGrid" class="talent-grid"></div>
   </section>
 
-  <section id="page-work" class="page form-page">
+  <section id="page-work" class="page form-page work-page">
     <div class="form-header">
       <button class="back-btn" data-go="home">← 戻る</button>
-      <h2>案件ワークスペース</h2>
+      <h2>案件管理</h2>
     </div>
-    <p class="form-subtitle">進捗・チャット・見積/支払い・納品・通知を1画面で管理します。</p>
+    <p id="workPageSubtitle" class="form-subtitle">担当案件の進捗・連絡・収録・納品をここで行います。</p>
 
-    <div class="form-card admin-tools">
-      <div class="field-row">
-        <div class="field">
-          <label for="workRequestSelect">対象案件</label>
-          <select id="workRequestSelect"></select>
+    <div class="work-case-toolbar form-card">
+      <div class="work-case-toolbar-row">
+        <div class="field work-case-select-field">
+          <label for="workRequestSelect">いま開いている案件</label>
+          <select id="workRequestSelect" class="work-request-select"></select>
         </div>
-        <div class="field">
-          <label for="workStatusSelect">ステータス</label>
-          <select id="workStatusSelect"></select>
-        </div>
-      </div>
-      <div class="hero-actions" style="margin-top:0.2rem">
-        <button id="saveWorkStatusBtn" class="btn-red" type="button">ステータス更新</button>
+        <button type="button" id="workRefreshCasesBtn" class="btn-ghost">一覧を更新</button>
       </div>
       <p id="workMessage" class="message"></p>
     </div>
 
-    <div class="form-card">
-      <h3>ステータス可視化</h3>
-      <div id="workStatusTimeline" class="status-timeline"></div>
+    <div id="workCaseEmpty" class="form-card work-case-empty hidden">
+      <p>表示できる案件がありません。ログイン種別が「声優」で、依頼時にあなたが選ばれている案件だけが表示されます。</p>
     </div>
 
-    <div class="form-card">
-      <h3>チャット / メッセージ</h3>
-      <div id="workChatList" class="chat-list"></div>
-      <div class="field">
-        <label for="workChatInput">メッセージ</label>
-        <textarea id="workChatInput" placeholder="依頼内容の補足、確認事項、修正依頼など"></textarea>
-      </div>
-      <div class="hero-actions" style="margin-top:0.2rem">
-        <button id="sendWorkChatBtn" class="btn-red" type="button">送信</button>
-      </div>
-    </div>
+    <div id="workCasePanel" class="work-case-panel hidden">
+      <div id="workCaseHeader" class="work-case-header form-card" aria-live="polite"></div>
 
-    <div class="form-card">
-      <h3>見積もり・支払い</h3>
-      <div class="field-row">
-        <div class="field">
-          <label for="workQuoteAmount">見積金額（円）</label>
-          <input id="workQuoteAmount" type="number" min="0" placeholder="12000">
-        </div>
-        <div class="field">
-          <label for="workPaymentStatus">支払いステータス</label>
-          <select id="workPaymentStatus">
-            <option value="unpaid">未払い</option>
-            <option value="approved">承認済み（未決済）</option>
-            <option value="paid">支払い完了</option>
-          </select>
+      <div id="workTransactionCard" class="form-card work-role-customer hidden">
+        <h3>取引・キャスティング</h3>
+        <p id="workTransactionPhase" class="section-desc"></p>
+        <div id="workCastAcceptanceList" class="cast-acceptance-list"></div>
+        <div class="hero-actions work-action-row">
+          <button type="button" id="workCancelTransactionBtn" class="btn-ghost">取引をキャンセル</button>
         </div>
       </div>
-      <div class="field">
-        <label for="workStripeUrl">Stripe決済リンク（任意）</label>
-        <input id="workStripeUrl" type="url" placeholder="https://buy.stripe.com/...">
-      </div>
-      <div class="hero-actions" style="margin-top:0.2rem">
-        <button id="saveWorkQuoteBtn" class="btn-red" type="button">見積・支払い情報を保存</button>
-      </div>
-    </div>
 
-    <div class="form-card">
-      <h3>納品物管理</h3>
-      <div id="workDeliveriesList" class="delivery-list"></div>
-      <div class="field">
-        <label for="workDeliveryUrl">納品URL</label>
-        <input id="workDeliveryUrl" type="url" placeholder="https://...">
+      <div id="workVoiceOfferCard" class="form-card work-role-voice hidden">
+        <h3>案件への回答</h3>
+        <p id="workVoiceOfferHint" class="section-desc"></p>
+        <div class="hero-actions work-action-row">
+          <button type="button" id="workVoiceAcceptBtn" class="btn-red">この案件を受ける</button>
+          <button type="button" id="workVoiceDeclineBtn" class="btn-ghost">受けない</button>
+        </div>
       </div>
-      <div class="field">
-        <label for="workDeliveryNote">メモ</label>
-        <input id="workDeliveryNote" type="text" placeholder="v2: ノイズ除去版">
-      </div>
-      <div class="hero-actions" style="margin-top:0.2rem">
-        <button id="addWorkDeliveryBtn" class="btn-red" type="button">納品物を追加</button>
-        <button id="addRevisionRequestBtn" class="btn-ghost" type="button">修正依頼を追加</button>
-      </div>
-      <p id="workRevisionCount" class="section-desc"></p>
-    </div>
 
-    <div class="form-card">
-      <h3>通知</h3>
-      <div id="workNotificationsList" class="notice-list"></div>
-      <div class="hero-actions" style="margin-top:0.2rem">
-        <button id="markAllNoticeReadBtn" class="btn-ghost" type="button">すべて既読にする</button>
+      <div class="form-card">
+        <h3>ステータス</h3>
+        <div id="workStatusTimeline" class="status-timeline"></div>
+        <div id="workStatusAdminTools" class="work-role-admin hidden">
+          <div class="field-row" style="margin-top:0.75rem">
+            <div class="field">
+              <label for="workStatusSelect">ステータス（運営）</label>
+              <select id="workStatusSelect"></select>
+            </div>
+          </div>
+          <div class="hero-actions" style="margin-top:0.2rem">
+            <button id="saveWorkStatusBtn" class="btn-red" type="button">ステータス更新</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-card work-voice-actions">
+        <h3>収録・納品</h3>
+        <p class="section-desc">台本と動画 URL を収録ブースに引き継ぎます。提出時は下のメモが顧客向け納品に一緒に保存されます。</p>
+        <div class="hero-actions work-action-row">
+          <button type="button" id="workOpenRecordWorkspaceBtn" class="btn-red">収録ブースで開く</button>
+        </div>
+        <p id="workPendingDeliveryHint" class="section-desc work-pending-hint hidden" role="status"></p>
+        <div class="field" style="margin-top:0.85rem">
+          <label for="workDeliveryAudioFile">合成音声を提出（WAV）</label>
+          <input id="workDeliveryAudioFile" type="file" accept="audio/wav,audio/*">
+          <p id="workDeliveryFileReady" class="section-desc work-delivery-file-ready hidden"></p>
+        </div>
+        <div class="field">
+          <label for="workDeliveryNote">提出メモ（任意）</label>
+          <input id="workDeliveryNote" type="text" placeholder="例: 話者1 全セリフ収録・タイムライン配置済み">
+        </div>
+        <div class="hero-actions work-action-row">
+          <button id="submitWorkAudioDeliveryBtn" class="btn-red" type="button">合成トラックを顧客に提出</button>
+        </div>
+      </div>
+
+      <div class="form-card">
+        <h3>顧客からの修正依頼</h3>
+        <div id="workRevisionList" class="revision-list"></div>
+        <div id="workRevisionComposer" class="work-role-customer work-role-admin hidden">
+          <p id="workRetakePaymentLock" class="work-retake-lock hidden"></p>
+          <div class="field">
+            <label for="workRevisionInput">修正依頼の内容</label>
+            <textarea id="workRevisionInput" placeholder="例: 00:12〜00:18 の抑揚をもう少し明るく（1回の依頼に複数セリフ可）"></textarea>
+          </div>
+          <div class="hero-actions work-action-row">
+            <button id="addRevisionRequestBtn" class="btn-red" type="button">修正依頼を送る</button>
+            <button id="markRetakePaidBtn" class="btn-ghost work-retake-pay-btn hidden" type="button">リテイク料金の支払いを記録（運営）</button>
+          </div>
+        </div>
+        <p id="workRevisionCount" class="section-desc"></p>
+      </div>
+
+      <div class="form-card">
+        <h3>顧客とのチャット</h3>
+        <div id="workChatList" class="chat-list"></div>
+        <div class="field">
+          <label for="workChatInput">メッセージ</label>
+          <textarea id="workChatInput" placeholder="確認事項や進捗の連絡"></textarea>
+        </div>
+        <div class="hero-actions work-action-row">
+          <button id="sendWorkChatBtn" class="btn-red" type="button">送信</button>
+        </div>
+      </div>
+
+      <div class="form-card">
+        <h3>提出済みの納品物</h3>
+        <div id="workDeliveriesList" class="delivery-list"></div>
+      </div>
+
+      <div class="form-card">
+        <h3>通知</h3>
+        <div id="workNotificationsList" class="notice-list"></div>
+        <div class="hero-actions work-action-row">
+          <button id="markAllNoticeReadBtn" class="btn-ghost" type="button">この案件の通知を既読</button>
+        </div>
       </div>
     </div>
   </section>
@@ -237,7 +287,8 @@
       </div>
       <button class="btn-red full" type="submit">ログインする</button>
       <p id="loginMessage" class="message"></p>
-      <p class="section-desc">Supabase未接続時の運営ログイン初期値: admin@wavrick.local / wavrick-admin</p>
+      <p class="section-desc customer-login-extra">アカウントをお持ちでない方は <button type="button" class="link-btn" data-go="customer-signup">無料で新規登録（YouTuber）</button></p>
+      <p class="section-desc">運営ログインにはSupabase認証が必要です。</p>
     </form>
     <div class="form-card backend-config">
       <h3>Supabase接続設定（任意）</h3>
@@ -260,6 +311,7 @@
       <h3>ログイン中</h3>
       <p id="loginSessionText" class="section-desc"></p>
       <div class="hero-actions">
+        <button id="loginAccountButton" class="btn-red hidden" type="button" data-go="account">マイページ</button>
         <button id="loginJumpButton" class="btn-ghost" type="button">ページへ移動</button>
         <button id="logoutButton" class="back-btn" type="button">ログアウト</button>
       </div>
@@ -422,16 +474,22 @@
         <label for="voiceGenres">得意ジャンル（カンマ区切り）</label>
         <input id="voiceGenres" name="genres" type="text" placeholder="ゲーム実況, 教育, 旅行">
       </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="voicePricePerMinute">1分あたり単価（USD） *</label>
+          <input id="voicePricePerMinute" name="pricePerMinute" type="number" min="15" step="1" value="25" required>
+          <p class="field-hint">最低 $15 / min</p>
+        </div>
+        <div class="field">
+          <label for="voiceMinimumOrderPrice">最低取引価格（USD）</label>
+          <input id="voiceMinimumOrderPrice" name="minimumOrderPrice" type="number" min="0" step="1" value="0">
+          <p class="field-hint">短い案件の下限（$0 可）</p>
+        </div>
+      </div>
       <div class="field">
-        <label for="voiceRateFrom">希望単価（円/分〜）任意</label>
-        <select id="voiceRateFrom" name="rateFrom">
-          <option value="">未設定</option>
-          <option value="3000">¥3,000〜</option>
-          <option value="5000">¥5,000〜</option>
-          <option value="8000" selected>¥8,000〜</option>
-          <option value="12000">¥12,000〜</option>
-          <option value="20000">¥20,000〜</option>
-        </select>
+        <label for="voiceAdditionalRetakePrice">追加リテイク費用（USD / 回）</label>
+        <input id="voiceAdditionalRetakePrice" name="additionalRetakePrice" type="number" min="0" step="1" value="5">
+        <p class="field-hint">4回目以降の修正依頼1回あたり（複数セリフ可）</p>
       </div>
       <div class="field">
         <label for="voiceJobCount">これまでの依頼件数 任意</label>
@@ -459,44 +517,156 @@
     </form>
   </section>
 
+  <section id="page-customer-signup" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="home">← 戻る</button>
+      <h2>YouTuber 新規登録</h2>
+    </div>
+    <p class="form-subtitle">アカウントを作成すると、ログイン後に依頼フォーム（動画URL・台本・声優選択）をご利用いただけます。</p>
+    <form id="customerSignupForm" class="form-card">
+      <div class="field">
+        <label for="customerSignupName">表示名 / チャンネル名 *</label>
+        <input id="customerSignupName" name="name" type="text" required placeholder="例: My Channel JP">
+      </div>
+      <div class="field">
+        <label for="customerSignupEmail">メールアドレス *</label>
+        <input id="customerSignupEmail" name="email" type="email" required placeholder="you@example.com" autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="customerSignupPassword">パスワード *（6文字以上）</label>
+        <input id="customerSignupPassword" name="password" type="password" required minlength="6" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="customerSignupPasswordConfirm">パスワード（確認） *</label>
+        <input id="customerSignupPasswordConfirm" name="passwordConfirm" type="password" required minlength="6" autocomplete="new-password">
+      </div>
+      <p class="section-desc">Supabase 接続時は確認メールが届く場合があります。YouTube チャンネルはログイン後の<strong>マイページ</strong>から登録できます。</p>
+      <button class="btn-red full" type="submit">アカウントを作成する</button>
+      <p id="customerSignupMessage" class="message"></p>
+      <p class="section-desc">すでにアカウントをお持ちの方は <button type="button" class="link-btn" data-go="login">ログイン</button></p>
+    </form>
+  </section>
+
+  <section id="page-account" class="page form-page">
+    <div class="form-header">
+      <button class="back-btn" data-go="yt">← 依頼フォームへ</button>
+      <h2>マイページ（YouTube チャンネル）</h2>
+    </div>
+    <p class="form-subtitle">メインチャンネル・サブチャンネルを Google で認証して登録できます。登録したチャンネルの動画だけ、依頼フォームの YouTube URL で利用できます。</p>
+    <div id="accountCustomerGate" class="form-card auth-gate-card">
+      <p class="section-desc">チャンネル登録には顧客ログインが必要です。</p>
+      <div class="hero-actions auth-gate-actions">
+        <button type="button" class="btn-red" data-go="login">ログイン</button>
+        <button type="button" class="btn-ghost" data-go="customer-signup">無料で新規登録</button>
+      </div>
+    </div>
+    <div id="accountVoiceApp" class="hidden form-card">
+      <p id="accountLoggedInAsVoice" class="yt-logged-in-as section-desc"></p>
+      <div id="voiceActiveToggleCard" class="voice-active-toggle-card">
+        <div class="voice-active-toggle-row">
+          <div class="voice-active-toggle-text">
+            <span class="voice-active-toggle-label">案件を募集する</span>
+            <span id="voiceActiveStatusText" class="voice-active-status-text"></span>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="voiceActiveToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <p class="voice-active-toggle-desc">案件を募集します。ONにしている間は顧客側にあなたが表示され、OFFの場合は一覧に表示されなくなります。<br>※ONの状態で依頼された案件をキャンセルしすぎると、プロフィールにペナルティ率が記録され今後の取引で不利になりますのでご注意ください。</p>
+      </div>
+      <p class="section-desc">声優向けのプロフィール・案件の確認は<strong>案件管理</strong>から行えます。収録は<strong>収録ブース</strong>をご利用ください。</p>
+      <div class="hero-actions auth-gate-actions">
+        <button type="button" class="btn-red" data-go="work">案件管理へ</button>
+        <a class="btn-ghost" href="./record-workspace.html">収録ブースを開く</a>
+      </div>
+      <div id="voiceMypageStats" class="voice-mypage-stats"></div>
+    </div>
+    <div id="accountAdminApp" class="hidden form-card">
+      <p id="accountLoggedInAsAdmin" class="yt-logged-in-as section-desc"></p>
+      <p class="section-desc">運営向けの確認・操作は<strong>運営管理</strong>と<strong>案件管理</strong>から行えます。</p>
+      <div class="hero-actions auth-gate-actions">
+        <button type="button" class="btn-red" data-go="admin">運営ダッシュボードへ</button>
+        <button type="button" class="btn-ghost" data-go="work">案件管理へ</button>
+      </div>
+    </div>
+    <div id="accountCustomerApp" class="hidden">
+      <p id="accountLoggedInAs" class="yt-logged-in-as section-desc"></p>
+      <div class="form-card">
+        <h3>登録済みチャンネル</h3>
+        <ul id="accountChannelList" class="account-channel-list"></ul>
+        <p id="accountChannelEmpty" class="section-desc hidden">まだチャンネルが登録されていません。下から追加してください。</p>
+      </div>
+      <div class="form-card">
+        <h3>チャンネルを追加</h3>
+        <div class="field">
+          <label for="accountChannelUrl">チャンネル URL または @ハンドル</label>
+          <input id="accountChannelUrl" type="text" placeholder="https://www.youtube.com/@yourchannel または @yourchannel">
+        </div>
+        <button id="accountChannelOAuthBtn" type="button" class="btn-ghost full">Google でこのチャンネルを認証して追加</button>
+        <p class="section-desc">または、Google にログインしているアカウント配下の<strong>すべてのチャンネル</strong>を一括登録:</p>
+        <button id="accountLinkAllOAuthBtn" type="button" class="btn-red full">Google で全チャンネルを一括登録</button>
+        <p id="accountMessage" class="message"></p>
+      </div>
+    </div>
+    <div id="accountLogoutCard" class="form-card account-logout-card hidden">
+      <button id="accountLogoutButton" type="button" class="btn-ghost">ログアウト</button>
+      <p id="accountLogoutMessage" class="message"></p>
+    </div>
+  </section>
+
   <section id="page-yt" class="page form-page">
     <div class="form-header">
       <button class="back-btn" data-go="home">← 戻る</button>
       <h2>YouTuber依頼フォーム</h2>
     </div>
     <p class="form-subtitle">動画URLを入れて、希望条件を選ぶだけで依頼できます。</p>
-    <form id="ytForm" class="form-card">
-      <div class="verify-box">
-        <div class="verify-head">
-          <h3>YouTuber（依頼者）本人確認（①メール ②チャンネル所有）</h3>
-          <span id="verifyBadge" class="verify-badge">未完了</span>
+
+    <div id="ytCustomerGate" class="form-card auth-gate-card">
+      <h3>ログインまたは新規登録</h3>
+      <p class="section-desc">依頼・台本作成・決済を利用するには、顧客アカウントが必要です（Netflix などと同様の流れです）。</p>
+      <div class="hero-actions auth-gate-actions">
+        <button type="button" class="btn-red" data-go="login">ログイン</button>
+        <button type="button" class="btn-ghost" data-go="customer-signup">無料で新規登録</button>
+        <button type="button" class="btn-ghost" data-go="account">マイページ（チャンネル登録）</button>
+      </div>
+    </div>
+
+    <div id="ytCustomerApp" class="hidden">
+      <p id="ytLoggedInAs" class="yt-logged-in-as section-desc"></p>
+      <p class="section-desc yt-account-link-row"><button type="button" class="link-btn" data-go="account">マイページ（YouTube チャンネル登録）</button></p>
+      <form id="ytForm" class="form-card">
+      <div class="field">
+        <span class="field-label">素材の種類 *</span>
+        <div class="radio-row yt-source-mode-row">
+          <label class="radio-chip"><input type="radio" name="ytSourceMode" value="youtube" checked> YouTube 動画 URL</label>
+          <label class="radio-chip"><input type="radio" name="ytSourceMode" value="audio"> 音声ファイル</label>
         </div>
-        <p class="verify-note">著作権保護のため、本人確認が完了するまで依頼は送信できません。①でメールを確認し、②で Google にログインして YouTube チャンネルの所有者と入力URLが一致するか検証します（ポップアップが開きます）。</p>
-        <div class="verify-steps">
-          <button id="verifyEmailBtn" class="verify-step-btn" type="button">1) 確認メールを送信</button>
-          <button id="verifyChannelBtn" class="verify-step-btn" type="button">2) Googleでチャンネル所有を確認</button>
+      </div>
+      <div id="ytYoutubeBlock">
+        <div id="ytChannelBanner" class="channel-status-banner hidden"></div>
+        <div id="ytChannelMismatch" class="channel-mismatch-banner hidden">
+          <p>この動画は登録済みチャンネルと一致しません。</p>
+          <button type="button" class="link-btn" data-go="account">こちらからアカウント（チャンネル）を追加</button>
+        </div>
+        <div id="ytChannelTestBypass" class="yt-test-bypass-card hidden">
+          <p class="section-desc yt-test-bypass-label">テスト段階のみ — 登録チャンネルと動画のチャンネルが違っても取引を進められます。</p>
+          <label class="yt-test-bypass-toggle">
+            <input type="checkbox" id="ytChannelBypassCheck">
+            チャンネル不一致ロックを無効化（テスト）
+          </label>
+        </div>
+        <div class="field">
+          <label for="ytVideoUrl">翻訳したい動画 URL *</label>
+          <input id="ytVideoUrl" name="videoUrl" type="url" placeholder="https://www.youtube.com/watch?v=...">
         </div>
       </div>
-      <div class="field">
-        <label for="ytName">名前 *</label>
-        <input id="ytName" name="name" type="text" required>
-      </div>
-      <div class="field">
-        <label for="ytEmail">メール *</label>
-        <input id="ytEmail" name="email" type="email" required>
-      </div>
-      <div class="field">
-        <label for="ytPassword">ログイン用パスワード（任意・6文字以上）</label>
-        <input id="ytPassword" name="password" type="password" placeholder="空欄でも依頼は送信できます">
-      </div>
-      <div class="field">
-        <label for="ytChannelUrl">あなたの YouTube チャンネル URL *</label>
-        <input id="ytChannelUrl" name="channelUrl" type="url" placeholder="https://www.youtube.com/@yourchannel" required>
-        <p class="field-hint">本人確認（Google）と同じチャンネル URL を入力してください。</p>
-      </div>
-      <div class="field">
-        <label for="ytVideoUrl">翻訳したい動画 URL *</label>
-        <input id="ytVideoUrl" name="videoUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." required>
+      <div id="ytAudioBlock" class="hidden">
+        <div class="field">
+          <label for="ytAudioFile">音声ファイル（任意形式・最大約24MB）</label>
+          <input id="ytAudioFile" type="file" accept="audio/*,video/*,*/*">
+          <p id="ytAudioFileHint" class="field-hint">文字起こしの直前にアップロードします。</p>
+        </div>
       </div>
       <div class="field">
         <label for="ytTone">希望トーン</label>
@@ -515,81 +685,116 @@
           <option value="2週間以内">2週間以内</option>
         </select>
       </div>
-      <div class="cast-mode-box">
-        <h3 class="cast-mode-title">声優の選び方</h3>
-        <div class="cast-mode-radios">
-          <label class="cast-radio">
-            <input type="radio" name="castMode" value="self" checked>
-            自分で選ぶ
-          </label>
-          <label class="cast-radio">
-            <input type="radio" name="castMode" value="recommend">
-            ジャンルなどを絞って、こちらで斡旋
-          </label>
+      <div class="pipeline-wizard cast-mode-box">
+        <h3 class="cast-mode-title">台本作成（同一画面で完結）</h3>
+        <p class="section-desc">URLから文字起こし → 編集 → 話者ごとに振り分け → 話者ごとに声優（選ぶ / おまかせ）→ AI台本生成</p>
+        <div class="field">
+          <label for="ytSpeakerCount">出演者・声優の人数 *</label>
+          <select id="ytSpeakerCount" name="speakerCount">
+            <option value="1">1人</option>
+            <option value="2" selected>2人</option>
+            <option value="3">3人</option>
+            <option value="4">4人</option>
+            <option value="5">5人</option>
+            <option value="6">6人</option>
+          </select>
         </div>
-
-        <div id="castSelfBox" class="cast-box">
-          <p class="cast-subtitle">選んだ声優：</p>
-          <div class="selected-talent-card">
-            <div class="selected-talent-row">
-              <div id="selectedTalentAvatar" class="talent-avatar">🎤</div>
-              <div>
-                <p id="selectedTalentName" class="selected-talent-name">未選択</p>
-                <p id="selectedTalentMeta" class="selected-talent-meta">声優一覧から選択してください</p>
+        <button id="ytTranscribeButton" class="btn-ghost full" type="button">1) 素材から文字起こし（Whisper）</button>
+        <p class="section-desc" style="margin-top:0.5rem">ローカル (<code>http://127.0.0.1:8889</code>) では <strong>トンネル不要</strong>です。ターミナル① <code>./scripts/start-dev-server.sh</code> ② <code>./scripts/start-audio-proxy.sh</code>。API キーは <strong><code>wavrick-app/.local/secrets.env</code></strong>（Supabase だけでは足りません）。未設定なら <code>./scripts/setup-local-secrets.sh</code></p>
+        <div id="aiStatus" class="ai-status hidden">
+          <p id="aiStep1">動画から音声を取得し、Whisper で文字起こし中...</p>
+        </div>
+        <div id="pipelineAfterTranscribe" class="hidden">
+          <div class="field">
+            <label for="ytTranscriptEdit">2) 文字起こし（タイムコード付き・誤りがあれば編集）</label>
+            <textarea id="ytTranscriptEdit" rows="12" placeholder="文字起こし後に Whisper が出力した SRT（タイムコード付き字幕）が表示されます"></textarea>
+            <p class="section-desc">話者のドラッグ割り当てはセリフ本文のみを使います（上の SRT のタイムコード行は対象外）。</p>
+          </div>
+          <div id="ytLineAssignSection" class="field hidden speaker-assign-workspace">
+            <div class="speaker-assign-panel speaker-assign-panel--head">
+              <label class="speaker-assign-step-label">3) 文字起こしをドラッグして話者に割り当て</label>
+              <p class="section-desc speaker-assign-intro">話者ボタンを選び、下のテキストを<strong>ドラッグで範囲選択</strong>（離すと色付き）。タッチしづらいときは「クリックで範囲指定」を ON にし、<strong>始まり→終わりの順にタップ</strong>してください。話者別プレビューを押すと、その話者の割り当て全文がエディタ内で選択されます。セリフの間が<strong>3秒以上10秒未満</strong>空く場合は台本の別行に分かれ、<strong>10秒以上</strong>空く場合は収録ブースで別ブロック（台本セクション）になります（声優は後から統合・削除も可能）。</p>
+            </div>
+            <div class="speaker-assign-panel speaker-assign-panel--editor">
+              <div id="ytTranscriptAssign" class="transcript-assign" tabindex="0" aria-label="文字起こし（ドラッグで範囲選択）"></div>
+            </div>
+            <div class="speaker-assign-panel speaker-assign-panel--controls">
+              <div class="speaker-assign-actions">
+                <div class="speaker-assign-btn-row">
+                  <button id="ytAssignUndoBtn" class="speaker-assign-btn speaker-assign-btn--secondary" type="button">
+                    <svg class="speaker-assign-btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M3 10h10a5 5 0 0 1 5 5v2"></path>
+                      <path d="M3 10l4-4M3 10l4 4"></path>
+                    </svg>
+                    <span class="speaker-assign-btn-label">直前の割り当てを取り消し</span>
+                  </button>
+                  <button id="ytAssignApplyBtn" class="speaker-assign-btn speaker-assign-btn--primary" type="button" aria-pressed="false" title="OFF: ドラッグで選択 / ON: 始まりと終わりをクリック">
+                    <svg class="speaker-assign-btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M12 20h9"></path>
+                      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-14.5z"></path>
+                    </svg>
+                    <span class="speaker-assign-btn-label">クリックで範囲指定: OFF</span>
+                  </button>
+                </div>
+                <div class="speaker-assign-toolbar">
+                  <span class="speaker-assign-toolbar-label">操作する話者</span>
+                  <div id="ytSpeakerPicker" class="speaker-picker speaker-picker--toolbar" role="tablist" aria-label="話者を選択"></div>
+                </div>
+                <div class="speaker-assign-names">
+                  <span class="speaker-assign-toolbar-label">話者の名前（台本・収録ブースに表示）</span>
+                  <div id="ytSpeakerNames" class="speaker-assign-names-grid" aria-label="話者名"></div>
+                </div>
               </div>
             </div>
-            <div class="hero-actions" style="margin-top:0.7rem">
-              <button id="chooseTalentBtn" class="btn-ghost" type="button">声優一覧で選ぶ</button>
+            <p id="ytAssignHint" class="field-hint speaker-assign-status-hint"></p>
+            <div class="speaker-assign-panel speaker-assign-panel--preview">
+              <span class="speaker-assign-panel-label">話者別プレビュー</span>
+              <div id="ytAssignSummary" class="speaker-assign-summary"></div>
             </div>
           </div>
+          <div id="ytCastSlotsSection" class="hidden">
+            <h4 class="cast-subtitle">4) 話者ごとの声優（選ぶ / おまかせ）</h4>
+            <p class="section-desc">おまかせの場合、性別・ジャンル・予算上限を指定するとこちらで自動マッチングします（確定までは声優名は表示しません）。</p>
+            <div class="field-row">
+              <div class="field">
+                <label for="ytOmakaseGender">おまかせ希望（性別・任意）</label>
+                <select id="ytOmakaseGender" name="omakaseGender">
+                  <option value="">指定なし</option>
+                  <option value="female">女性</option>
+                  <option value="male">男性</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="ytOmakaseBudget">おまかせ予算上限（USD/分・任意）</label>
+                <input id="ytOmakaseBudget" name="omakaseBudgetMaxUsd" type="number" min="15" step="1" placeholder="例: 30">
+              </div>
+            </div>
+            <div class="field">
+              <label for="ytOmakaseGenres">おまかせ希望ジャンル（カンマ区切り・任意）</label>
+              <input id="ytOmakaseGenres" name="omakaseGenres" type="text" placeholder="ゲーム, 教育">
+            </div>
+            <div id="ytCastSlots" class="cast-slots"></div>
+          </div>
+          <button id="generateScriptButton" class="btn-red full hidden" type="button">5) 話者分けをもとに台本を生成（Grok）</button>
         </div>
+      </div>
 
-        <div id="castRecommendBox" class="cast-box hidden">
-          <p class="cast-subtitle">斡旋のための希望（任意）</p>
-          <div class="field">
-            <label for="recGenres">希望ジャンル（カンマ区切り）</label>
-            <input id="recGenres" name="recGenres" type="text" placeholder="例：旅行,教育">
-          </div>
-          <div class="field-row">
-            <div class="field">
-              <label for="recBudgetMax">予算上限（円/分〜）</label>
-              <select id="recBudgetMax" name="recBudgetMax">
-                <option value="">未設定</option>
-                <option value="5000">〜¥5,000</option>
-                <option value="8000" selected>〜¥8,000</option>
-                <option value="12000">〜¥12,000</option>
-                <option value="20000">〜¥20,000</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="recJobMin">件数下限（任意）</label>
-              <select id="recJobMin" name="recJobMin">
-                <option value="">未設定</option>
-                <option value="10">10件以上</option>
-                <option value="30" selected>30件以上</option>
-                <option value="50">50件以上</option>
-              </select>
-            </div>
-          </div>
-          <button id="recommendTalentBtn" class="btn-red full" type="button">おすすめ声優を提案（デモ）</button>
-          <p id="recommendMessage" class="message"></p>
-        </div>
-      </div>
-      <button id="generateScriptButton" class="btn-ghost full" type="button">動画URLから台本を自動生成（Whisper + Grok）</button>
-      <p class="section-desc" style="margin-top:0.5rem">台本生成を使うときは、開発用 Mac で <code>./scripts/cursor-ai-setup.sh</code> を実行し、音声プロキシとトンネルを起動したままにしてください（トンネルURLは数日で切れます）。</p>
-      <div id="aiStatus" class="ai-status hidden">
-        <p id="aiStep1">1/3 動画から音声を取得中...</p>
-        <p id="aiStep2">2/3 Whisper で文字起こし中...</p>
-        <p id="aiStep3">3/3 Grok で翻訳・台本化中...</p>
-      </div>
       <div id="scriptPreview" class="field hidden">
         <label for="ytScript">生成台本（編集可）</label>
-        <textarea id="ytScript" name="script"></textarea>
+        <textarea id="ytScript" name="script" rows="32" class="yt-script-field"></textarea>
+        <button type="button" id="ytOpenRecordWorkspaceBtn" class="btn-ghost full" style="margin-top:0.5rem">収録ブースで開く（台本・動画を引き継ぐ）</button>
       </div>
-      <button id="ytSubmitButton" class="btn-red full" type="submit" disabled>本人確認後に依頼を送信</button>
+      <div id="ytQuotePreview" class="form-card quote-preview hidden" aria-live="polite">
+        <h3>見積もり（自動計算）</h3>
+        <p class="section-desc">目安枠（タイムコード）の合計を10秒単位で切り上げ、話者ごとの単価で計算します。決済後、声優が全員受諾すると本取引が開始されます。</p>
+        <div id="ytQuotePreviewBody"></div>
+      </div>
+      <button id="ytProvisionalPayBtn" class="btn-red full hidden" type="button">この見積で決済して依頼する</button>
+      <button id="ytSubmitButton" class="btn-ghost full hidden" type="submit" disabled>依頼送信</button>
       <button id="ytSkipButton" class="btn-ghost full" type="button">デモ入力で声優選択へ（スキップ）</button>
       <p id="ytMessage" class="message"></p>
     </form>
+    </div>
   </section>
 
   <!-- 日本語文言（HTML 側に置く → app.js の文字化けを防ぐ） -->
@@ -625,11 +830,14 @@
         <div>
           <h2 id="talentModalTitle" class="talent-modal-title">声優プロフィール</h2>
           <p id="talentModalMeta" class="talent-meta"></p>
+          <div id="talentModalRating"></div>
         </div>
       </div>
       <p id="talentModalBio" class="talent-modal-bio"></p>
+      <div id="talentModalPricing" class="talent-pricing talent-modal-pricing"></div>
       <div id="talentModalTags" class="talent-tags"></div>
       <p id="talentModalSample" class="talent-modal-sample"></p>
+      <div id="talentModalStats"></div>
       <div class="talent-modal-actions">
         <button type="button" class="btn-red" id="talentModalRequestBtn">この声優に依頼する</button>
         <button type="button" class="btn-ghost" data-go="talents" data-close-talent-modal>声優一覧へ</button>
@@ -649,6 +857,14 @@
     };
   </script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="./app.js?v=ui-2026-05-9" charset="UTF-8"></script>
+  <script src="./js/wavrick-customer-account.js?v=account-2026-05-24"></script>
+  <script src="./js/wavrick-pricing.js?v=pricing-2026-05-23"></script>
+  <script src="./js/wavrick-transaction.js?v=tx-2026-05-24"></script>
+  <script src="./js/wavrick-work-cases.js?v=work-2026-05-23b"></script>
+  <script src="./js/wavrick-delivery-handoff.js?v=work-2026-05-23b"></script>
+  <script src="./js/wavrick-speaker-assign.js?v=spk-gap-2026-05-24"></script>
+  <script src="./js/wavrick-talent-stats.js?v=stats-2026-05-26b"></script>
+  <!-- app.js または styles.css を更新したら ?v= を必ず変える（README のデプロイ手順） -->
+  <script src="./app.js?v=deploy-2026-05-26b" charset="UTF-8"></script>
 </body>
 </html>

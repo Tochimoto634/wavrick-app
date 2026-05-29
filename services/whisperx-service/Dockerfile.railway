@@ -1,0 +1,21 @@
+# Railway 用（CPU）。GPU は Railway の GPU プラン or VPS を推奨。
+FROM python:3.12-slim-bookworm
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
+  && pip install --no-cache-dir -r requirements.txt
+
+COPY transcribe.py silence_detect.py app.py ./
+
+ENV WHISPERX_DEVICE=cpu
+ENV WHISPERX_MODEL=large-v3
+ENV WHISPERX_COMPUTE_TYPE=int8
+ENV WHISPERX_BATCH_SIZE=8
+
+# Railway が注入する PORT を使う
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8081} --timeout-keep-alive 600"]

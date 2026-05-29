@@ -7,6 +7,8 @@ export PROXY_SECRET="${PROXY_SECRET:-wavrick-local-dev-secret}"
 export PORT="${PORT:-5055}"
 
 echo "Starting YouTube audio proxy on http://127.0.0.1:${PORT}/extract"
+echo "AI vocal separation (demucs): pip install -r requirements.txt && pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu"
+echo "  Disable: WAVRICK_VOCAL_SEPARATION=0"
 echo "PROXY_SECRET=${PROXY_SECRET}"
 echo "Health: http://127.0.0.1:${PORT}/health"
 echo ""
@@ -22,6 +24,9 @@ done
 
 VENV="${ROOT}/services/youtube-audio-proxy/.venv"
 if [[ -x "${VENV}/bin/python3" ]]; then
+  if ! "${VENV}/bin/python3" -c "import demucs" 2>/dev/null; then
+    echo "demucs 未導入 → ./scripts/install-demucs.sh を実行するとボーカル分離が有効になります"
+  fi
   exec "${VENV}/bin/python3" app.py
 fi
 

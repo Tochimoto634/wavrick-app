@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hostinger に FTP / ファイルマネージャで上げる ZIP を作る（旧 wavrick-v3.html の差し替え用）
+# Hostinger 本番用 ZIP + 同梱ファイル検証
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="${ROOT}/dist"
@@ -13,6 +13,20 @@ zip -r "$APP_ZIP" \
   index.html \
   app.js \
   styles.css \
+  js/wavrick-customer-account.js \
+  js/wavrick-pricing.js \
+  js/wavrick-transaction.js \
+  js/wavrick-work-cases.js \
+  js/wavrick-delivery-handoff.js \
+  js/wavrick-speaker-assign.js \
+  js/wavrick-talent-stats.js \
+  record-workspace.html \
+  record-workspace.css \
+  record-workspace-mic-test.html \
+  record-booth.html \
+  record-booth.css \
+  js/record-workspace \
+  js/record-booth \
   oauth-done.html \
   .htaccess
 
@@ -20,19 +34,36 @@ cd "$ROOT/hostinger"
 zip -j "$REDIRECT_ZIP" wavrick-v3-redirect.html
 
 echo ""
-echo "=== できました（2つ）==="
-echo "1) 新アプリ本体: $APP_ZIP"
-echo "   → public_html 直下に解凍（index.html がトップ）"
-echo "   → https://wavrick.com/"
+echo "=== ZIP 同梱チェック ==="
+for f in \
+  index.html \
+  app.js \
+  styles.css \
+  js/wavrick-speaker-assign.js \
+  js/wavrick-talent-stats.js \
+  record-workspace.html \
+  record-booth.html \
+  js/record-workspace/app.js \
+  js/record-workspace/script-cue-ops.js \
+  js/record-booth/booth-app.js; do
+  if unzip -l "$APP_ZIP" | awk '{print $NF}' | grep -qxF "$f"; then
+    echo "  OK  $f"
+  else
+    echo "  NG  $f （ZIP に無い）"
+    exit 1
+  fi
+done
+
 echo ""
-echo "2) 旧URL用リダイレクト: $REDIRECT_ZIP"
-echo "   → public_html/wavrick-v3.html として配置（任意）"
+echo "=== キャッシュバスター（index.html）==="
+grep -E 'app\.js\?v=|styles\.css\?v=' "$ROOT/index.html" || true
+
 echo ""
-echo "※ 以前 /wavrick/ に置いていた場合:"
-echo "   public_html/wavrick/index.html を hostinger/wavrick-subfolder-redirect.html に差し替えると / へ誘導できます。"
+echo "=== デプロイ手順 ==="
+echo "  詳細: hostinger/DEPLOY-RELEASE-1.md"
 echo ""
-echo "=== ZIP を Finder で開く（コピペ用）==="
+echo "=== できました ==="
+echo "1) $APP_ZIP"
+echo "2) $REDIRECT_ZIP"
+echo ""
 echo "open \"$APP_ZIP\""
-echo ""
-echo "=== 台本生成を直す（Mac・別タブ）==="
-echo "cd \"$ROOT\" && ./scripts/cursor-ai-setup.sh"

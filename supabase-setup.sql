@@ -12,6 +12,9 @@ create table if not exists public.voice_profiles_public (
   bio text not null,
   genres text,
   rateFrom numeric,
+  price_per_minute numeric,
+  minimum_order_price numeric default 0,
+  additional_retake_price numeric default 0,
   jobCount integer,
   sampleUrl text,
   created_at timestamptz not null default now()
@@ -75,10 +78,8 @@ create table if not exists public.admin_users_public (
 create unique index if not exists uq_admin_users_public_email
   on public.admin_users_public (lower(email));
 
--- Optional starter row for admin login.
-insert into public.admin_users_public (email, displayName)
-values ('admin@wavrick.local', 'WAVRICK運営')
-on conflict ((lower(email))) do nothing;
+-- Admin rows must be inserted manually via Supabase dashboard or CLI.
+-- Never commit credentials to source code.
 
 create table if not exists public.request_workflows_public (
   id uuid primary key default gen_random_uuid(),
@@ -90,6 +91,12 @@ create table if not exists public.request_workflows_public (
   stripeUrl text,
   deliveries jsonb not null default '[]'::jsonb,
   revisionCount integer not null default 0,
+  billable_seconds integer default 0,
+  quote_amount_usd numeric,
+  quote_breakdown jsonb default '{}'::jsonb,
+  free_retakes_used integer not null default 0,
+  retake_payment_status text default 'none',
+  retake_fee_usd numeric default 0,
   updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
@@ -162,35 +169,72 @@ create policy media_pipeline_jobs_select_own
 --   任意: GROK_MODEL=grok-4.3  YOUTUBE_AUDIO_PROXY_URL=https://.../extract  YOUTUBE_AUDIO_PROXY_SECRET=...
 --   deploy: supabase functions deploy media-pipeline
 
--- MVP: ブラウザ(anon)からの保存用 RLS（本番前に厳格化すること）
--- 既に RLS エラーが出ている場合は supabase-rls-mvp-fix.sql を SQL Editor で実行
+-- ── RLS: Role-based access control ──────────────────────────
+-- See supabase/migrations/202605260002_rls_strict.sql for the
+-- full policy set. Below is the base grant + RLS enablement.
+
 grant usage on schema public to anon, authenticated;
-grant all on all tables in schema public to anon, authenticated;
+grant select on public.voice_profiles_public to anon;
+grant all on all tables in schema public to authenticated;
 
+-- Helper functions for RLS policies
+CREATE OR REPLACE FUNCTION public.auth_email()
+RETURNS text LANGUAGE sql STABLE
+AS $$ SELECT lower(auth.jwt() ->> 'email'); $$;
+
+CREATE OR REPLACE FUNCTION public.is_wavrick_admin()
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.admin_users_public
+    WHERE lower(email) = public.auth_email()
+  );
+$$;
+
+-- Enable RLS on all tables
 alter table public.youtube_requests_public enable row level security;
-drop policy if exists wavrick_mvp_youtube_requests on public.youtube_requests_public;
-create policy wavrick_mvp_youtube_requests on public.youtube_requests_public for all to anon, authenticated using (true) with check (true);
-
 alter table public.customer_accounts_public enable row level security;
-drop policy if exists wavrick_mvp_customer_accounts on public.customer_accounts_public;
-create policy wavrick_mvp_customer_accounts on public.customer_accounts_public for all to anon, authenticated using (true) with check (true);
-
 alter table public.voice_profiles_public enable row level security;
-drop policy if exists wavrick_mvp_voice_profiles on public.voice_profiles_public;
-create policy wavrick_mvp_voice_profiles on public.voice_profiles_public for all to anon, authenticated using (true) with check (true);
-
 alter table public.voice_accounts_public enable row level security;
-drop policy if exists wavrick_mvp_voice_accounts on public.voice_accounts_public;
-create policy wavrick_mvp_voice_accounts on public.voice_accounts_public for all to anon, authenticated using (true) with check (true);
-
 alter table public.request_workflows_public enable row level security;
-drop policy if exists wavrick_mvp_request_workflows on public.request_workflows_public;
-create policy wavrick_mvp_request_workflows on public.request_workflows_public for all to anon, authenticated using (true) with check (true);
-
 alter table public.notifications_public enable row level security;
-drop policy if exists wavrick_mvp_notifications on public.notifications_public;
-create policy wavrick_mvp_notifications on public.notifications_public for all to anon, authenticated using (true) with check (true);
-
 alter table public.admin_users_public enable row level security;
-drop policy if exists wavrick_mvp_admin_users on public.admin_users_public;
-create policy wavrick_mvp_admin_users on public.admin_users_public for all to anon, authenticated using (true) with check (true);
+
+-- voice_profiles_public: public read, authenticated owner write
+create policy voice_profiles_select on public.voice_profiles_public for select to anon, authenticated using (true);
+create policy voice_profiles_insert on public.voice_profiles_public for insert to authenticated with check (lower(email) = public.auth_email());
+create policy voice_profiles_update on public.voice_profiles_public for update to authenticated using (lower(email) = public.auth_email() or public.is_wavrick_admin());
+create policy voice_profiles_delete on public.voice_profiles_public for delete to authenticated using (public.is_wavrick_admin());
+
+-- voice_accounts_public: own row or admin
+create policy voice_accounts_select on public.voice_accounts_public for select to authenticated using (lower(email) = public.auth_email() or public.is_wavrick_admin());
+create policy voice_accounts_insert on public.voice_accounts_public for insert to authenticated with check (lower(email) = public.auth_email());
+create policy voice_accounts_update on public.voice_accounts_public for update to authenticated using (lower(email) = public.auth_email() or public.is_wavrick_admin());
+create policy voice_accounts_delete on public.voice_accounts_public for delete to authenticated using (public.is_wavrick_admin());
+
+-- customer_accounts_public: own row or admin
+create policy customer_accounts_select on public.customer_accounts_public for select to authenticated using (lower(email) = public.auth_email() or public.is_wavrick_admin());
+create policy customer_accounts_insert on public.customer_accounts_public for insert to authenticated with check (lower(email) = public.auth_email());
+create policy customer_accounts_update on public.customer_accounts_public for update to authenticated using (lower(email) = public.auth_email() or public.is_wavrick_admin());
+create policy customer_accounts_delete on public.customer_accounts_public for delete to authenticated using (public.is_wavrick_admin());
+
+-- youtube_requests_public: authenticated read all, write own or admin
+create policy youtube_requests_select on public.youtube_requests_public for select to authenticated using (true);
+create policy youtube_requests_insert on public.youtube_requests_public for insert to authenticated with check (lower(email) = public.auth_email());
+create policy youtube_requests_update on public.youtube_requests_public for update to authenticated using (lower(email) = public.auth_email() or public.is_wavrick_admin());
+create policy youtube_requests_delete on public.youtube_requests_public for delete to authenticated using (public.is_wavrick_admin());
+
+-- request_workflows_public: authenticated, delete admin only
+create policy request_workflows_select on public.request_workflows_public for select to authenticated using (true);
+create policy request_workflows_insert on public.request_workflows_public for insert to authenticated with check (true);
+create policy request_workflows_update on public.request_workflows_public for update to authenticated using (true);
+create policy request_workflows_delete on public.request_workflows_public for delete to authenticated using (public.is_wavrick_admin());
+
+-- notifications_public: authenticated, delete admin only
+create policy notifications_select on public.notifications_public for select to authenticated using (true);
+create policy notifications_insert on public.notifications_public for insert to authenticated with check (true);
+create policy notifications_update on public.notifications_public for update to authenticated using (true);
+create policy notifications_delete on public.notifications_public for delete to authenticated using (public.is_wavrick_admin());
+
+-- admin_users_public: select own row only (for login verification)
+create policy admin_users_select_own on public.admin_users_public for select to authenticated using (lower(email) = public.auth_email());

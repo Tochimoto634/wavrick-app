@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>マイク診断 — WAVRICK</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 2rem auto; padding: 0 1rem; }
+    button { margin: 0.35rem 0.35rem 0.35rem 0; padding: 0.5rem 1rem; }
+    #log { white-space: pre-wrap; background: #111; color: #9f9; padding: 1rem; border-radius: 8px; font-size: 13px; }
+    audio { width: 100%; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>マイク診断</h1>
+  <p>収録ブースと別の最小ページです。ここで録音→再生できれば、マイクと Chrome は正常です。</p>
+  <button id="rec">録音 2秒</button>
+  <button id="play" disabled>再生</button>
+  <audio id="out" controls></audio>
+  <pre id="log"></pre>
+  <script>
+    const log = (m) => { document.getElementById("log").textContent += m + "\n"; };
+    let blob = null;
+    let recorder = null;
+    let chunks = [];
+    document.getElementById("rec").onclick = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        chunks = [];
+        const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+        recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+        recorder.onstop = () => {
+          blob = new Blob(chunks, { type: recorder.mimeType });
+          log("stop: " + blob.size + " bytes, " + chunks.length + " chunks");
+          document.getElementById("out").src = URL.createObjectURL(blob);
+          document.getElementById("play").disabled = blob.size < 44;
+          stream.getTracks().forEach((t) => t.stop());
+        };
+        recorder.start(250);
+        log("recording…");
+        setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, 2000);
+      } catch (e) {
+        log("ERR: " + e.message);
+      }
+    };
+    document.getElementById("play").onclick = () => {
+      const a = document.getElementById("out");
+      a.volume = 1;
+      a.play().then(() => log("play ok")).catch((e) => log("play ERR: " + e.message));
+    };
+  </script>
+</body>
+</html>

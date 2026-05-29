@@ -32,6 +32,9 @@ else
       python3 -m venv "$VENV"
       "${VENV}/bin/pip" install -q -r "${ROOT}/services/youtube-audio-proxy/requirements.txt"
     fi
+  elif ! "${VENV}/bin/python3" -c "import flask, yt_dlp" 2>/dev/null; then
+    echo "    venv に flask/yt_dlp がないため pip install..."
+    "${VENV}/bin/pip" install -q -r "${ROOT}/services/youtube-audio-proxy/requirements.txt"
   fi
   echo "    音声プロキシを起動 (port ${PORT_PROXY})..."
   lsof -ti ":${PORT_PROXY}" 2>/dev/null | xargs kill -9 2>/dev/null || true
@@ -95,7 +98,7 @@ echo "    → ${TUNNEL_URL}"
 
 # --- ローカル extract テスト ---
 echo "[3/5] ローカル extract テスト..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 600 \
   -X POST "http://127.0.0.1:${PORT_PROXY}/extract" \
   -H "Authorization: Bearer ${SECRET}" \
   -H "Content-Type: application/json" \

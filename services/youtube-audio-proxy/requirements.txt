@@ -1,2 +1,6 @@
 flask>=3.0.0
-yt-dlp>=2025.1.26
+yt-dlp>=2025.10.14
+# AI vocal separation (Whisper preprocess + record-workspace waveform)
+demucs>=4.0.1
+torch>=2.1.0
+torchaudio>=2.1.0

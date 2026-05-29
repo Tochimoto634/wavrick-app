@@ -1,0 +1,27 @@
+# RunPod GPU Pod 用（CUDA）
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg git ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+# ベースイメージに torch 済み → CPU 版は入れない
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY transcribe.py silence_detect.py app.py ./
+
+ENV WHISPERX_DEVICE=cuda
+ENV WHISPERX_MODEL=large-v3
+ENV WHISPERX_COMPUTE_TYPE=float16
+ENV WHISPERX_BATCH_SIZE=16
+ENV PORT=8081
+# モデルキャッシュ（RunPod Network Volume を /workspace にマウント推奨）
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV TORCH_HOME=/workspace/.cache/torch
+
+EXPOSE 8081
+
+# 0.0.0.0 必須（RunPod から到達するため）
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8081} --timeout-keep-alive 600"]

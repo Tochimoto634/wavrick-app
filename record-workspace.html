@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>収録ブース — WAVRICK</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css?v=ui-2026-05-28">
+  <link rel="stylesheet" href="./record-workspace.css?v=rw-panel-fix-2026-05-25">
+  <style>html.no-scroll,html.no-scroll body{overflow:hidden!important;height:100%!important}</style>
+  <script>
+    document.documentElement.classList.add("no-scroll");
+    if("scrollRestoration"in history)history.scrollRestoration="manual";
+    window.scrollTo(0,0);
+    document.addEventListener("DOMContentLoaded",function(){
+      window.scrollTo(0,0);
+      requestAnimationFrame(function(){
+        window.scrollTo(0,0);
+        document.documentElement.classList.remove("no-scroll");
+      });
+    });
+  </script>
+</head>
+<body class="rw-body">
+  <header class="rw-topbar">
+    <div class="rw-topbar-brand">
+      <h1>収録ブース</h1>
+      <span class="rw-topbar-sub">ADR / 吹替スタイル</span>
+      <span id="rwActiveCaseLabel" class="rw-topbar-case" hidden></span>
+    </div>
+    <div class="rw-topbar-actions">
+      <details class="rw-topbar-panel" id="rwAccountPanel">
+        <summary class="rw-btn rw-btn-ghost">マイアカウント</summary>
+        <div class="rw-topbar-panel-body" role="region" aria-label="マイアカウント">
+          <p id="rwAccountSummary" class="rw-account-summary">ログイン情報を読み込み中…</p>
+          <p class="rw-hint">声優アカウントは <a href="./index.html">トップ</a> のログインと共通です。</p>
+          <a href="./index.html" class="rw-btn rw-btn-ghost">アカウント設定を開く</a>
+        </div>
+      </details>
+      <details class="rw-topbar-panel" id="rwRetakePanel">
+        <summary class="rw-btn rw-btn-ghost rw-retake-summary">要修正</summary>
+        <div class="rw-topbar-panel-body rw-retake-panel-body" role="region" aria-label="部分リテイク依頼">
+          <p class="rw-hint">顧客が指定した目安枠だけ差し戻されます。赤枠のセリフを録り直すと再提出扱いになります。</p>
+          <ul id="rwRetakeList" class="rw-retake-list"></ul>
+          <button type="button" id="rwRetakeSimulateBtn" class="rw-btn rw-btn-ghost" title="開発用: 選択中の枠に差し戻しを付ける">（開発）差し戻しを模擬</button>
+        </div>
+      </details>
+      <details class="rw-topbar-panel" id="rwSavePanel">
+        <summary class="rw-btn rw-btn-ghost">保存</summary>
+        <div class="rw-topbar-panel-body" role="region" aria-label="クラウド保存">
+          <p id="rwSaveStatus" class="rw-save-status">—</p>
+          <div class="rw-save-actions">
+            <button type="button" id="rwSaveBtn" class="rw-btn rw-btn-primary">現在の状態を保存</button>
+            <button type="button" id="rwLoadSaveBtn" class="rw-btn rw-btn-ghost">クラウドから復元</button>
+          </div>
+          <p class="rw-hint">ログイン中のアカウントに台本・Take・編集・ゴミ箱を保存します。別 PC でも同じアカウントで復元できます。</p>
+        </div>
+      </details>
+      <details class="rw-topbar-panel" id="rwTrashPanel">
+        <summary class="rw-btn rw-btn-ghost">ゴミ箱</summary>
+        <div class="rw-topbar-panel-body rw-trash-panel-body" role="region" aria-label="ゴミ箱">
+          <p id="rwTrashEmpty" class="rw-hint">削除した Take はここに表示されます。</p>
+          <ul id="rwTrashList" class="rw-trash-list"></ul>
+        </div>
+      </details>
+      <details class="rw-topbar-panel" id="rwBugReportPanel">
+        <summary class="rw-btn rw-btn-ghost">バグ報告</summary>
+        <div class="rw-topbar-panel-body" role="region" aria-label="バグ報告">
+          <p class="rw-hint">再現手順や期待する動作を書いて送信してください。環境情報は自動で付きます。</p>
+          <label class="rw-field">
+            <span>内容</span>
+            <textarea id="rwBugReportText" rows="5" placeholder="例: Chrome で ② 読込後に試聴できない"></textarea>
+          </label>
+          <label class="rw-field">
+            <span>連絡用メール（任意）</span>
+            <input id="rwBugReportEmail" type="email" autocomplete="email" placeholder="you@example.com">
+          </label>
+          <div class="rw-bug-actions">
+            <button type="button" id="rwBugReportCopyBtn" class="rw-btn rw-btn-ghost">内容をコピー</button>
+            <button type="button" id="rwBugReportSendBtn" class="rw-btn rw-btn-primary">メールで送る</button>
+          </div>
+        </div>
+      </details>
+      <details class="rw-topbar-panel rw-settings-panel" id="rwSettingsPanel">
+        <summary class="rw-btn rw-btn-ghost">詳細設定</summary>
+        <div class="rw-topbar-panel-body rw-settings-panel-body" role="region" aria-label="収録の詳細設定">
+          <p class="rw-settings-intro">普段は設定だけ変更。各項目の「説明」は必要なときだけ開いてください。</p>
+
+          <div class="rw-setting-row">
+            <label class="rw-setting-label" for="rwPreRoll">プレロール（秒）</label>
+            <input id="rwPreRoll" class="rw-setting-control" type="number" min="0" max="10" step="0.5" value="3">
+            <details class="rw-setting-help">
+              <summary>説明</summary>
+              <p>収録スタートの何秒前からお手本（元音声）を流すか。タイミングを耳で合わせてから 3-2-1 → 吹き込みになります。0 にするとカウントだけですぐ録音に入ります。</p>
+            </details>
+          </div>
+
+          <div class="rw-setting-row">
+            <label class="rw-setting-label rw-setting-label--check" for="rwCountdownBeeps">
+              <input id="rwCountdownBeeps" type="checkbox" checked autocomplete="off">
+              3-2-1 ピッ音
+            </label>
+            <details class="rw-setting-help">
+              <summary>説明</summary>
+              <p>カウントダウン（3・2・1）のときに短いビープを鳴らします。スタジオでモニターしやすくなります。オフにすると無音カウントです。</p>
+            </details>
+          </div>
+
+          <div class="rw-setting-row">
+            <label class="rw-setting-label rw-setting-label--check" for="rwHoldToRecord">
+              <input id="rwHoldToRecord" type="checkbox" autocomplete="off">
+              押している間録音（スペース長押し）
+            </label>
+            <details class="rw-setting-help">
+              <summary>説明</summary>
+              <p>収録ブースを開いた状態で、キーボードの <kbd>Space</kbd> を押しているあいだだけ収録します。押すとプレロール → 3-2-1 → 録音が始まり、離すと録音停止。連続で何テイクも取りたいとき向けです（オフのときは下の収録ブースの ● 録音 → 3-2-1 ボタンを使います）。</p>
+            </details>
+          </div>
+
+          <div class="rw-setting-row">
+            <label class="rw-setting-label" for="rwAudioOffset">波形と動画のズレ補正</label>
+            <div class="rw-setting-control rw-setting-offset">
+              <input id="rwAudioOffset" type="range" min="-5" max="5" step="0.1" value="0">
+              <span id="rwAudioOffsetVal" class="rw-offset-val">+0.0秒</span>
+            </div>
+            <details class="rw-setting-help">
+              <summary>説明</summary>
+              <p>② で読み込んだ波形と YouTube 動画の位置がずれているときだけ直します。ずれていなければ <strong>0 のまま</strong>で問題ありません。</p>
+            </details>
+          </div>
+
+          <div class="rw-setting-row">
+            <label class="rw-setting-label rw-setting-label--check" for="rwAutoRecordAtCue">
+              <input id="rwAutoRecordAtCue" type="checkbox" autocomplete="off">
+              キュー到達で自動録音
+            </label>
+            <details class="rw-setting-help">
+              <summary>説明</summary>
+              <p>▶ 再生中、台本のタイムコードに到達したら自動でマイク録音を始める旧フローです。収録ブースの 3-2-1 収録とは別なので、通常はオフのままで大丈夫です。</p>
+            </details>
+          </div>
+
+          <details class="rw-settings-subsection rw-settings-subsection--features">
+            <summary>収録アシスト（オンオフ）</summary>
+            <p class="rw-settings-intro">収録システムでよく使われる補助機能です。必要なものだけオンにしてください。</p>
+
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_pingPongPreview">
+                <input id="rwFeat_pingPongPreview" type="checkbox" autocomplete="off" data-feat="pingPongPreview">
+                ピンポン試聴
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>お手本と採用 Take を約2秒ずつ交互に再生して比較します。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_loopLineRegion">
+                <input id="rwFeat_loopLineRegion" type="checkbox" autocomplete="off" data-feat="loopLineRegion">
+                ループ区間（現在の台本行）
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>▶ 再生で、選択中の台本行の範囲をループします。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_takeColorLabels">
+                <input id="rwFeat_takeColorLabels" type="checkbox" autocomplete="off" data-feat="takeColorLabels">
+                テイク色分け
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>Take カードをクリックで「候補／NG／要再録」の色を切り替えます。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_markerList">
+                <input id="rwFeat_markerList" type="checkbox" autocomplete="off" data-feat="markerList">
+                マーカーリスト
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>台本行の収録状況一覧を右に表示します。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_noiseGateSuggest">
+                <input id="rwFeat_noiseGateSuggest" type="checkbox" autocomplete="off" data-feat="noiseGateSuggest">
+                ノイズゲート簡易版
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>無音部分のトリム候補を自動提案します（編集パネルのボタン）。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_bpmClickCountdown">
+                <input id="rwFeat_bpmClickCountdown" type="checkbox" autocomplete="off" data-feat="bpmClickCountdown">
+                3-2-1 に BPM クリック
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>カウント中にクリック音を追加します（ピッ音オン時）。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_dualScreenMode">
+                <input id="rwFeat_dualScreenMode" type="checkbox" autocomplete="off" data-feat="dualScreenMode">
+                二画面モード
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>セリフ表示を大きく、波形を下に固定するレイアウトです。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_sessionExport">
+                <input id="rwFeat_sessionExport" type="checkbox" autocomplete="off" data-feat="sessionExport">
+                セッション書き出し
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>台本・Take メタデータを JSON で保存します。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_inputLevelMeter">
+                <input id="rwFeat_inputLevelMeter" type="checkbox" autocomplete="off" data-feat="inputLevelMeter">
+                入力レベルメーター
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>録音中のマイク音量を数値表示します。</p></details>
+            </div>
+            <div class="rw-setting-row">
+              <label class="rw-setting-label rw-setting-label--check" for="rwFeat_overdubMonitor">
+                <input id="rwFeat_overdubMonitor" type="checkbox" autocomplete="off" data-feat="overdubMonitor">
+                オーバーダブ比較
+              </label>
+              <details class="rw-setting-help"><summary>説明</summary><p>録音中に前の Take を小さく再生します。</p></details>
+            </div>
+
+            <button type="button" id="rwSessionExportBtn" class="rw-btn rw-btn-ghost rw-feat-action" hidden>セッション JSON を書き出し</button>
+          </details>
+
+          <details class="rw-settings-subsection">
+            <summary>開発者向け（プロキシ URL）</summary>
+            <p class="rw-hint rw-setup-hint">
+              ローカルは <code>http://127.0.0.1:8889/record-workspace.html</code>。
+              POST 先は <code>/api/youtube-audio/extract</code>（自動）。
+            </p>
+            <div class="rw-proxy-grid">
+              <div class="rw-field">
+                <label for="rwProxyUrl">POST 先（末尾 /extract）</label>
+                <input id="rwProxyUrl" type="url" autocomplete="off" placeholder="https://xxxx.trycloudflare.com/extract">
+              </div>
+              <div class="rw-field">
+                <label for="rwProxySecret">Bearer シークレット</label>
+                <input id="rwProxySecret" type="password" autocomplete="off" placeholder="wavrick-local-dev-secret">
+              </div>
+            </div>
+            <button type="button" id="rwSaveProxyBtn" class="rw-btn rw-btn-ghost">プロキシ設定を保存</button>
+          </details>
+        </div>
+      </details>
+      <label class="rw-case-select-wrap">
+        <span class="rw-case-select-label">案件</span>
+        <select id="rwCaseSelect" class="rw-case-select" title="いま開いている案件"></select>
+      </label>
+      <a href="./index.html" id="rwCaseManageLink" class="rw-btn rw-btn-ghost">案件管理</a>
+    </div>
+  </header>
+
+  <div class="rw-excel-bar" id="rwExcelBar" role="toolbar" aria-label="編集">
+    <div class="rw-excel-bar-group">
+      <button type="button" id="rwUndoBtn" class="rw-excel-btn" title="元に戻す" disabled>↶ 戻る</button>
+      <button type="button" id="rwRedoBtn" class="rw-excel-btn" title="やり直し" disabled>↷ やり直し</button>
+    </div>
+    <div class="rw-excel-bar-group">
+      <button type="button" id="rwSaveSessionBtn" class="rw-excel-btn rw-excel-btn--primary" title="台本・Take・編集を保存">💾 保存</button>
+    </div>
+    <span id="rwExcelBarHint" class="rw-excel-bar-hint" aria-live="polite"></span>
+  </div>
+
+  <div id="rwRetakeBanner" class="rw-retake-banner" hidden role="status" aria-live="polite">
+    <span class="rw-retake-banner-text">顧客から部分リテイク依頼: <strong id="rwRetakeCount">0</strong> 枠</span>
+    <button type="button" id="rwRetakeNextBtn" class="rw-btn rw-btn-ghost">次の要修正へ</button>
+  </div>
+
+  <!-- 常時表示: URL 貼り付け・読み込み（折りたたまない） -->
+  <section class="rw-prep-bar" id="rwPrepBar" aria-label="動画・波形の準備">
+    <p class="rw-prep-steps">
+      <span class="rw-step">① URL を貼る</span>
+      <span class="rw-step-arrow">→</span>
+      <span class="rw-step">② 動画+音声読込</span>
+      <span class="rw-step-arrow">→</span>
+      <span class="rw-step">③ 音声だけ再取得</span>
+    </p>
+    <div class="rw-prep-grid">
+      <div class="rw-field rw-field--url">
+        <label for="rwYoutubeUrl">YouTube 動画 URL</label>
+        <input id="rwYoutubeUrl" type="url" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" spellcheck="false">
+      </div>
+      <div class="rw-prep-actions">
+        <button type="button" id="rwLoadVideoBtn" class="rw-btn rw-btn-primary">② 動画+音声読込</button>
+        <button type="button" id="rwLoadWaveBtn" class="rw-btn rw-btn-ghost" title="動画はそのまま、AIボーカル分離音声だけ取り直す">③ 音声再取得</button>
+        <label class="rw-file-label">
+          <span class="rw-btn rw-btn-ghost">音声ファイル</span>
+          <input id="rwAudioFile" type="file" accept="audio/*" hidden>
+        </label>
+        <button type="button" id="rwNoiseToggleBtn" class="rw-btn rw-btn-ghost rw-noise-toggle" aria-pressed="false" title="ノイズ除去済み音声と元音声を切り替え">ノイズ除去 OFF</button>
+      </div>
+    </div>
+  </section>
+
+  <p id="rwStatus" class="rw-status" data-type="info" role="status">準備中…</p>
+
+  <main class="rw-studio" id="rwStudio">
+    <!-- トランスポート（プロ DAW / Source-Connect 風） -->
+    <div class="rw-transport" aria-label="再生・録音コントロール">
+      <div class="rw-transport-time">
+        <span id="rwTimeDisplay" class="rw-time">00:00.00 / 00:00.00</span>
+        <span id="rwRecordIndicator" class="rw-record-indicator" hidden aria-live="polite">REC</span>
+      </div>
+      <div class="rw-transport-progress">
+        <span id="rwProgressLabel" class="rw-progress-label">0 / 0 行収録済</span>
+        <div class="rw-progress-track" aria-hidden="true">
+          <div id="rwProgressFill" class="rw-progress-fill" style="width:0%"></div>
+        </div>
+      </div>
+      <div class="rw-transport-controls" role="group" aria-label="トランスポート">
+        <button type="button" id="rwPrevLineBtn" class="rw-transport-btn" title="前のセリフ（↑）">⏮ 前</button>
+        <button type="button" id="rwCueBtn" class="rw-transport-btn" title="収録スタートから再生（C）">⏮ 最初から再生</button>
+        <button type="button" id="rwPlayPauseBtn" class="rw-transport-btn rw-transport-btn--play" title="お手本音声の再生／一時停止（Shift+Space）">▶ 再生</button>
+        <button type="button" id="rwPlayTakeTransportBtn" class="rw-transport-btn rw-transport-btn--take rw-hidden-in-ui" title="自分の録音を試聴" disabled hidden>🔊 試聴</button>
+        <button type="button" id="rwRecordBtn" class="rw-transport-btn rw-transport-btn--record rw-hidden-in-ui" title="録音" hidden>● 録音</button>
+        <button type="button" id="rwStopBtn" class="rw-transport-btn rw-hidden-in-ui" title="停止" hidden>■ 停止</button>
+        <button type="button" id="rwNextLineBtn" class="rw-transport-btn" title="次のセリフ（↓）">次 ⏭</button>
+      </div>
+    </div>
+
+    <!-- 2行マルチトラック（お手本 / 声優収録） -->
+    <section class="rw-wave-dock rw-multitrack-dock" id="rwWaveDock" aria-label="マルチトラック波形比較">
+      <div class="rw-wave-dock-head">
+        <strong>マルチトラック比較</strong>
+        <span class="rw-wave-dock-hint">②の波形をタップで編集対象 · ⋮⋮ で移動 · 端を長押しでトリム</span>
+        <span id="rwVocalBadge" class="rw-vocal-badge" data-state="pending">ボーカル分離: 未取得</span>
+      </div>
+      <div class="rw-multitrack-viewport rw-wave-viewport--dock" id="rwMultitrackViewport">
+        <div class="rw-track-row rw-track-row--ref">
+          <span class="rw-track-label rw-track-label--ref">① お手本（元ボーカル）</span>
+          <div id="rwRefWaveHost" class="rw-wave-inner rw-ref-wave-host"></div>
+        </div>
+        <div class="rw-track-row rw-track-row--take">
+          <span class="rw-track-label rw-track-label--take">② 声優収録</span>
+          <div class="rw-take-lane-scroll" id="rwTakeLaneScroll">
+            <div id="rwTakeLane" class="rw-take-lane" role="list" aria-label="声優収録トラック"></div>
+          </div>
+        </div>
+      </div>
+      <div id="rwMultitrackSeekBar" class="rw-multitrack-seek" hidden aria-label="タイムラインシーク">
+        <span id="rwSeekTc" class="rw-seek-tc">00:00.00</span>
+        <input type="range" id="rwMultitrackSeek" class="rw-multitrack-seek-input" min="0" max="10000" step="1" value="0" aria-label="再生位置">
+        <span id="rwSeekDuration" class="rw-seek-dur">00:00.00</span>
+      </div>
+      <p id="rwWaveEmptyHint" class="rw-wave-empty-hint">② 動画+音声読込 で上段にお手本波形、下段に台本の目安枠が表示されます</p>
+      <div id="rwLiveRecPanel" class="rw-live-rec-panel" hidden aria-label="録音中のリアルタイム波形">
+        <span class="rw-live-rec-label">マイク入力（リアルタイム）</span>
+        <span id="rwInputLevelMeter" class="rw-input-level-meter" hidden>— dBFS</span>
+        <canvas id="rwLiveRecCanvas" class="rw-live-rec-canvas" width="800" height="80"></canvas>
+      </div>
+    </section>
+
+    <div id="rwRecordBoothBar" class="rw-record-booth-bar" aria-label="収録ブース操作">
+      <p id="rwBoothStatus" class="rw-booth-status">収録ブース — マルチトラックと台本を確認してから「収録ブースを開く」で録音画面へ</p>
+      <div class="rw-booth-actions">
+        <button type="button" id="rwOpenBoothBtn" class="rw-btn rw-btn-primary">収録ブースを開く</button>
+        <button type="button" id="rwBoothReadyBtn" class="rw-btn rw-rec-start" hidden>● 録音</button>
+        <button type="button" id="rwBoothStartBtn" class="rw-btn rw-btn-primary rw-booth-start-countdown" hidden>● 3-2-1 で吹き込み開始</button>
+        <button type="button" id="rwBoothStopBtn" class="rw-btn rw-rec-stop" hidden>■ 録音停止</button>
+        <button type="button" id="rwBoothCloseBtn" class="rw-btn rw-btn-ghost" hidden>ブースを閉じる</button>
+      </div>
+    </div>
+
+    <div class="rw-studio-grid">
+      <!-- テレプロンプター（中央・大きいセリフ） -->
+      <section class="rw-teleprompter" aria-label="現在のセリフ">
+        <div id="rwAdrOverlay" class="rw-adr-overlay" hidden aria-live="assertive">
+          <p class="rw-adr-phase"></p>
+          <p class="rw-adr-count"></p>
+          <p class="rw-adr-sub"></p>
+        </div>
+        <div class="rw-cue-header">
+          <span id="rwCueIndex" class="rw-cue-index">— / —</span>
+          <span id="rwCueTc" class="rw-cue-tc">[—]</span>
+        </div>
+        <div class="rw-punch-bar" id="rwPunchBar">
+          <div class="rw-punch-readout">
+            <span class="rw-punch-label">収録スタート</span>
+            <strong id="rwPunchTime" class="rw-punch-time">—</strong>
+            <span id="rwPunchScriptHint" class="rw-punch-hint">台本目安: —</span>
+          </div>
+          <div class="rw-punch-actions">
+            <button type="button" id="rwSetPunchBtn" class="rw-btn rw-btn-ghost" title="波形の現在位置を収録開始点にする">📍 ここをスタート</button>
+            <button type="button" id="rwJumpPunchBtn" class="rw-btn rw-btn-ghost" title="収録スタートの手前へ移動">⏪ スタートへ</button>
+            <button type="button" id="rwResetPunchBtn" class="rw-btn rw-btn-ghost" title="台本のタイムコード開始に戻す">台本に戻す</button>
+          </div>
+        </div>
+        <p id="rwCuePrev" class="rw-cue-prev" aria-hidden="true"></p>
+        <div id="rwTeleprompterScroll" class="rw-teleprompter-scroll" tabindex="0" aria-label="セリフ（自動スクロール）">
+          <p id="rwCueCurrent" class="rw-cue-current">台本を反映するか、左の行を選んでください</p>
+        </div>
+        <p id="rwCueNext" class="rw-cue-next" aria-hidden="true"></p>
+        <section class="rw-take-desk" id="rwTakeDesk" aria-label="Take 管理">
+          <div class="rw-take-desk-head">
+            <strong>Take 管理</strong>
+            <span id="rwTakeDeskHint" class="rw-take-desk-hint">名前を編集可 · 採用した Take が波形と全編試聴に反映</span>
+          </div>
+          <div id="rwTakeCards" class="rw-take-cards" role="list"></div>
+          <p id="rwTakeCardsEmpty" class="rw-take-cards-empty">まだ Take がありません。下の「収録ブースを開く」から録音してください。</p>
+          <section id="rwTakeEditor" class="rw-take-editor" hidden aria-label="採用 Take の音声編集">
+            <div class="rw-take-editor-head">
+              <strong>音声編集</strong>
+              <span id="rwTakeEditorPending" class="rw-take-editor-pending" hidden>未適用</span>
+            </div>
+            <p id="rwTakeEditorMeta" class="rw-take-editor-meta">—</p>
+            <div id="rwTakeEditWaveHost" class="rw-take-edit-wave-host" aria-label="編集中 Take の波形プレビュー"></div>
+            <p class="rw-take-editor-hint">暗い部分はカットされます。下で調整 → <strong>適用</strong> で②声優トラックに反映。</p>
+            <label class="rw-take-editor-row">
+              <span>音量</span>
+              <input type="range" id="rwTakeGain" min="0" max="200" value="100" step="1">
+              <span id="rwTakeGainVal" class="rw-take-editor-val">100%</span>
+            </label>
+            <label class="rw-take-editor-row">
+              <span>頭をカット</span>
+              <input type="range" id="rwTakeTrimStart" min="0" max="0" step="0.01" value="0">
+              <span id="rwTakeTrimStartVal" class="rw-take-editor-val">0.00s</span>
+            </label>
+            <label class="rw-take-editor-row">
+              <span>末尾をカット</span>
+              <input type="range" id="rwTakeTrimEnd" min="0" max="0" step="0.01" value="0">
+              <span id="rwTakeTrimEndVal" class="rw-take-editor-val">0.00s</span>
+            </label>
+            <p id="rwTakeEditorDur" class="rw-take-editor-dur">有効な長さ: —</p>
+            <div class="rw-take-editor-actions">
+              <button type="button" id="rwTakeEditApplyBtn" class="rw-btn rw-btn-primary">適用（②に反映）</button>
+              <button type="button" id="rwTakeEditPreviewBtn" class="rw-btn rw-btn-ghost">▶ 編集を試聴</button>
+              <button type="button" id="rwPingPongBtn" class="rw-btn rw-btn-ghost rw-feat-action" hidden>ピンポン試聴</button>
+              <button type="button" id="rwNoiseGateSuggestBtn" class="rw-btn rw-btn-ghost rw-feat-action" hidden>無音カット候補</button>
+              <button type="button" id="rwTakeEditResetBtn" class="rw-btn rw-btn-ghost">リセット</button>
+            </div>
+          </section>
+          <div class="rw-take-preview-wrap" id="rwTakePreviewWrap" hidden>
+            <label class="rw-take-preview-label">試聴プレイヤー</label>
+            <audio id="rwTakePreview" class="rw-take-preview" controls preload="auto"></audio>
+          </div>
+        </section>
+        <section class="rw-flow-panel" id="rwFlowPanel" aria-label="収録フロー">
+          <div class="rw-flow-head">
+            <strong>収録フロー</strong>
+            <span id="rwFlowSummary" class="rw-flow-summary">0 / 0 完了</span>
+          </div>
+          <ol id="rwFlowList" class="rw-flow-list"></ol>
+          <div class="rw-flow-actions">
+            <button type="button" id="rwPlayConcatBtn" class="rw-btn rw-btn-primary" disabled>🔊 合成された音声を試聴</button>
+            <button type="button" id="rwDownloadConcatBtn" class="rw-btn rw-btn-ghost" disabled title="お使いのPCにWAVファイルとしてダウンロード">ミックス WAV をダウンロード</button>
+            <button type="button" id="rwQueueDeliveryBtn" class="rw-btn rw-btn-ghost" disabled title="案件管理の提出欄へ移動">案件として提出</button>
+          </div>
+          <div class="rw-concat-preview-wrap" id="rwConcatPreviewWrap" hidden>
+            <label class="rw-concat-preview-label">合成音声プレビュー（タイムライン配置）</label>
+            <audio id="rwConcatPreview" class="rw-concat-preview" controls preload="auto"></audio>
+          </div>
+        </section>
+        <p class="rw-shortcuts-hint">
+          <kbd>R</kbd> 収録ブース　<kbd>Space</kbd> 試聴／録音　<kbd>Shift+Space</kbd> お手本再生　<kbd>S</kbd> 停止 — ②の波形タップで編集対象に
+        </p>
+      </section>
+
+      <!-- 台本インデックス（右サイド） -->
+      <aside class="rw-script-rail" aria-label="台本一覧">
+        <section id="rwMarkerListPanel" class="rw-marker-list-panel" hidden aria-label="マーカー一覧">
+          <div class="rw-marker-list-head">
+            <strong>マーカー一覧</strong>
+          </div>
+          <ul id="rwMarkerList" class="rw-marker-list"></ul>
+        </section>
+        <div class="rw-rail-head">
+          <strong>台本</strong>
+          <span class="rw-rail-legend"><span class="dot dot--done"></span>収録済 <span class="dot dot--active"></span>現在</span>
+        </div>
+        <div class="rw-script-rail-tools" role="group" aria-label="台本の選択と結合">
+          <button type="button" id="rwScriptSelectModeBtn" class="rw-btn rw-btn-ghost rw-script-select-toggle" aria-pressed="false">選択</button>
+          <button type="button" id="rwScriptMergeBtn" class="rw-btn rw-btn-ghost" hidden disabled>結合</button>
+          <button type="button" id="rwScriptSplitBtn" class="rw-btn rw-btn-ghost" hidden disabled>分割</button>
+        </div>
+        <div id="rwScriptList" class="rw-line-index" role="list"></div>
+        <button type="button" id="rwAddScriptLineBtn" class="rw-btn rw-btn-ghost rw-add-script-line">＋ 台本の行を追加</button>
+        <details class="rw-script-edit">
+          <summary>台本を編集</summary>
+          <textarea id="rwScriptEditor" spellcheck="false" rows="8"></textarea>
+          <button type="button" id="rwApplyScriptBtn" class="rw-btn rw-btn-ghost">台本を反映</button>
+        </details>
+      </aside>
+    </div>
+
+    <!-- 映像のみ（折りたたみ・小窓可） -->
+    <details class="rw-ref-panel" id="rwRefPanel">
+      <summary>映像プレビュー（任意・ミュート）</summary>
+      <section class="rw-panel rw-video-panel" id="rwVideoPanel" aria-label="元動画" data-video-mode="hidden">
+        <div class="rw-panel-head rw-video-panel-head" id="rwVideoPanelHead">
+          <strong>映像（ミュート）</strong>
+          <div class="rw-video-head-right">
+            <div class="rw-video-mode-btns" role="group" aria-label="動画の表示">
+              <button type="button" class="rw-btn-mode" data-video-mode="normal" title="パネル内に表示">通常</button>
+              <button type="button" class="rw-btn-mode" data-video-mode="mini" title="小窓">小窓</button>
+              <button type="button" class="rw-btn-mode is-active" data-video-mode="hidden" title="非表示">非表示</button>
+            </div>
+          </div>
+        </div>
+        <div class="rw-video-wrap" id="rwVideoWrap">
+          <div id="rwPlayerHost" class="rw-player-embed"></div>
+        </div>
+      </section>
+    </details>
+  </main>
+
+  <button type="button" id="rwShowVideoBtn" class="rw-show-video-btn" hidden>映像を表示</button>
+
+  <script>
+    // 台本エディタの変更を自動保存（モジュールのキャッシュ問題対策）
+    (function() {
+      var editor = document.getElementById("rwScriptEditor");
+      if (!editor) return;
+      var ready = false;
+      // Wait 3s after page load before starting to track (avoid saving demo text)
+      setTimeout(function() { ready = true; }, 3000);
+      var debounceTimer = null;
+      function saveEditorState() {
+        if (!ready) return;
+        try {
+          var text = editor.value;
+          if (!text || !text.trim()) return;
+          localStorage.setItem("wavrick_rw_editor_text", text);
+          localStorage.setItem("wavrick_rw_editor_saved_at", String(Date.now()));
+        } catch(e) {}
+      }
+      editor.addEventListener("input", function() {
+        if (!ready) return;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(saveEditorState, 500);
+      });
+      // Detect programmatic value changes (merge/split updates editor.value)
+      var lastVal = editor.value;
+      setInterval(function() {
+        if (!ready) return;
+        if (editor.value !== lastVal) {
+          lastVal = editor.value;
+          saveEditorState();
+        }
+      }, 1000);
+    })();
+  </script>
+
+  <script>
+    window.WAVRICK_CONFIG = window.WAVRICK_CONFIG || {
+      supabaseUrl: "https://gdolqgcftxqxaacjyqla.supabase.co",
+      supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdkb2xxZ2NmdHhxeGFhY2p5cWxhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4Mjg2NTksImV4cCI6MjA5NDQwNDY1OX0.OzuD8nAAx1ksQmD1p3Dupltbkv93vTxtRGtPoXiz7w0",
+      audioProxyUrl: "/api/youtube-audio/extract",
+      audioProxySecret: "wavrick-local-dev-secret"
+    };
+  </script>
+  <script>
+    // デモデータを localStorage から即座にクリア（キャッシュ問題対策）
+    (function() {
+      try {
+        var stateRaw = localStorage.getItem("wavrick_rw_script_state");
+        if (stateRaw) {
+          var state = JSON.parse(stateRaw);
+          if (state && state.scriptLines && state.scriptLines.length > 0) {
+            var firstText = (state.scriptLines[0].text || "").trim().toLowerCase();
+            if (firstText === "hello" || firstText.indexOf("hello") === 0) {
+              localStorage.removeItem("wavrick_rw_script_state");
+              console.log("[wavrick] cleared demo script state from localStorage");
+            }
+          }
+        }
+        var editorText = localStorage.getItem("wavrick_rw_editor_text");
+        if (editorText && /^\[00:02/i.test(editorText.trim()) && /Hello/i.test(editorText)) {
+          localStorage.removeItem("wavrick_rw_editor_text");
+          console.log("[wavrick] cleared demo editor text from localStorage");
+        }
+        var boothSync = localStorage.getItem("wavrick_booth_sync");
+        if (boothSync) {
+          var sync = JSON.parse(boothSync);
+          if (sync && sync.scriptLines && sync.scriptLines.length > 0) {
+            var id = String(sync.scriptLines[0].id || "");
+            var t = (sync.scriptLines[0].text || "").trim().toLowerCase();
+            if (id.indexOf("demo-") === 0 || t === "hello") {
+              localStorage.removeItem("wavrick_booth_sync");
+              console.log("[wavrick] cleared demo booth sync from localStorage");
+            }
+          }
+        }
+      } catch(e) { /* ignore */ }
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="./js/wavrick-work-cases.js?v=work-2026-05-23b"></script>
+  <script src="./js/wavrick-delivery-handoff.js?v=work-2026-05-23b"></script>
+  <script type="module" src="./js/record-workspace/app.js?v=rw-tc-duration-2026-05-27t"></script>
+  <script type="module">
+    // Module-based fallback: if main app.js errors during init, this still runs.
+    // Since this is also a module, it only executes if modules are supported.
+    window.__wavrick_module_loaded = true;
+  </script>
+  <script>
+    // Non-module fallback for booth navigation.
+    (function() {
+      var moduleHandled = false;
+      window.__wavrick_booth_nav_handled = function() { moduleHandled = true; };
+
+      var btn = document.getElementById("rwOpenBoothBtn");
+      if (!btn) return;
+
+      function parseScriptFromEditor() {
+        var editor = document.getElementById("rwScriptEditor");
+        if (!editor || !editor.value.trim()) return [];
+        var rangeRe = /^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\s*-\s*(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+)$/;
+        var startRe = /^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+)$/;
+        var lines = [];
+        editor.value.split("\n").forEach(function(raw, i) {
+          raw = raw.trim();
+          if (!raw) return;
+          var m = raw.match(rangeRe);
+          if (m) {
+            var startSec = parseInt(m[1],10)*60 + parseInt(m[2],10) + (parseInt(m[3]||"0",10)/100);
+            var endSec = parseInt(m[4],10)*60 + parseInt(m[5],10) + (parseInt(m[6]||"0",10)/100);
+            if (endSec <= startSec) endSec = startSec + 2;
+            lines.push({ id: "fb-"+i, startSec: startSec, endSec: endSec, text: m[7], rawTc: raw.match(/^\[[^\]]+\]/)[0] });
+            return;
+          }
+          m = raw.match(startRe);
+          if (m) {
+            var s = parseInt(m[1],10)*60 + parseInt(m[2],10) + (parseInt(m[3]||"0",10)/100);
+            lines.push({ id: "fb-"+i, startSec: s, endSec: null, text: m[4], rawTc: raw.match(/^\[[^\]]+\]/)[0] });
+          }
+        });
+        for (var j = 0; j < lines.length; j++) {
+          var next = lines[j + 1] || null;
+          if (lines[j].endSec == null || lines[j].endSec <= lines[j].startSec) {
+            lines[j].endSec = next && next.startSec > lines[j].startSec
+              ? Math.max(lines[j].startSec + 0.15, next.startSec - 0.05)
+              : lines[j].startSec + 2;
+          }
+        }
+        return lines;
+      }
+
+      btn.addEventListener("click", function() {
+        setTimeout(function() {
+          if (moduleHandled) return;
+          var lines = parseScriptFromEditor();
+          var ytUrlEl = document.getElementById("rwYoutubeUrl");
+          var youtubeUrl = ytUrlEl ? ytUrlEl.value.trim() : "";
+          if (lines.length > 0) {
+            var payload = {
+              scriptLines: lines,
+              focusedLineIndex: 0,
+              takes: {},
+              settings: { preRollSec: 3, countdownBeepsOn: true, holdToRecordOn: false, audioOffsetSec: 0 },
+              youtubeUrl: youtubeUrl,
+              timestamp: Date.now()
+            };
+            try { localStorage.setItem("wavrick_booth_sync", JSON.stringify(payload)); } catch(e) {}
+          }
+          window.location.href = "./record-booth.html";
+        }, 200);
+      });
+    })();
+  </script>
+</body>
+</html>

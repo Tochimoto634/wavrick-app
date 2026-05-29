@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>収録ブース（全画面） — WAVRICK</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./record-booth.css?v=booth-chrome-fix-2026-05-26">
+</head>
+<body class="booth-body">
+
+  <!-- ヘッダー -->
+  <header class="booth-header" style="display:flex;align-items:center;justify-content:space-between;padding:0.6rem 1rem;background:#12151c;border-bottom:1px solid rgba(255,255,255,0.08);min-height:3.2rem">
+    <div class="booth-header-left" style="display:flex;align-items:center;gap:0.7rem">
+      <button type="button" id="boothBackBtn" class="booth-btn booth-btn-back" title="編集画面に戻る" style="display:inline-block;background:rgba(77,159,255,0.12);border:1px solid rgba(77,159,255,0.35);color:#4d9fff;font-weight:700;font-size:0.92rem;padding:0.65rem 1.2rem;border-radius:6px;cursor:pointer">← 編集画面に戻る</button>
+      <details class="booth-header-panel" id="boothSettingsPanel" style="display:block;position:relative">
+        <summary class="booth-btn booth-btn-ghost" style="display:inline-block;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.92);border:1px solid rgba(255,255,255,0.08);padding:0.65rem 1.2rem;font-size:0.9rem;font-weight:600;border-radius:6px;cursor:pointer;list-style:none">詳細設定</summary>
+        <div class="booth-panel-body" role="region" aria-label="収録の詳細設定">
+          <h3 class="booth-panel-title">詳細設定</h3>
+
+          <div class="booth-setting-row">
+            <label class="booth-setting-label" for="boothPreRoll">プレロール（秒）</label>
+            <input id="boothPreRoll" class="booth-setting-input" type="number" min="0" max="10" step="0.5" value="3">
+          </div>
+          <p class="booth-setting-help">収録スタートの何秒前からお手本（元音声）を流すか。</p>
+
+          <div class="booth-setting-row">
+            <label class="booth-setting-label booth-setting-check" for="boothCountdownBeeps">
+              <input id="boothCountdownBeeps" type="checkbox" checked>
+              3-2-1 ピッ音
+            </label>
+          </div>
+          <p class="booth-setting-help">カウントダウンのときに短いビープ音を鳴らします。</p>
+
+          <div class="booth-setting-row">
+            <label class="booth-setting-label booth-setting-check" for="boothHoldToRecord">
+              <input id="boothHoldToRecord" type="checkbox">
+              押している間録音（スペース長押し）
+            </label>
+          </div>
+          <p class="booth-setting-help">スペースを押している間だけ収録します。離すと録音停止。</p>
+
+          <div class="booth-setting-row">
+            <label class="booth-setting-label" for="boothAudioOffset">波形と動画のズレ補正</label>
+            <div class="booth-setting-offset">
+              <input id="boothAudioOffset" type="range" min="-5" max="5" step="0.1" value="0">
+              <span id="boothAudioOffsetVal">+0.0秒</span>
+            </div>
+          </div>
+          <p class="booth-setting-help">波形と元音声の位置がずれている場合に調整。</p>
+        </div>
+      </details>
+      <details class="booth-header-panel" id="boothBugPanel" style="display:block;position:relative">
+        <summary class="booth-btn booth-btn-ghost" style="display:inline-block;background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.92);border:1px solid rgba(255,255,255,0.08);padding:0.65rem 1.2rem;font-size:0.9rem;font-weight:600;border-radius:6px;cursor:pointer;list-style:none">バグ報告</summary>
+        <div class="booth-panel-body" role="region" aria-label="バグ報告">
+          <h3 class="booth-panel-title">バグ報告</h3>
+          <p class="booth-panel-hint">再現手順や期待する動作を書いて送信してください。環境情報は自動で付きます。</p>
+          <label class="booth-field">
+            <span>内容</span>
+            <textarea id="boothBugText" rows="4" placeholder="例: 録音ボタンを押しても反応しない"></textarea>
+          </label>
+          <label class="booth-field">
+            <span>連絡用メール（任意）</span>
+            <input id="boothBugEmail" type="email" autocomplete="email" placeholder="you@example.com">
+          </label>
+          <div class="booth-panel-actions">
+            <button type="button" id="boothBugCopyBtn" class="booth-btn booth-btn-ghost">内容をコピー</button>
+            <button type="button" id="boothBugSendBtn" class="booth-btn booth-btn-primary">メールで送る</button>
+          </div>
+        </div>
+      </details>
+    </div>
+    <div class="booth-header-right">
+      <span id="boothRecIndicator" class="booth-rec-indicator" hidden>● REC</span>
+      <label class="booth-toggle booth-toggle-sm" title="English text overlay">
+        <input type="checkbox" id="boothEnToggle">
+        <span class="booth-toggle-track"></span>
+        <span class="booth-toggle-label">EN字幕</span>
+      </label>
+    </div>
+  </header>
+
+  <!-- メインコンテンツ -->
+  <main class="booth-main">
+
+    <!-- ========== 左カラム ========== -->
+    <section class="booth-left" aria-label="録音・波形・テイク管理">
+
+      <!-- マルチトラック波形表示 -->
+      <div class="booth-waveform-panel">
+        <div class="booth-waveform-header">
+          <strong id="boothWaveTitle">マルチトラック波形表示（台本 1 / Section 1）</strong>
+        </div>
+        <div class="booth-waveform-ruler" id="boothWaveRuler"></div>
+        <div class="booth-waveform-tracks">
+          <div class="booth-track booth-track-ref">
+            <div class="booth-track-label-box booth-track-label-ref">
+              <span class="booth-track-label-title">元音声</span>
+              <span class="booth-track-label-sub">(Master Original Audio EN)</span>
+            </div>
+            <div class="booth-track-canvas-wrap">
+              <div id="boothRefWave" class="booth-track-canvas"></div>
+              <span class="booth-track-tc-overlay" id="boothRefTcOverlay">—</span>
+            </div>
+          </div>
+          <div class="booth-track-tc-row" id="boothRefTcRow">—</div>
+          <div class="booth-track booth-track-rec">
+            <div class="booth-track-label-box booth-track-label-rec">
+              <span class="booth-track-label-title">収録音声</span>
+              <span class="booth-track-label-sub">(JA / Recording Audio)</span>
+            </div>
+            <div class="booth-track-canvas-wrap">
+              <div id="boothRecWave" class="booth-track-canvas"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 収録テイク管理 -->
+      <div class="booth-takes-panel">
+        <div class="booth-takes-header">
+          <strong id="boothTakesTitle">収録テイク管理 (Script Section 1)</strong>
+        </div>
+        <div id="boothTakeList" class="booth-take-list" role="list"></div>
+        <p id="boothTakeEmpty" class="booth-take-empty">まだテイクがありません。下の「● REC TAKE」で録音してください。</p>
+      </div>
+
+      <!-- 元音声のみ再生 -->
+      <div class="booth-master-audio">
+        <div class="booth-master-header">
+          <span class="booth-master-label">元音声のみ再生 (Master Original Audio EN Only)</span>
+          <label class="booth-toggle booth-toggle-sm">
+            <input type="checkbox" id="boothMasterToggle" checked>
+            <span class="booth-toggle-track"></span>
+          </label>
+        </div>
+        <div class="booth-master-seekbar">
+          <span id="boothMasterCurrent" class="booth-tc">00:00</span>
+          <input type="range" id="boothMasterSeek" class="booth-seek-input" min="0" max="10000" step="1" value="0">
+          <span id="boothMasterDuration" class="booth-tc">00:00</span>
+        </div>
+        <div class="booth-master-ticks" id="boothMasterTicks"></div>
+      </div>
+
+      <!-- メイン録音コントロール -->
+      <div class="booth-rec-controls">
+        <button type="button" id="boothRecBtn" class="booth-rec-main" title="録音開始">
+          <span class="booth-rec-dot">●</span>
+          <span class="booth-rec-label">REC TAKE</span>
+        </button>
+        <div class="booth-rec-sub-controls">
+          <button type="button" id="boothStopBtn" class="booth-ctrl-btn" disabled title="停止">Stop</button>
+          <button type="button" id="boothPlayBtn" class="booth-ctrl-btn" title="全体試聴">Play/Preview</button>
+          <button type="button" id="boothRetakeBtn" class="booth-ctrl-btn booth-ctrl-retake" title="直前のテイクを削除して録り直し">Retake (Del)</button>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ========== 右カラム ========== -->
+    <section class="booth-right" aria-label="台本・セリフタイムライン">
+
+      <!-- 動画プレーヤー（YouTube / アップロードファイル） -->
+      <div class="booth-video-panel" id="boothVideoPanel" hidden>
+        <div class="booth-video-wrapper" id="boothVideoWrapper">
+          <div id="boothYtPlayer"></div>
+          <video id="boothFilePlayer" hidden playsinline></video>
+        </div>
+      </div>
+
+      <!-- Script Timeline ヘッダー + 台本プルダウン -->
+      <div class="booth-timeline-header">
+        <strong class="booth-timeline-title">Script Timeline</strong>
+        <div class="booth-script-selector" id="boothScriptSelector">
+          <button type="button" id="boothScriptDropdownBtn" class="booth-script-dropdown-btn">
+            <span id="boothScriptLabel">台本 1</span>
+            <span id="boothScriptStatus" class="booth-script-dot">●</span>
+            <span class="booth-script-chevron">▾</span>
+          </button>
+          <ul id="boothScriptMenu" class="booth-script-menu" hidden role="listbox"></ul>
+        </div>
+      </div>
+
+      <!-- Apple Music 風セリフタイムライン -->
+      <div class="booth-lyrics-container" id="boothLyricsContainer">
+        <div class="booth-lyrics-scroll" id="boothLyricsScroll"></div>
+        <button type="button" id="boothSnapBackBtn" class="booth-snap-back" hidden>
+          ↓ 再生位置に戻る
+        </button>
+      </div>
+
+    </section>
+
+  </main>
+
+  <script>
+    window.WAVRICK_CONFIG = window.WAVRICK_CONFIG || {
+      supabaseUrl: "https://gdolqgcftxqxaacjyqla.supabase.co",
+      supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdkb2xxZ2NmdHhxeGFhY2p5cWxhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4Mjg2NTksImV4cCI6MjA5NDQwNDY1OX0.OzuD8nAAx1ksQmD1p3Dupltbkv93vTxtRGtPoXiz7w0",
+      audioProxyUrl: "/api/youtube-audio/extract",
+      audioProxySecret: "wavrick-local-dev-secret"
+    };
+  </script>
+  <script src="./js/wavrick-work-cases.js?v=work-2026-05-23b"></script>
+  <script src="./js/record-booth/booth-app.js?v=booth-tc-preserve-2026-05-27r"></script>
+</body>
+</html>

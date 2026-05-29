@@ -1,4 +1,10 @@
 <!DOCTYPE html>
+<!--
+  wavrick-share.html（legacy・単一ファイル版）
+  本番・開発の正は index.html + app.js + styles.css（./scripts/pack-hostinger-upload.sh の ZIP）。
+  このファイルは ZIP に含めず、index とは手動では同期しない。配布は https://wavrick.com/ を推奨。
+  詳細: リポジトリ直下 README.md
+-->
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
@@ -770,7 +776,7 @@ footer {
       </div>
       <div id="scriptPreview" class="field hidden">
         <label for="ytScript">生成台本（デモ）</label>
-        <textarea id="ytScript" name="script"></textarea>
+        <textarea id="ytScript" name="script" rows="32" class="yt-script-field"></textarea>
       </div>
       <button id="ytSubmitButton" class="btn-red full" type="submit" disabled>本人確認後に依頼を送信</button>
       <button id="ytSkipButton" class="btn-ghost full" type="button">デモ入力で声優選択へ（スキップ）</button>

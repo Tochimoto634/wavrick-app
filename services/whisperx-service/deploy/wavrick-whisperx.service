@@ -1,0 +1,19 @@
+[Unit]
+Description=Wavrick WhisperX transcription service
+After=network.target
+
+[Service]
+Type=simple
+User=wavrick
+Group=wavrick
+WorkingDirectory=/opt/wavrick-app/services/whisperx-service
+EnvironmentFile=/opt/wavrick-app/services/whisperx-service/deploy/.env
+ExecStart=/opt/wavrick-app/services/whisperx-service/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=10
+# large-v3 の初回ロード・長尺文字起こし用
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
