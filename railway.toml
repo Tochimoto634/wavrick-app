@@ -1,0 +1,11 @@
+# wavrick-app サービス用（YouTube 音声プロキシ）
+# GitHub 連携デプロイ時、UI の Dockerfile 設定より優先される
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.railway-audio-proxy"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
