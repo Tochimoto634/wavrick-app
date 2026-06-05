@@ -70,28 +70,53 @@ def _guess_mimetype(path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def _ydl_options(out_tmpl: str, *, format_selector: str | None = None) -> dict:
-    # YouTube はクライアント検証が頻繁に変わる。android+web と player_js_version=actual で 403 を回避。
+def _yt_proxy() -> str:
+    return os.environ.get("WAVRICK_YT_PROXY", "").strip()
+
+
+def _youtube_extractor_args() -> dict:
+    raw = os.environ.get("WAVRICK_YT_PLAYER_CLIENT", "tv,tv_embedded,android,web")
+    clients = [c.strip() for c in raw.split(",") if c.strip()]
+    return {
+        "youtube": {
+            "player_client": clients or ["android", "web"],
+            "player_skip": ["webpage"],
+            "player_js_version": ["actual"],
+        }
+    }
+
+
+def _base_ydl_opts(**extra) -> dict:
     opts: dict = {
-        "format": format_selector or _AUDIO_FORMAT,
-        "outtmpl": out_tmpl,
-        "noplaylist": True,
         "quiet": True,
-        "no_warnings": False,
+        "noplaylist": True,
+        "proxy": _yt_proxy(),
+        "force_ipv4": True,
+        "extractor_args": _youtube_extractor_args(),
+    }
+    cookiefile = os.environ.get("WAVRICK_YT_COOKIES", "").strip()
+    if cookiefile and os.path.isfile(cookiefile):
+        opts["cookiefile"] = cookiefile
+    node = shutil.which("node")
+    if node:
+        opts["js_runtimes"] = {"node": {"path": node}}
+    opts.update(extra)
+    return opts
+
+
+def _ydl_options(out_tmpl: str, *, format_selector: str | None = None) -> dict:
+    # YouTube はクライアント検証が頻繁に変わる。複数 player_client で 403 を回避。
+    opts = _base_ydl_opts(
+        format=format_selector or _AUDIO_FORMAT,
+        outtmpl=out_tmpl,
+        no_warnings=False,
         # max_filesize を付けると高ビットレートの元音声が途中で切れる（10分動画が約4〜5分で終わる等）。
         # サイズ制限は ffmpeg 後の返却バイト（read_audio_file 後）だけでかける。
-        "socket_timeout": 300,
-        "nopart": True,
-        "retries": 5,
-        "fragment_retries": 10,
-        "proxy": "",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-                "player_js_version": ["actual"],
-            }
-        },
-    }
+        socket_timeout=300,
+        nopart=True,
+        retries=5,
+        fragment_retries=10,
+    )
     if shutil.which("ffmpeg"):
         opts["postprocessors"] = [
             {
@@ -229,18 +254,7 @@ def probe_media_duration_sec(path: str) -> float:
 def youtube_video_duration_sec(url: str) -> float:
     """yt-dlp で動画メタの長さ（秒）。"""
     clear_download_proxies()
-    opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "proxy": "",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-                "player_js_version": ["actual"],
-            }
-        },
-    }
+    opts = _base_ydl_opts(skip_download=True)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not info:
@@ -535,7 +549,7 @@ def video_meta():
 
     clear_download_proxies()
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True, "proxy": ""}) as ydl:
+        with yt_dlp.YoutubeDL(_base_ydl_opts(skip_download=True)) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         logger.exception("video-meta failed for %s", url)

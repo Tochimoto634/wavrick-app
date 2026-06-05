@@ -1,17 +1,20 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
+  applyTranslationsToTimedCues,
   buildScriptsBySpeakerFromWhisperTimeline,
+  buildTimedCuesBySpeakerFromAssignRanges,
   GROK_TRANSLATE_LINES_SYSTEM,
   mergeTranslationsIntoWhisperTimeline,
   normalizeWhisperSegsForGrok,
   speakerAssignmentsToPlainText,
+  timedCuesToSpeakerScript,
   whisperSegmentsToBracketTimelineText
 } from "../_shared/grok-timecode-prompt.ts";
 import {
   appendTranscribeBuildMarker,
   WAVRICK_TRANSCRIBE_BUILD
 } from "../_shared/transcribe-build.ts";
-import { transcribeWithWhisperX } from "../_shared/whisperx-client.ts";
+import { guessWhisperUploadFilename, transcribeWithWhisperX } from "../_shared/whisperx-client.ts";
 import {
   buildBracketTimelineFromWhisperX,
   buildTimelineCuesFromWhisperX,
@@ -21,15 +24,21 @@ import {
   type SilenceGap,
   type WhisperSeg
 } from "../_shared/whisperx-timeline-rules.ts";
+import { corsHeadersForRequest } from "../_shared/cors.ts";
+import {
+  burstLimitPerMinute,
+  clientIpFromRequest,
+  enforceRateLimit,
+  mediaPipelineLimits,
+  rateLimitResponseHeaders
+} from "../_shared/rate-limit.ts";
 
-const MAX_WHISPER_BYTES = 24 * 1024 * 1024;
+/** 返却 MP3 想定。48MB ≒ 192kbps で約40分弱（従来24MBは yt-dlp 途中打切りで約4〜5分止まりの原因だった） */
+const MAX_WHISPER_BYTES = 48 * 1024 * 1024;
 const GROK_MODEL = Deno.env.get("GROK_MODEL") || "grok-4.3";
-
-const corsHeaders: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS"
-};
+/** 1 回の Grok に載せる行数（長尺・多話者でタイムアウトしないよう分割） */
+const GROK_PREVIEW_LINES_BATCH_SIZE = 20;
+const GROK_PREVIEW_LINES_BATCH_MAX_CHARS = 12_000;
 
 type SpeakerInput = {
   id: number;
@@ -51,13 +60,22 @@ type PipelineBody = {
   whisperDurationSec?: number;
   /** 文字起こし時のブラケット台本（Grok へそのまま・時刻の正） */
   whisperTimeline?: string;
+  /** 話者割り当て UI のプレーンテキスト（文字オフセットの基準） */
+  transcriptPlain?: string;
+  /** 話者割り当て範囲（ドラッグ選択） */
+  assignRanges?: { start: number; end: number; speakerIndex: number }[];
 };
 
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
-  });
+function makeJsonResponse(corsHeaders: Record<string, string>) {
+  return (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: {
+        ...corsHeaders,
+        ...extraHeaders,
+        "Content-Type": "application/json; charset=utf-8"
+      }
+    });
 }
 
 function extractYouTubeVideoId(raw: string): string | null {
@@ -107,14 +125,17 @@ async function resolveUserId(req: Request): Promise<string | null> {
   return data.user.id;
 }
 
-async function fetchAudioFromProxy(videoUrl: string, vocalSeparate = true): Promise<{ buf: Uint8Array; vocalSeparated: boolean }> {
+async function fetchAudioFromProxy(
+  videoUrl: string,
+  vocalSeparate = true
+): Promise<{ buf: Uint8Array; vocalSeparated: boolean; contentType: string | null }> {
   const proxyUrl = Deno.env.get("YOUTUBE_AUDIO_PROXY_URL");
   if (!proxyUrl) {
     throw new Error(
       "YOUTUBE_AUDIO_PROXY_URL が未設定です。services/youtube-audio-proxy をデプロイするか、body.audioUrl で音声URLを渡してください。"
     );
   }
-  const secret = Deno.env.get("YOUTUBE_AUDIO_PROXY_SECRET");
+  const secret = (Deno.env.get("YOUTUBE_AUDIO_PROXY_SECRET") || "").trim();
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (secret) headers.Authorization = `Bearer ${secret}`;
   let r: Response;
@@ -135,17 +156,26 @@ async function fetchAudioFromProxy(videoUrl: string, vocalSeparate = true): Prom
   }
   if (!r.ok) {
     const t = await r.text();
-    throw new Error(`音声プロキシが失敗しました (${r.status}): ${t.slice(0, 500)}`);
+    let detail = t.slice(0, 500);
+    try {
+      const parsed = JSON.parse(t) as { error?: string };
+      if (parsed?.error) detail = String(parsed.error);
+    } catch {
+      /* keep raw body */
+    }
+    throw new Error(`音声プロキシが失敗しました (${r.status}): ${detail}`);
   }
   const buf = new Uint8Array(await r.arrayBuffer());
   if (buf.byteLength > MAX_WHISPER_BYTES) {
-    throw new Error(`音声が大きすぎます（${buf.byteLength} bytes）。Whisper API 上限（約25MB）以内にしてください。`);
+    throw new Error(
+      `音声が大きすぎます（${buf.byteLength} bytes）。上限は約48MBです。短くするかビットレートを下げてください。`
+    );
   }
   if (buf.byteLength < 256) {
     throw new Error("音声データが短すぎるか空です。");
   }
   const vocalSeparated = r.headers.get("X-Wavrick-Vocal-Separated") === "1";
-  return { buf, vocalSeparated };
+  return { buf, vocalSeparated, contentType: r.headers.get("Content-Type") };
 }
 
 async function uploadAudioToStorage(
@@ -389,13 +419,119 @@ function resolveWhisperTimeline(
   return whisperSegmentsToBracketTimelineText(segments, durationSec);
 }
 
+function chunkPreviewLinesForGrok(
+  previewLines: string[],
+  maxLines = GROK_PREVIEW_LINES_BATCH_SIZE,
+  maxChars = GROK_PREVIEW_LINES_BATCH_MAX_CHARS
+): string[][] {
+  const chunks: string[][] = [];
+  let cur: string[] = [];
+  let curChars = 0;
+  for (const raw of previewLines) {
+    const line = String(raw || "").trim();
+    if (!line) continue;
+    const len = line.length;
+    if (
+      cur.length >= maxLines ||
+      (cur.length > 0 && curChars + len > maxChars)
+    ) {
+      chunks.push(cur);
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(line);
+    curChars += len;
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+async function translatePreviewLinesBatchWithGrok(
+  previewLines: string[],
+  extraUserHint = ""
+): Promise<{ translation: string; lines: string[] }> {
+  const numbered = previewLines
+    .map((line, i) => `${i + 1}. ${String(line || "").trim()}`)
+    .join("\n");
+  const userText = [
+    "【話者別プレビューのセリフ（行数・順序厳守）】",
+    "各行を必ず日本語の吹替に翻訳してください（原語のまま返さない）。",
+    "タイムコード [ ] は出力しないでください。",
+    "",
+    numbered,
+    extraUserHint ? `\n${extraUserHint}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const system = [
+    GROK_TRANSLATE_LINES_SYSTEM,
+    "",
+    "次の JSON のみを返してください:",
+    '{"translation":"参考訳（短くてよい）","lines":["1行目の吹替のみ","2行目…"]}',
+    GROK_JSON_OUTPUT_RULES
+  ].join("\n");
+
+  const parsed = await callGrokJson<{ translation?: string; lines?: string[] }>(
+    system,
+    userText
+  );
+  let lines = Array.isArray(parsed.lines)
+    ? parsed.lines.map((l) => String(l ?? "").trim())
+    : [];
+  if (lines.length > previewLines.length) {
+    lines = lines.slice(0, previewLines.length);
+  }
+  while (lines.length < previewLines.length) {
+    lines.push("");
+  }
+  const translation = typeof parsed.translation === "string" ? parsed.translation : "";
+  return { translation, lines };
+}
+
+async function translatePreviewLinesWithGrok(
+  previewLines: string[],
+  extraUserHint = ""
+): Promise<{ translation: string; lines: string[] }> {
+  const trimmed = previewLines.map((l) => String(l || "").trim()).filter(Boolean);
+  if (!trimmed.length) {
+    return { translation: "", lines: [] };
+  }
+
+  const chunks = chunkPreviewLinesForGrok(trimmed);
+  if (chunks.length <= 1) {
+    return translatePreviewLinesBatchWithGrok(trimmed, extraUserHint);
+  }
+
+  const allLines: string[] = [];
+  const refParts: string[] = [];
+  let offset = 0;
+  for (let bi = 0; bi < chunks.length; bi++) {
+    const chunk = chunks[bi];
+    const batchHint = [
+      extraUserHint,
+      `（この話者の ${offset + 1}〜${offset + chunk.length} 行目 / 全 ${trimmed.length} 行。行数・順序を変えないでください。）`
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const { translation, lines } = await translatePreviewLinesBatchWithGrok(
+      chunk,
+      batchHint
+    );
+    if (translation) refParts.push(translation);
+    allLines.push(...lines);
+    offset += chunk.length;
+  }
+  return { translation: refParts.join("\n").trim(), lines: allLines };
+}
+
 async function translateWhisperTimelineWithGrok(
   whisperTimeline: string,
   extraUserHint = ""
 ): Promise<{ translation: string; lines: string[]; script: string }> {
   const userText = [
     "【WhisperX タイムコード付き書き起こし（行数・順序厳守）】",
-    "各行のセリフを日本語吹替にしてください。タイムコードは出力しないでください。",
+    "各行のセリフを必ず日本語の吹替に翻訳してください（原語のまま返さない）。タイムコードは出力しないでください。",
     "",
     whisperTimeline,
     extraUserHint ? `\n${extraUserHint}` : ""
@@ -466,13 +602,83 @@ async function scriptBySpeakersWithGrok(params: {
   tone?: string;
   durationSec?: number;
   whisperTimeline?: string;
-}): Promise<{ scriptsBySpeaker: Record<string, string>; referenceTranslation: string }> {
+  transcriptPlain?: string;
+  assignRanges?: { start: number; end: number; speakerIndex: number }[];
+}): Promise<{
+  scriptsBySpeaker: Record<string, string>;
+  referenceTranslation: string;
+  translatedLines: string[];
+}> {
   if (!params.whisperSegments.length) {
     throw new Error("whisperSegments が空です。");
   }
 
   const toneHint = (params.tone || "").trim() ? `希望トーン: ${params.tone.trim()}` : "";
   const dur = Number(params.durationSec) > 0 ? Number(params.durationSec) : 0;
+  const assignRanges = Array.isArray(params.assignRanges) ? params.assignRanges : [];
+  const transcriptPlain = String(params.transcriptPlain || "").trim();
+  const speakerCount = params.speakers.length;
+
+  if (assignRanges.length && transcriptPlain) {
+    const cuesBySpeaker = buildTimedCuesBySpeakerFromAssignRanges(
+      transcriptPlain,
+      assignRanges,
+      speakerCount,
+      {
+        whisperSegments: params.whisperSegments,
+        durationSec: dur
+      }
+    );
+
+    const scriptsBySpeaker: Record<string, string> = {};
+    const translatedLines: string[] = [];
+    const refParts: string[] = [];
+
+    const speakerJobs = params.speakers.map(async (s) => {
+      const key = String(s.id);
+      const cues = cuesBySpeaker[key] || [];
+      if (!cues.length) return null;
+
+      const sourceLines = cues.map((c) => c.text);
+      const hint = [
+        `話者${s.id}（${(s.label && String(s.label).trim()) || `話者${s.id}`}）`,
+        toneHint
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const { translation, lines } = await translatePreviewLinesWithGrok(
+        sourceLines,
+        hint
+      );
+      const merged = applyTranslationsToTimedCues(cues, lines);
+      return {
+        key,
+        translation,
+        lines,
+        script: timedCuesToSpeakerScript(merged)
+      };
+    });
+
+    const results = await Promise.all(speakerJobs);
+    for (const row of results) {
+      if (!row) continue;
+      if (row.translation) refParts.push(row.translation);
+      scriptsBySpeaker[row.key] = row.script;
+      translatedLines.push(...row.lines);
+    }
+
+    if (!Object.keys(scriptsBySpeaker).some((k) => scriptsBySpeaker[k]?.trim())) {
+      throw new Error("話者別プレビューから台本を組み立てられませんでした。");
+    }
+
+    return {
+      scriptsBySpeaker,
+      referenceTranslation: refParts.join("\n").trim(),
+      translatedLines
+    };
+  }
+
   const whisperTimeline =
     params.whisperTimeline?.trim() ||
     whisperSegmentsToBracketTimelineText(params.whisperSegments, dur);
@@ -491,10 +697,13 @@ async function scriptBySpeakersWithGrok(params: {
       [speakerPlain, toneHint].filter(Boolean).join("\n")
     );
 
+  const speakerRows = params.speakers.map((s) => ({ id: s.id, lines: s.lines }));
+
   let scriptsBySpeaker = buildScriptsBySpeakerFromWhisperTimeline(
     whisperTimeline,
-    params.speakers.map((s) => ({ id: s.id, lines: s.lines })),
-    lines
+    speakerRows,
+    lines,
+    null
   );
 
   if (params.speakers.length === 1) {
@@ -508,7 +717,7 @@ async function scriptBySpeakersWithGrok(params: {
     throw new Error("話者別台本の組み立てに失敗しました。");
   }
 
-  return { scriptsBySpeaker, referenceTranslation };
+  return { scriptsBySpeaker, referenceTranslation, translatedLines: lines };
 }
 
 function buildTrainingBundle(params: {
@@ -534,6 +743,9 @@ function buildTrainingBundle(params: {
 }
 
 Deno.serve(async (req) => {
+  const corsHeaders = corsHeadersForRequest(req);
+  const jsonResponse = makeJsonResponse(corsHeaders);
+
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
@@ -562,6 +774,42 @@ Deno.serve(async (req) => {
   const userId = await resolveUserId(req);
   const admin = createClient(supabaseUrl, serviceKey);
   const started = Date.now();
+
+  const clientKey = userId ? `user:${userId}` : `ip:${clientIpFromRequest(req)}`;
+  const burst = await enforceRateLimit({
+    admin,
+    bucketPrefix: "media-pipeline:burst",
+    clientKey: `ip:${clientIpFromRequest(req)}`,
+    limit: burstLimitPerMinute(),
+    windowSec: 60
+  });
+  if (!burst.ok) {
+    return jsonResponse(
+      { ok: false, error: "短時間のリクエストが多すぎます。しばらく待ってから再試行してください。", retryAfterSec: burst.retryAfterSec },
+      429,
+      rateLimitResponseHeaders(burst.retryAfterSec)
+    );
+  }
+
+  const modeLimit = mediaPipelineLimits(mode);
+  const modeRl = await enforceRateLimit({
+    admin,
+    bucketPrefix: `media-pipeline:${mode}`,
+    clientKey,
+    limit: modeLimit.limit,
+    windowSec: modeLimit.windowSec
+  });
+  if (!modeRl.ok) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: `この操作の利用上限（${modeLimit.limit}回/時間）に達しました。しばらく待ってから再試行してください。`,
+        retryAfterSec: modeRl.retryAfterSec
+      },
+      429,
+      rateLimitResponseHeaders(modeRl.retryAfterSec)
+    );
+  }
 
   if (mode === "script") {
     const speakers = normalizeSpeakers(body);
@@ -614,7 +862,9 @@ Deno.serve(async (req) => {
         speakers,
         tone: body.tone,
         durationSec: scriptDur,
-        whisperTimeline
+        whisperTimeline,
+        transcriptPlain: String(body.transcriptPlain || "").trim() || undefined,
+        assignRanges: Array.isArray(body.assignRanges) ? body.assignRanges : undefined
       });
       const combinedScript = speakers
         .map((s) => {
@@ -651,6 +901,7 @@ Deno.serve(async (req) => {
         mode: "script",
         scriptsBySpeaker: grok.scriptsBySpeaker,
         referenceTranslation: grok.referenceTranslation,
+        translatedLines: grok.translatedLines,
         script: combinedScript,
         timecodedByWhisper: true,
         whisperTimeline,
@@ -707,7 +958,7 @@ Deno.serve(async (req) => {
   try {
     let audio: Uint8Array;
     let audioSource: string;
-    let filename = "audio.m4a";
+    let filename = "audio.mp3";
 
     let rawAudioStorageUrl: string | null = null;
     let cleanedAudioStorageUrl: string | null = null;
@@ -716,12 +967,7 @@ Deno.serve(async (req) => {
     if (audioUrl) {
       audioSource = "audio_url";
       audio = await fetchAudioFromUrl(audioUrl);
-      try {
-        const ext = new URL(audioUrl).pathname.split(".").pop();
-        if (ext && /^[a-z0-9]+$/i.test(ext) && ext.length <= 5) filename = `audio.${ext}`;
-      } catch {
-        /* keep default */
-      }
+      filename = guessWhisperUploadFilename(audio, { url: audioUrl });
       if (userId) {
         try {
           rawAudioStorageUrl = await uploadAudioToStorage(admin, userId, videoId, audio, "raw");
@@ -736,16 +982,14 @@ Deno.serve(async (req) => {
       }
       await admin.from("media_pipeline_jobs").update({ step: "extract", audio_source: audioSource }).eq("id", jobId);
 
-      const rawResult = await fetchAudioFromProxy(videoUrl, false);
-      const cleanedResult = await fetchAudioFromProxy(videoUrl, true);
-      audio = cleanedResult.vocalSeparated ? cleanedResult.buf : rawResult.buf;
+      // Railway 本番は vocal separation OFF のため 1 回の取得で十分（2 回目は YouTube 負荷・502 の原因）
+      const audioResult = await fetchAudioFromProxy(videoUrl, false);
+      audio = audioResult.buf;
+      filename = guessWhisperUploadFilename(audio, { contentType: audioResult.contentType });
 
       if (userId) {
         try {
-          rawAudioStorageUrl = await uploadAudioToStorage(admin, userId, videoId, rawResult.buf, "raw");
-          if (cleanedResult.vocalSeparated) {
-            cleanedAudioStorageUrl = await uploadAudioToStorage(admin, userId, videoId, cleanedResult.buf, "cleaned");
-          }
+          rawAudioStorageUrl = await uploadAudioToStorage(admin, userId, videoId, audioResult.buf, "raw");
         } catch { /* non-critical */ }
       }
     }
