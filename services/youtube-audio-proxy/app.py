@@ -33,13 +33,18 @@ app = Flask(__name__)
 logger = logging.getLogger("wavrick.yt_audio")
 logging.basicConfig(level=logging.INFO)
 
-MAX_BYTES = 24 * 1024 * 1024
+# 返却する音声の上限（Whisper 投入用 MP3 想定）。192kbps なら約 40 分弱まで。
+MAX_BYTES = int(os.environ.get("WAVRICK_MAX_AUDIO_BYTES", str(48 * 1024 * 1024)))
 
-# m4a(AAC) を優先。ffmpeg があれば 192kbps MP3 に変換（webm opus より聴きやすい）
+# 高ビットレート単体ストリームは途中で切れることがあるため abr 上限付きで「動画全长」を優先
 _AUDIO_FORMAT = (
-    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/"
-    "bestaudio[ext=webm]/bestaudio/best"
+    "bestaudio[ext=m4a][acodec^=mp4a][abr<=192]/"
+    "bestaudio[abr<=192]/"
+    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 )
+_AUDIO_FORMAT_FALLBACK = "bestaudio[abr<=128]/bestaudio"
+# 動画長の何割未満なら「途中切断」とみなすか
+_MIN_DURATION_RATIO = float(os.environ.get("WAVRICK_AUDIO_MIN_DURATION_RATIO", "0.88"))
 
 # Demucs vocal separation (shared by record-workspace + Whisper preprocess)
 _VOCAL_SEPARATION = os.environ.get("WAVRICK_VOCAL_SEPARATION", "1").strip().lower() not in (
@@ -65,16 +70,20 @@ def _guess_mimetype(path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def _ydl_options(out_tmpl: str) -> dict:
+def _ydl_options(out_tmpl: str, *, format_selector: str | None = None) -> dict:
     # YouTube はクライアント検証が頻繁に変わる。android+web と player_js_version=actual で 403 を回避。
     opts: dict = {
-        "format": _AUDIO_FORMAT,
+        "format": format_selector or _AUDIO_FORMAT,
         "outtmpl": out_tmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": False,
-        "max_filesize": MAX_BYTES,
-        "socket_timeout": 120,
+        # max_filesize を付けると高ビットレートの元音声が途中で切れる（10分動画が約4〜5分で終わる等）。
+        # サイズ制限は ffmpeg 後の返却バイト（read_audio_file 後）だけでかける。
+        "socket_timeout": 300,
+        "nopart": True,
+        "retries": 5,
+        "fragment_retries": 10,
         "proxy": "",
         "extractor_args": {
             "youtube": {
@@ -94,13 +103,15 @@ def _ydl_options(out_tmpl: str) -> dict:
     return opts
 
 
-# 収録ワークスペース（ブラウザ）からローカル / 本番オリジンで POST /extract するため
-_CORS_ORIGIN = os.environ.get("WAVRICK_CORS_ORIGIN", "*")
+from cors_utils import resolve_cors_origin
+from rate_limit import check_extract_limit, check_video_meta_limit, rate_limit_config
 
 
 @app.after_request
 def _cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = _CORS_ORIGIN
+    origin = resolve_cors_origin(request.headers.get("Origin"))
+    if origin:
+        resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["Access-Control-Expose-Headers"] = (
@@ -186,10 +197,72 @@ def _run_ffmpeg(args: list[str], timeout: int = 120) -> None:
         raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {err}")
 
 
+def probe_media_duration_sec(path: str) -> float:
+    """ffprobe でメディアの長さ（秒）を取得。失敗時は 0。"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not os.path.isfile(path):
+        return 0.0
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return 0.0
+    try:
+        return max(0.0, float((proc.stdout or "").strip()))
+    except ValueError:
+        return 0.0
+
+
+def youtube_video_duration_sec(url: str) -> float:
+    """yt-dlp で動画メタの長さ（秒）。"""
+    clear_download_proxies()
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "proxy": "",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+                "player_js_version": ["actual"],
+            }
+        },
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        return 0.0
+    try:
+        return max(0.0, float(info.get("duration") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_audio_truncated(actual_sec: float, expected_sec: float) -> bool:
+    if not (expected_sec >= 90 and actual_sec > 0):
+        return False
+    return actual_sec < expected_sec * _MIN_DURATION_RATIO
+
+
 def audio_to_wav(input_path: str, wav_path: str) -> None:
+    dur = probe_media_duration_sec(input_path)
+    timeout = max(180, int(dur * 3) + 60) if dur > 0 else 180
     _run_ffmpeg(
         ["-y", "-i", input_path, "-ar", "44100", "-ac", "2", wav_path],
-        timeout=180,
+        timeout=timeout,
     )
 
 
@@ -303,16 +376,54 @@ def apply_vocal_separation(source_path: str, work_dir: str) -> tuple[str, bool]:
         return source_path, False
 
 
-def download_youtube_audio(url: str, out_dir: str) -> str:
+def _clear_out_files(out_dir: str) -> None:
+    for old in glob.glob(os.path.join(out_dir, "out.*")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def download_youtube_audio(
+    url: str, out_dir: str, *, format_selector: str | None = None
+) -> str:
     out_tmpl = os.path.join(out_dir, "out.%(ext)s")
     clear_download_proxies()
-    ydl_opts = _ydl_options(out_tmpl)
+    _clear_out_files(out_dir)
+    ydl_opts = _ydl_options(out_tmpl, format_selector=format_selector)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     files = glob.glob(os.path.join(out_dir, "out.*"))
     if not files:
         raise RuntimeError("yt-dlp produced no output file")
     return files[0]
+
+
+def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, float, float]:
+    """
+    動画メタの長さと照合し、途中切断されていれば低ビットレート形式で再取得する。
+    Returns (path, audio_duration_sec, video_duration_sec).
+    """
+    expected = youtube_video_duration_sec(url)
+    path = download_youtube_audio(url, out_dir)
+    actual = probe_media_duration_sec(path)
+    if _is_audio_truncated(actual, expected):
+        logger.warning(
+            "audio truncated (%.1fs / video %.1fs) — retry format %s",
+            actual,
+            expected,
+            _AUDIO_FORMAT_FALLBACK,
+        )
+        path = download_youtube_audio(url, out_dir, format_selector=_AUDIO_FORMAT_FALLBACK)
+        actual = probe_media_duration_sec(path)
+    if _is_audio_truncated(actual, expected):
+        raise RuntimeError(
+            "YouTube 音声が動画より短く切れています"
+            f"（取得 {actual:.0f}秒 / 動画 {expected:.0f}秒）。"
+            " 音声ファイルを直接アップロードするか、"
+            " WAVRICK_VOCAL_SEPARATION=0 で ./scripts/start-audio-proxy.sh を再起動して再試行してください。"
+        )
+    return path, actual, expected
 
 
 def read_audio_file(path: str) -> tuple[bytes, str]:
@@ -334,6 +445,14 @@ def extract():
         if auth != f"Bearer {secret}":
             abort(401)
 
+    allowed, retry_after = check_extract_limit()
+    if not allowed:
+        return (
+            jsonify({"ok": False, "error": "リクエスト制限に達しました。しばらくして再試行してください。"}),
+            429,
+            {"Retry-After": str(retry_after)},
+        )
+
     payload = request.get_json(silent=True) or {}
     url = (payload.get("videoUrl") or payload.get("url") or "").strip()
     if not url or not host_allowed(url):
@@ -347,11 +466,23 @@ def extract():
 
     out_dir = tempfile.mkdtemp(prefix="wavrick_yt_")
     separated = False
+    audio_dur = 0.0
+    video_dur = 0.0
     try:
-        path = download_youtube_audio(url, out_dir)
+        path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
         if vocal_requested and _VOCAL_SEPARATION:
             path, separated = apply_vocal_separation(path, out_dir)
+            audio_dur = probe_media_duration_sec(path) or audio_dur
+            if _is_audio_truncated(audio_dur, video_dur):
+                logger.warning(
+                    "vocals shorter than video (%.1fs / %.1fs) — retry without demucs",
+                    audio_dur,
+                    video_dur,
+                )
+                path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
+                separated = False
         data, mime = read_audio_file(path)
+        audio_dur = probe_media_duration_sec(path) or audio_dur
     except Exception as exc:
         logger.exception("extract failed for %s", url)
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -374,6 +505,10 @@ def extract():
     resp = Response(data, mimetype=mime)
     resp.headers["X-Wavrick-Vocal-Separated"] = "1" if separated else "0"
     resp.headers["X-Wavrick-Audio-Stem"] = "vocals" if separated else "mix"
+    if audio_dur > 0:
+        resp.headers["X-Wavrick-Audio-Duration-Sec"] = f"{audio_dur:.2f}"
+    if video_dur > 0:
+        resp.headers["X-Wavrick-Video-Duration-Sec"] = f"{video_dur:.2f}"
     return resp
 
 
@@ -384,6 +519,14 @@ def video_meta():
         auth = request.headers.get("Authorization", "")
         if auth != f"Bearer {secret}":
             abort(401)
+
+    allowed, retry_after = check_video_meta_limit()
+    if not allowed:
+        return (
+            jsonify({"ok": False, "error": "リクエスト制限に達しました。しばらくして再試行してください。"}),
+            429,
+            {"Retry-After": str(retry_after)},
+        )
 
     payload = request.get_json(silent=True) or {}
     url = (payload.get("videoUrl") or payload.get("url") or "").strip()
@@ -428,6 +571,7 @@ def video_meta():
             "channelKey": channel_key,
             "channelTitle": uploader,
             "channelUrl": channel_url,
+            "durationSec": max(0.0, float(info.get("duration") or 0)),
         }
     )
 
@@ -437,10 +581,15 @@ def health():
     return jsonify(
         {
             "ok": True,
+            "service": "youtube-audio-proxy",
             "vocalSeparationEnabled": _VOCAL_SEPARATION,
             "vocalSeparationReady": demucs_available(),
             "demucsModel": _DEMUCS_MODEL,
             "ffmpeg": find_ffmpeg(),
+            "maxBytes": MAX_BYTES,
+            "downloadMaxFilesizeOnFetch": False,
+            "minDurationRatio": _MIN_DURATION_RATIO,
+            "rateLimit": rate_limit_config(),
         }
     )
 
