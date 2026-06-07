@@ -46,6 +46,7 @@ _AUDIO_FORMAT = (
     "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 )
 _AUDIO_FORMAT_FALLBACK = "bestaudio[abr<=128]/bestaudio"
+_AUDIO_FORMAT_LAST_RESORT = "bestaudio/best"
 # 動画長の何割未満なら「途中切断」とみなすか
 _MIN_DURATION_RATIO = float(os.environ.get("WAVRICK_AUDIO_MIN_DURATION_RATIO", "0.88"))
 
@@ -476,13 +477,52 @@ def download_youtube_audio(
     return files[0]
 
 
+def _is_format_or_challenge_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "no video formats found",
+            "requested format is not available",
+            "sign in to confirm",
+            "not a bot",
+            "challenge solving failed",
+            "only images are available",
+        )
+    )
+
+
 def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, float, float]:
     """
     動画メタの長さと照合し、途中切断されていれば低ビットレート形式で再取得する。
     Returns (path, audio_duration_sec, video_duration_sec).
     """
     expected = youtube_video_duration_sec(url)
-    path = download_youtube_audio(url, out_dir)
+    format_attempts = [
+        _AUDIO_FORMAT,
+        _AUDIO_FORMAT_FALLBACK,
+        _AUDIO_FORMAT_LAST_RESORT,
+    ]
+
+    path = ""
+    last_err: BaseException | None = None
+    for idx, fmt in enumerate(format_attempts):
+        try:
+            path = download_youtube_audio(url, out_dir, format_selector=fmt)
+            last_err = None
+            if idx > 0:
+                logger.warning("audio download succeeded with fallback format %s", fmt)
+            break
+        except Exception as exc:
+            last_err = exc
+            if _is_format_or_challenge_error(exc) and idx < len(format_attempts) - 1:
+                logger.warning("audio download failed (%s) — retry format %s", exc, format_attempts[idx + 1])
+                continue
+            raise
+
+    if not path:
+        raise last_err or RuntimeError("yt-dlp produced no output file")
+
     actual = probe_media_duration_sec(path)
     if _is_audio_truncated(actual, expected):
         logger.warning(
@@ -733,6 +773,8 @@ def health():
             "youtubeCookiesLoaded": bool(cookie_path),
             "remoteComponents": _remote_components(),
             "ytDlpVersion": yt_dlp.version.__version__,
+            "nodePath": shutil.which("node"),
+            "denoPath": shutil.which("deno"),
         }
     )
 
