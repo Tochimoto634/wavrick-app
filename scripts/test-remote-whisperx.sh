@@ -11,13 +11,33 @@ if [[ -f "${SECRETS}" ]]; then
   set +a
 fi
 
-BASE="${WHISPERX_SERVICE_URL:-http://127.0.0.1:8081}"
-BASE="${BASE%/}"
+# shellcheck source=scripts/_whisperx_url.sh
+source "${ROOT}/scripts/_whisperx_url.sh"
+
+BASE="$(wavrick_whisperx_base_url)"
+HEALTH_PATH="$(wavrick_whisperx_health_path)"
 SECRET="${WHISPERX_SERVICE_SECRET:-${PROXY_SECRET:-wavrick-local-dev-secret}}"
+RUNPOD_KEY="${RUNPOD_API_KEY:-}"
+
+AUTH_HEADER=()
+if [[ -n "${RUNPOD_KEY}" ]]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${RUNPOD_KEY}")
+elif [[ -n "${SECRET}" ]]; then
+  AUTH_HEADER=(-H "Authorization: Bearer ${SECRET}")
+fi
 
 echo "URL: ${BASE}"
-echo "GET /health …"
-curl -sf "${BASE}/health" | python3 -m json.tool
+echo "GET ${HEALTH_PATH} …"
+HTTP_CODE="$(curl -sS -o /tmp/wavrick-whisperx-health.json -w "%{http_code}" "${AUTH_HEADER[@]}" "${BASE}${HEALTH_PATH}")"
+echo "HTTP ${HTTP_CODE}"
+if [[ "${HTTP_CODE}" == "204" ]]; then
+  echo "モデルロード中（RunPod Serverless）"
+elif [[ "${HTTP_CODE}" == "200" ]]; then
+  python3 -m json.tool /tmp/wavrick-whisperx-health.json
+else
+  cat /tmp/wavrick-whisperx-health.json
+  exit 1
+fi
 
 AUDIO="${1:-}"
 if [[ -z "${AUDIO}" ]]; then
@@ -34,7 +54,7 @@ fi
 echo ""
 echo "POST /transcribe (${AUDIO}) …"
 curl -sf -X POST "${BASE}/transcribe" \
-  -H "Authorization: Bearer ${SECRET}" \
+  "${AUTH_HEADER[@]}" \
   -F "file=@${AUDIO}" \
   -o "${ROOT}/.whisperx-remote-test.json"
 python3 -m json.tool "${ROOT}/.whisperx-remote-test.json" | head -40

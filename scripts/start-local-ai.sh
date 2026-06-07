@@ -46,9 +46,21 @@ if wavrick_whisperx_use_local; then
     echo "whisperx (8081) already running (build ${RUNNING_WX})"
   fi
 else
-  echo "WhisperX: リモート $(wavrick_whisperx_base_url)（ローカル 8081 はスキップ）"
-  if ! curl -sf "$(wavrick_whisperx_base_url)/health" >/dev/null 2>&1; then
-    echo "  ⚠️  リモート /health に届きません。.local/secrets.env の URL / SECRET を確認"
+  wavrick_load_whisperx_env
+  WX_BASE="$(wavrick_whisperx_base_url)"
+  WX_HEALTH="$(wavrick_whisperx_health_path)"
+  echo "WhisperX: リモート ${WX_BASE}（ローカル 8081 はスキップ）"
+  AUTH=()
+  if [[ -n "${RUNPOD_API_KEY:-}" ]]; then
+    AUTH=(-H "Authorization: Bearer ${RUNPOD_API_KEY}")
+  elif [[ -n "${WHISPERX_SERVICE_SECRET:-${PROXY_SECRET:-}}" ]]; then
+    AUTH=(-H "Authorization: Bearer ${WHISPERX_SERVICE_SECRET:-${PROXY_SECRET}}")
+  fi
+  WX_CODE="$(curl -sS -o /dev/null -w "%{http_code}" "${AUTH[@]}" "${WX_BASE}${WX_HEALTH}" 2>/dev/null || echo "000")"
+  if [[ "${WX_CODE}" != "200" && "${WX_CODE}" != "204" ]]; then
+    echo "  ⚠️  リモート ${WX_HEALTH} に届きません (HTTP ${WX_CODE})。.local/secrets.env を確認"
+  elif [[ "${WX_CODE}" == "204" ]]; then
+    echo "  ⏳ モデルロード中（RunPod Serverless）"
   fi
 fi
 

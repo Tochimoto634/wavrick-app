@@ -19,6 +19,23 @@ WHISPERX_URL = os.environ.get("WHISPERX_SERVICE_URL", "http://127.0.0.1:8081").r
 WAVRICK_TRANSCRIBE_BUILD = 8
 
 
+def resolve_whisperx_base_url(keys: dict[str, str]) -> str:
+    endpoint_id = (
+        keys.get("RUNPOD_WHISPERX_ENDPOINT_ID")
+        or keys.get("RUNPOD_ENDPOINT_ID")
+        or os.environ.get("RUNPOD_WHISPERX_ENDPOINT_ID")
+        or os.environ.get("RUNPOD_ENDPOINT_ID")
+        or ""
+    ).strip()
+    if endpoint_id:
+        return f"https://{endpoint_id}.api.runpod.ai"
+    return (
+        keys.get("WHISPERX_SERVICE_URL")
+        or os.environ.get("WHISPERX_SERVICE_URL")
+        or WHISPERX_URL
+    ).rstrip("/")
+
+
 def transcribe_build_marker() -> str:
     return f"[Wavrick-{WAVRICK_TRANSCRIBE_BUILD}]"
 
@@ -75,6 +92,9 @@ def load_dev_api_keys() -> dict[str, str]:
         "YOUTUBE_AUDIO_PROXY_SECRET",
         "WHISPERX_SERVICE_URL",
         "WHISPERX_SERVICE_SECRET",
+        "RUNPOD_API_KEY",
+        "RUNPOD_WHISPERX_ENDPOINT_ID",
+        "RUNPOD_ENDPOINT_ID",
     ):
         if not out.get(key) and os.environ.get(key):
             out[key] = os.environ[key]
@@ -242,14 +262,37 @@ def fetch_audio_from_local_proxy(video_url: str) -> bytes:
     return body
 
 
-def get_whisperx_secret(keys: dict[str, str]) -> str:
-    return (
+def whisperx_failure_hint(base: str, detail: str) -> str:
+    if "runpod.ai" in base:
+        if "hotwords" in detail:
+            return (
+                "RunPod の WhisperX イメージが古いです（build 14）。"
+                " ./scripts/deploy-whisperx-serverless.sh tochimoto/wavrick-whisperx-serverless:stable "
+                "で build 15 を push し、RunPod Endpoint を保存して再試行してください。"
+            )
+        return (
+            "RunPod Serverless の WhisperX を確認してください。"
+            " ./scripts/test-remote-whisperx.sh で /ping の build と cuda_available を確認。"
+        )
+    return "./scripts/start-whisperx.sh が動いているか確認してください。"
+
+
+def get_whisperx_auth_header(keys: dict[str, str]) -> str | None:
+    runpod_key = (
+        keys.get("RUNPOD_API_KEY")
+        or os.environ.get("RUNPOD_API_KEY")
+        or ""
+    ).strip()
+    if runpod_key:
+        return f"Bearer {runpod_key}"
+    secret = (
         keys.get("WHISPERX_SERVICE_SECRET")
         or keys.get("PROXY_SECRET")
         or os.environ.get("WHISPERX_SERVICE_SECRET")
         or os.environ.get("PROXY_SECRET")
         or "wavrick-local-dev-secret"
-    )
+    ).strip()
+    return f"Bearer {secret}" if secret else None
 
 
 def transcribe_whisperx(audio: bytes, filename: str, keys: dict[str, str]) -> dict[str, Any]:
@@ -259,12 +302,8 @@ def transcribe_whisperx(audio: bytes, filename: str, keys: dict[str, str]) -> di
         timeline_cues_to_legacy_segments,
     )
 
-    base = (
-        keys.get("WHISPERX_SERVICE_URL")
-        or os.environ.get("WHISPERX_SERVICE_URL")
-        or WHISPERX_URL
-    ).rstrip("/")
-    secret = get_whisperx_secret(keys)
+    base = resolve_whisperx_base_url(keys)
+    auth = get_whisperx_auth_header(keys)
     boundary = f"wavrick-{int(time.time() * 1000)}"
     parts: list[bytes] = [
         f"--{boundary}\r\n".encode()
@@ -278,8 +317,8 @@ def transcribe_whisperx(audio: bytes, filename: str, keys: dict[str, str]) -> di
     headers = {
         "Content-Type": f"multipart/form-data; boundary={boundary}",
     }
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
+    if auth:
+        headers["Authorization"] = auth
 
     req = urllib.request.Request(
         f"{base}/transcribe",
@@ -292,13 +331,14 @@ def transcribe_whisperx(audio: bytes, filename: str, keys: dict[str, str]) -> di
             wx = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:500]
+        hint = whisperx_failure_hint(base, detail)
         raise RuntimeError(
-            f"WhisperX ({base}) が失敗しました ({e.code}): {detail}. "
-            "./scripts/start-whisperx.sh が動いているか確認してください。"
+            f"WhisperX ({base}) が失敗しました ({e.code}): {detail}. {hint}"
         ) from e
     except urllib.error.URLError as e:
+        hint = whisperx_failure_hint(base, str(e))
         raise RuntimeError(
-            f"WhisperX ({base}) に接続できません: {e}. ./scripts/start-whisperx.sh を起動してください。"
+            f"WhisperX ({base}) に接続できません: {e}. {hint}"
         ) from e
 
     words = wx.get("words") if isinstance(wx, dict) else []
