@@ -1,6 +1,6 @@
 /** 文字起こしパイプラインのビルド番号（末尾マーカーで稼働確認） */
 
-export const WAVRICK_TRANSCRIBE_BUILD = 8;
+export const WAVRICK_TRANSCRIBE_BUILD = 12;
 
 export function transcribeBuildMarker(): string {
   return `[Wavrick-${WAVRICK_TRANSCRIBE_BUILD}]`;

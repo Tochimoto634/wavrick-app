@@ -2,10 +2,10 @@
  * WhisperX 単語タイムスタンプ → 2秒/10秒 台本分割（Deno / Edge 共有）
  *
  * Pass 1: words → speech spans（ケツは単語間 gap ≥2s または ffmpeg silenceGaps）
- * Pass 2: spans 間ブランクで行分割
- *   - gap < 2s: 同一タイムコード行
- *   - 2s ≤ gap < 10s: 改行（新タイムコード）
- *   - gap ≥ 10s: [NEW_BLOCK]
+ * Pass 2: spans 間ブランクで行分割（収録ブースの台本もこの区切りを流用）
+ *   - gap < 2s: 連結（同一タイムコード行・同じセリフ）
+ *   - 2s ≤ gap < 10s: 改行（同じ台本内の別行＝概念上の "/" 区切り・新タイムコード）
+ *   - gap ≥ 10s: [NEW_BLOCK]（次の台本）
  */
 
 export type AlignWord = { word: string; start: number; end: number };
@@ -25,6 +25,92 @@ export const SILENCE_GAP_BLOCK_MIN_SEC = 10.0;
 export const SILENCE_END_LOCK_SEC = 2.0;
 export const INVALID_SEGMENT_END_FALLBACK_SEC = 0.35;
 export const NEW_BLOCK_MARKER = "[NEW_BLOCK]";
+/** 同一台本内の 2〜10秒ギャップ区切り。WhisperX 書き起こし表示のみに出す（台本パースで除去）。 */
+export const LINE_GAP_MARKER = "/";
+
+/** 叫び・ノイズ時の Whisper ループ幻覚を表示用に抑える（同一フレーズの連続上限） */
+export const MAX_CONSECUTIVE_PHRASE_REPEAT = 2;
+
+function normalizeAlignToken(word: string): string {
+  return String(word || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+/**
+ * align 単語列の連続重複を 1 語にまとめる（タイムスタンプは最後の end まで伸ばす）。
+ * WhisperX が叫び声を同じ語で長く塗りつぶすときの対策。
+ */
+export function dedupeConsecutiveAlignWords(words: AlignWord[]): AlignWord[] {
+  if (words.length < 2) return words;
+  const out: AlignWord[] = [{ ...words[0] }];
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i];
+    const prev = out[out.length - 1];
+    if (normalizeAlignToken(prev.word) === normalizeAlignToken(w.word)) {
+      prev.end = safeEnd(prev.start, Math.max(prev.end, w.end));
+      continue;
+    }
+    out.push({ ...w });
+  }
+  return out;
+}
+
+/** セリフ本文の同一フレーズ連続（やめてやめて… / word word word…）を上限回数に抑える */
+export function collapseExcessiveTextRepetition(
+  text: string,
+  maxRun = MAX_CONSECUTIVE_PHRASE_REPEAT
+): string {
+  let t = String(text || "").trim();
+  if (!t || maxRun < 1) return t;
+
+  if (/\s/.test(t)) {
+    const parts = t.split(/\s+/).filter(Boolean);
+    const out: string[] = [];
+    let run = 0;
+    let prev = "";
+    for (const p of parts) {
+      const norm = normalizeAlignToken(p);
+      if (norm && norm === prev) {
+        run += 1;
+        if (run <= maxRun) out.push(p);
+      } else {
+        prev = norm;
+        run = 1;
+        out.push(p);
+      }
+    }
+    t = out.join(" ");
+  }
+
+  const maxLen = Math.min(16, Math.floor(t.length / (maxRun + 1)));
+  for (let len = maxLen; len >= 1; len--) {
+    const re = new RegExp(`(.{${len}})(?:\\1){${maxRun},}`, "gu");
+    t = t.replace(re, (_m, unit: string) => unit.repeat(maxRun));
+  }
+  return t.trim();
+}
+
+/** 叫び・幻覚ループっぽい rough セグメント（長時間＋同じ音の繰り返し） */
+export function isLikelyScreamHallucination(text: string, durationSec: number): boolean {
+  const t = String(text || "").replace(/\s+/g, "");
+  if (!t) return false;
+  const dur = Math.max(0, Number(durationSec) || 0);
+  if (dur >= 22) return true;
+  if (dur < 6) return false;
+  const chars = [...t];
+  const unique = new Set(chars).size;
+  const diversity = unique / Math.max(chars.length, 1);
+  if (dur >= 10 && chars.length >= 10 && diversity < 0.32) return true;
+  const once = collapseExcessiveTextRepetition(t, 1);
+  if (dur >= 8 && t.length >= 16 && once.length <= Math.max(6, t.length * 0.28)) return true;
+  return false;
+}
+
+function roughSegmentsNeedWordLevelFallback(rough: WhisperSeg[]): boolean {
+  return rough.some((s) => isLikelyScreamHallucination(s.text, s.end - s.start));
+}
 
 export function formatBracketTimecode(seconds: number): string {
   const s = Math.max(0, Number(seconds) || 0);
@@ -69,7 +155,7 @@ export function normalizeAlignWords(raw: unknown): AlignWord[] {
     out.push({ word, start, end });
   }
   out.sort((a, b) => a.start - b.start || a.end - b.end);
-  return out;
+  return dedupeConsecutiveAlignWords(out);
 }
 
 function clampWordsToDuration(words: AlignWord[], durationSec: number): AlignWord[] {
@@ -222,6 +308,39 @@ function expandWordsAtPhraseBoundary(
   return out;
 }
 
+/** prev/next の境界付近にある実際の無音区間（ffmpeg / rough segment）を探す */
+function silenceGapNearBoundary(
+  prev: TimelineCue,
+  next: TimelineCue,
+  silenceGaps: SilenceGap[],
+  roughSegments: WhisperSeg[]
+): { start: number; end: number } | null {
+  // align が無音を詰めた結果、ケツ（prev.end）が次の頭（next.start）にぶつかっている。
+  // その境界付近で「発話再開（無音の終わり）が next.start に最も近い」無音区間を選ぶ。
+  const boundary = next.startSec;
+  const lo = prev.startSec - 0.5;
+  const hi = next.endSec + 0.5;
+
+  type BoundaryGap = { start: number; end: number; dist: number };
+  let best: BoundaryGap | null = null;
+  const consider = (start: number, end: number) => {
+    if (!(end - start >= SILENCE_GAP_LINE_MIN_SEC - 0.01)) return;
+    if (end < lo || start > hi) return;
+    const dist = Math.abs(end - boundary);
+    if (best === null || dist < best.dist) best = { start, end, dist };
+  };
+
+  for (const sg of normalizeSilenceGaps(silenceGaps)) {
+    consider(sg.start, sg.end);
+  }
+  const rough = normalizeWhisperSegments(roughSegments);
+  for (let si = 1; si < rough.length; si++) {
+    consider(rough[si - 1].end, rough[si].start);
+  }
+  const hit = best as BoundaryGap | null;
+  return hit ? { start: hit.start, end: hit.end } : null;
+}
+
 /** 連続キューのケツ／頭を無音区間で離す（align 詰め・仮分割の補正） */
 function resolveAdjacentCueBoundary(
   prev: TimelineCue,
@@ -229,10 +348,23 @@ function resolveAdjacentCueBoundary(
   silenceGaps: SilenceGap[],
   roughSegments: WhisperSeg[] = []
 ): { prevEnd: number; nextStart: number } | null {
+  // 既に 2 秒以上離れていれば触れていない＝補正不要
   if (next.startSec - prev.endSec >= SILENCE_GAP_LINE_MIN_SEC - 0.05) {
     return null;
   }
 
+  // 行が分かれている＝この境界には無音か明確な転換がある。
+  // align が無音を詰めてケツが次の頭にぶつかっているので、実際の無音直前まで引き戻す。
+  // 頭（next.start）は align の単語頭が正確なので動かさない。
+  const gap = silenceGapNearBoundary(prev, next, silenceGaps, roughSegments);
+  if (gap) {
+    const prevEnd = Math.max(prev.startSec + 0.05, Math.min(gap.start, next.startSec));
+    if (next.startSec > prevEnd) {
+      return { prevEnd, nextStart: next.startSec };
+    }
+  }
+
+  // 無音情報がない言い回しの転換（例: でも → 今）のフォールバック
   const prevSpan: SpeechSpan = {
     startSec: prev.startSec,
     endSec: prev.endSec,
@@ -243,27 +375,40 @@ function resolveAdjacentCueBoundary(
     endSec: next.endSec,
     text: next.text
   };
-
-  if (phraseLineGap(prevSpan, nextSpan) == null) return null;
-
-  for (const sg of normalizeSilenceGaps(silenceGaps)) {
-    const dur = sg.duration ?? sg.end - sg.start;
-    if (dur < SILENCE_GAP_LINE_MIN_SEC - 0.01) continue;
-    return { prevEnd: sg.start, nextStart: sg.end };
+  if (phraseLineGap(prevSpan, nextSpan) != null) {
+    const mid = prev.endSec;
+    return {
+      prevEnd: Math.max(prev.startSec + 0.05, mid),
+      nextStart: mid + SILENCE_GAP_LINE_MIN_SEC
+    };
   }
 
-  const rough = normalizeWhisperSegments(roughSegments);
-  for (let si = 1; si < rough.length; si++) {
-    const rgap = rough[si].start - rough[si - 1].end;
-    if (rgap < SILENCE_GAP_LINE_MIN_SEC - 0.01) continue;
-    return { prevEnd: rough[si - 1].end, nextStart: rough[si].start };
-  }
+  return null;
+}
 
-  const mid = prev.endSec;
-  return {
-    prevEnd: Math.max(prev.startSec + 0.05, mid),
-    nextStart: mid + SILENCE_GAP_LINE_MIN_SEC
-  };
+/**
+ * 最終ルール徹底（表示タイムコードのギャップ基準）。
+ * - ギャップ < 2 秒 : 同じ台本・同じ行（結合）
+ * - 2 秒以上 10 秒未満: 同じ台本・次の行
+ * - 10 秒以上        : 別の台本（blockBreak）
+ * align / rough segment が連続発話を誤って分割しても、ここで最終的に揃える。
+ */
+function enforceGapRules(cues: TimelineCue[]): TimelineCue[] {
+  if (!cues.length) return cues;
+  const out: TimelineCue[] = [{ ...cues[0], blockBreak: !!cues[0].blockBreak }];
+  for (let i = 1; i < cues.length; i++) {
+    const c = cues[i];
+    const prev = out[out.length - 1];
+    const gap = c.startSec - prev.endSec;
+    if (gap < SILENCE_GAP_LINE_MIN_SEC - 0.01) {
+      // 2 秒未満 → 同じ行に結合
+      prev.text = joinWordTexts([prev.text, c.text]);
+      prev.endSec = safeEnd(prev.startSec, Math.max(prev.endSec, c.endSec));
+      continue;
+    }
+    out.push({ ...c, blockBreak: gap >= SILENCE_GAP_BLOCK_MIN_SEC });
+  }
+  return out;
 }
 
 function applySilenceBoundariesToCues(
@@ -314,34 +459,52 @@ function phraseLineGap(prev: SpeechSpan, next: SpeechSpan): number | null {
   return null;
 }
 
-/** align が無音を詰めるとき、roughSegments / ffmpeg 無音の直前でスパンを切る */
-function forcedSpanBreakBeforeWord(
+/**
+ * align が無音を詰めるとき、roughSegments / ffmpeg 無音の直前でスパンを切る。
+ *
+ * align は直前の単語末を次の発話開始まで伸ばすことがあるため、ブレーク位置だけでなく
+ * 「発話が実際に終わった時刻（＝ケツ）」も返し、Pass 1 でスパン末尾を無音直前まで
+ * 引き戻せるようにする。
+ * 返り値: ブレークする単語 index -> その手前の発話終了秒
+ */
+function forcedSpanBreaksBeforeWord(
   words: AlignWord[],
   segments: WhisperSeg[],
   silenceGaps: SilenceGap[],
   roughSegments: WhisperSeg[] = [],
   durationSec = 0
-): Set<number> {
-  const breaks = new Set<number>();
+): Map<number, number> {
+  const breaks = new Map<number, number>();
   if (words.length < 2) return breaks;
+
+  const register = (wi: number, speechEndSec: number) => {
+    if (wi <= 0 || wi >= words.length) return;
+    const wordStart = words[wi - 1]?.start ?? speechEndSec;
+    const wordEnd = words[wi - 1]?.end ?? speechEndSec;
+    // 実際のケツは無音直前。単語末より後ろには伸ばさず、単語頭より前にも縮めない。
+    const realEnd = Math.min(wordEnd, Math.max(wordStart + 0.05, speechEndSec));
+    const prev = breaks.get(wi);
+    if (prev === undefined || realEnd < prev) breaks.set(wi, realEnd);
+  };
 
   const segRows = segmentRowsForBreaks(segments, roughSegments);
   for (let si = 1; si < segRows.length; si++) {
     const gap = segRows[si].start - segRows[si - 1].end;
     if (gap < SILENCE_END_LOCK_SEC) continue;
     const wi = words.findIndex((w) => w.start >= segRows[si].start - 0.05);
-    if (wi > 0) breaks.add(wi);
+    if (wi > 0) register(wi, segRows[si - 1].end);
   }
 
   for (const sg of normalizeSilenceGaps(silenceGaps)) {
     const dur = sg.duration ?? sg.end - sg.start;
     if (dur < SILENCE_END_LOCK_SEC - 0.01) continue;
     const wi = wordIndexAfterSilence(words, sg, durationSec);
-    if (wi > 0) breaks.add(wi);
+    if (wi > 0) register(wi, sg.start);
   }
 
   for (const wi of phraseBoundaryBreakBeforeWord(words)) {
-    breaks.add(wi);
+    // 無音情報がない言い回しの転換は、ケツを単語末のまま後段の境界補正に委ねる
+    if (!breaks.has(wi)) register(wi, words[wi - 1]?.end ?? 0);
   }
   return breaks;
 }
@@ -387,7 +550,7 @@ export function buildSpeechSpansFromAlignWords(
   const rows = clampWordsToDuration(expanded, durationSec);
   if (!rows.length) return [];
 
-  const forcedBreaks = forcedSpanBreakBeforeWord(
+  const forcedBreaks = forcedSpanBreaksBeforeWord(
     rows,
     segments,
     silenceGaps,
@@ -401,7 +564,7 @@ export function buildSpeechSpansFromAlignWords(
   const batchTexts: string[] = [rows[0].word];
 
   const flush = () => {
-    const text = joinWordTexts(batchTexts);
+    const text = collapseExcessiveTextRepetition(joinWordTexts(batchTexts));
     if (!text) return;
     spans.push({
       startSec: batchStart,
@@ -413,12 +576,18 @@ export function buildSpeechSpansFromAlignWords(
   for (let i = 1; i < rows.length; i++) {
     const w = rows[i];
     const gap = w.start - batchEnd;
+    const forcedEnd = forcedBreaks.get(i);
     const endLocked =
-      forcedBreaks.has(i) ||
+      forcedEnd !== undefined ||
       gap >= SILENCE_END_LOCK_SEC ||
       silenceBetweenWords(batchEnd, w.start, silenceGaps);
 
     if (endLocked) {
+      // align が無音を詰めて単語末を次の発話まで伸ばしている場合、
+      // スパン末尾（ケツ）を無音直前まで引き戻し、次行の頭にぶつからないようにする。
+      if (forcedEnd !== undefined && forcedEnd > batchStart) {
+        batchEnd = Math.min(batchEnd, forcedEnd);
+      }
       flush();
       batchStart = w.start;
       batchEnd = w.end;
@@ -451,7 +620,7 @@ export function buildTimelineCuesFromSpeechSpans(
   let pendingBlockBreak = false;
 
   const flush = () => {
-    const text = joinWordTexts(batch.texts);
+    const text = collapseExcessiveTextRepetition(joinWordTexts(batch.texts));
     if (!text) return;
     cues.push({
       startSec: batch.startSec,
@@ -492,7 +661,9 @@ export function buildTimelineCuesFromSpeechSpans(
     batch.endSec = Math.max(batch.endSec, next.endSec);
   }
   flush();
-  return applySilenceBoundariesToCues(cues, silenceGaps, roughSegments);
+  return enforceGapRules(
+    applySilenceBoundariesToCues(cues, silenceGaps, roughSegments)
+  );
 }
 
 export function buildTimelineCuesFromAlignWords(
@@ -513,6 +684,49 @@ export function buildTimelineCuesFromAlignWords(
   return buildTimelineCuesFromSpeechSpans(spans, silenceGaps, roughSegments);
 }
 
+/**
+ * rough_segments（Whisper のネイティブ文単位セグメント）をそのまま行区切りとして cue に変換。
+ * - gap < 0.1s  : 同一発話の続き → 結合
+ * - 0.1s ≤ gap < 10s : 新しい行（Whisper が判断した文境界を優先）
+ * - gap ≥ 10s   : blockBreak
+ */
+function buildCuesFromRoughSegments(roughRows: WhisperSeg[]): TimelineCue[] {
+  if (!roughRows.length) return [];
+  const cues: TimelineCue[] = [];
+  let batch = { startSec: roughRows[0].start, endSec: roughRows[0].end, texts: [roughRows[0].text] };
+  let pendingBlockBreak = false;
+
+  const flush = () => {
+    const text = collapseExcessiveTextRepetition(joinWordTexts(batch.texts));
+    if (!text) return;
+    cues.push({
+      startSec: batch.startSec,
+      endSec: safeEnd(batch.startSec, batch.endSec),
+      text,
+      blockBreak: pendingBlockBreak
+    });
+    pendingBlockBreak = false;
+  };
+
+  for (let i = 1; i < roughRows.length; i++) {
+    const next = roughRows[i];
+    const gap = next.start - batch.endSec;
+    if (gap >= SILENCE_GAP_BLOCK_MIN_SEC) {
+      flush();
+      pendingBlockBreak = true;
+      batch = { startSec: next.start, endSec: next.end, texts: [next.text] };
+    } else if (gap < 0.1) {
+      batch.texts.push(next.text);
+      batch.endSec = Math.max(batch.endSec, next.end);
+    } else {
+      flush();
+      batch = { startSec: next.start, endSec: next.end, texts: [next.text] };
+    }
+  }
+  flush();
+  return cues;
+}
+
 export function buildTimelineCuesFromWhisperX(
   words: AlignWord[],
   segments: WhisperSeg[],
@@ -520,15 +734,26 @@ export function buildTimelineCuesFromWhisperX(
   silenceGaps: SilenceGap[] = [],
   roughSegments: WhisperSeg[] = []
 ): TimelineCue[] {
-  const rows = clampWordsToDuration(normalizeAlignWords(words), durationSec);
-  if (rows.length) {
+  const rough = normalizeWhisperSegments(roughSegments);
+  const wordRows = clampWordsToDuration(normalizeAlignWords(words), durationSec);
+  // rough_segments が 2 行以上あれば通常は文単位の行区切りとして優先。
+  // ただし叫び声などで 1 セグメントが長く幻覚ループすると、その間の台詞が rough から消える。
+  // その場合は align 単語ベースにフォールバックする。
+  if (rough.length >= 2 && !roughSegmentsNeedWordLevelFallback(rough)) {
+    return buildCuesFromRoughSegments(rough);
+  }
+  if (wordRows.length) {
     return buildTimelineCuesFromAlignWords(
-      rows,
+      wordRows,
       durationSec,
       segments,
       silenceGaps,
       roughSegments
     );
+  }
+  const segs = normalizeWhisperSegments(segments);
+  if (segs.length >= 2) {
+    return buildCuesFromRoughSegments(segs);
   }
   return buildTimelineCuesFromWhisperSegments(segments, durationSec);
 }
@@ -586,7 +811,7 @@ export function buildBracketTimelineFromWhisperX(
 function normalizeWhisperSegments(segments: WhisperSeg[]): WhisperSeg[] {
   const out: WhisperSeg[] = [];
   for (const row of segments || []) {
-    const text = String(row.text || "").trim();
+    const text = collapseExcessiveTextRepetition(String(row.text || "").trim());
     if (!text) continue;
     const start = Math.max(0, Number(row.start) || 0);
     let end = Math.max(0, Number(row.end) || 0);
@@ -663,17 +888,29 @@ export function buildTimelineCuesFromWhisperSegments(
   }
   flush();
 
+  // enforceGapRules は 2秒未満のギャップを再結合するため、
+  // segments が既に文単位なら適用しない（= 返す前に再結合が起きると元の木阿弥になる）
   return cues;
 }
 
 function bracketLinesFromCues(cues: TimelineCue[]): string {
   const lines: string[] = [];
+  let prevCue: TimelineCue | null = null;
   for (const cue of cues) {
-    if (cue.blockBreak) lines.push(NEW_BLOCK_MARKER);
+    if (cue.blockBreak) {
+      lines.push(NEW_BLOCK_MARKER);
+    } else if (prevCue !== null) {
+      // "/" は 2 秒以上のギャップのみ（同一台本内の間合い区切り表示用）
+      const gap = cue.startSec - prevCue.endSec;
+      if (gap >= SILENCE_GAP_LINE_MIN_SEC) {
+        lines.push(LINE_GAP_MARKER);
+      }
+    }
     const end = safeEnd(cue.startSec, cue.endSec);
     lines.push(
       `[${formatBracketTimecode(cue.startSec)} - ${formatBracketTimecode(end)}] ${cue.text}`
     );
+    prevCue = cue;
   }
   return lines.join("\n").trim();
 }
