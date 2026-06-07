@@ -27,9 +27,11 @@ async function importHmacKey(secret: string): Promise<CryptoKey> {
 
 export type OAuthStatePayload = {
   /** ASCII のみ（UTF-8 文字化け防止） */
-  channel_key_b64: string;
+  channel_key_b64?: string;
   /** 旧トークン互換（新規発行では使わない） */
   channel_key?: string;
+  /** single = URL指定チャンネル / link_all = Google配下をすべて登録 */
+  link_mode?: string;
   parent_origin: string;
   exp: number;
 };
@@ -66,12 +68,9 @@ export async function verifyOAuthState(
   } catch {
     return null;
   }
-  if (
-    (!parsed.channel_key_b64 && !parsed.channel_key) ||
-    typeof parsed.parent_origin !== "string"
-  ) {
-    return null;
-  }
+  const linkAll = parsed.link_mode === "link_all";
+  if (!linkAll && !parsed.channel_key_b64 && !parsed.channel_key) return null;
+  if (typeof parsed.parent_origin !== "string") return null;
   if (typeof parsed.exp !== "number" || Date.now() > parsed.exp + graceMs) return null;
   return parsed;
 }

@@ -4,6 +4,9 @@ export type PostPayload = {
   ok: boolean;
   channelKeyB64: string;
   channelId: string;
+  /** link_all 時に Google アカウント配下の全チャンネル */
+  channelIds?: string[];
+  linkMode?: string;
   /** 親画面 app.js が日本語に変換するコード */
   code: string;
   /** 補足（英数字のみ。Google エラー等） */

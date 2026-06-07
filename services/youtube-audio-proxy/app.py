@@ -17,6 +17,7 @@ Docker: docker build -t wavrick-yt-audio . && docker run -e PROXY_SECRET=... -p 
 
 from __future__ import annotations
 
+import base64
 import glob
 import logging
 import os
@@ -24,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 from flask import Flask, Response, abort, jsonify, request
@@ -43,6 +46,12 @@ _AUDIO_FORMAT = (
     "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 )
 _AUDIO_FORMAT_FALLBACK = "bestaudio[abr<=128]/bestaudio"
+_AUDIO_FORMAT_LAST_RESORT = "bestaudio/best"
+_AUDIO_FORMAT_ANY = "ba/b/w"
+_AUDIO_FORMAT_MUX = "b/w"
+_AUDIO_FORMAT_BEST = "best"
+# health の extractBuild と揃える（Railway で新コードが載ったか確認用）
+_EXTRACT_BUILD = 2
 # 動画長の何割未満なら「途中切断」とみなすか
 _MIN_DURATION_RATIO = float(os.environ.get("WAVRICK_AUDIO_MIN_DURATION_RATIO", "0.88"))
 
@@ -70,43 +79,163 @@ def _guess_mimetype(path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
+_COOKIE_CACHE_PATH: str | None = None
+
+
 def _yt_proxy() -> str:
     return os.environ.get("WAVRICK_YT_PROXY", "").strip()
 
 
-def _youtube_extractor_args() -> dict:
-    raw = os.environ.get("WAVRICK_YT_PLAYER_CLIENT", "tv,tv_embedded,android,web")
-    clients = [c.strip() for c in raw.split(",") if c.strip()]
+def _resolve_yt_cookiefile() -> str | None:
+    """ファイルパス / 環境変数テキスト / Base64 から yt-dlp 用 cookies.txt を用意。"""
+    global _COOKIE_CACHE_PATH
+
+    path = os.environ.get("WAVRICK_YT_COOKIES", "").strip()
+    if path and os.path.isfile(path):
+        return path
+    if _COOKIE_CACHE_PATH and os.path.isfile(_COOKIE_CACHE_PATH):
+        return _COOKIE_CACHE_PATH
+
+    text = os.environ.get("WAVRICK_YT_COOKIES_TEXT", "").strip()
+    if not text:
+        b64 = os.environ.get("WAVRICK_YT_COOKIES_B64", "").strip()
+        if b64:
+            try:
+                text = base64.b64decode(b64).decode("utf-8", errors="replace").strip()
+            except Exception:
+                logger.warning("WAVRICK_YT_COOKIES_B64 decode failed")
+                text = ""
+
+    if not text:
+        return None
+
+    fd, cache_path = tempfile.mkstemp(prefix="wavrick_yt_cookies_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else f"{text}\n")
+    _COOKIE_CACHE_PATH = cache_path
+    logger.info("YouTube cookies loaded from env (%d bytes)", len(text))
+    return cache_path
+
+
+def _friendly_yt_extract_error(detail: str) -> str:
+    if "Sign in to confirm" in detail or "not a bot" in detail.lower():
+        return (
+            "YouTube がボット判定しています（Railway の IP がブロックされています）。"
+            " 対処: ①依頼フォームで音声ファイルを直接アップロード ② Railway に YouTube ログイン済み cookies を設定"
+            "（WAVRICK_YT_COOKIES_B64・YouTube 用に絞り込み済み）。./scripts/export-youtube-cookies-for-railway.sh を参照。"
+        )
+    if "403" in detail or "Forbidden" in detail:
+        return (
+            "YouTube から音声を取得できませんでした（403）。"
+            " しばらくして再試行するか、音声ファイルを直接アップロードしてください。"
+            f" 詳細: {detail[:240]}"
+        )
+    if "requested format is not available" in detail.lower() or "no video formats found" in detail.lower():
+        return (
+            "YouTube から利用可能な音声形式を取得できませんでした。"
+            " 別の動画で試すか、mp3/m4a を直接アップロードしてください。"
+            f" 詳細: {detail[:240]}"
+        )
+    return detail
+
+
+def _remote_components() -> list[str]:
+    raw = os.environ.get("WAVRICK_YT_REMOTE_COMPONENTS", "ejs:github").strip()
+    if raw.lower() in ("0", "false", "no", "off"):
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _js_runtimes() -> dict:
+    runtimes: dict = {}
+    node = shutil.which("node")
+    if node:
+        runtimes["node"] = {"path": node}
+    deno = shutil.which("deno")
+    if deno:
+        runtimes["deno"] = {"path": deno}
+    return runtimes
+
+
+def _normalize_player_clients(clients: list[str], *, use_cookies: bool) -> list[str]:
+    """Cookie 利用時は android が yt-dlp 側でスキップされるため除外する。"""
+    if not use_cookies or not _resolve_yt_cookiefile():
+        return clients
+    return [c for c in clients if c != "android"]
+
+
+def _player_client_attempts(*, use_cookies: bool = True) -> list[list[str]]:
+    """Railway + Cookie では tv DRM / SABR で bestaudio が空になることがある。"""
+    raw = os.environ.get("WAVRICK_YT_PLAYER_CLIENT", "").strip()
+    primary = _normalize_player_clients(
+        [c.strip() for c in raw.split(",") if c.strip()],
+        use_cookies=use_cookies,
+    )
+    if use_cookies and _resolve_yt_cookiefile():
+        defaults: list[list[str]] = [
+            ["web", "tv", "tv_embedded"],
+            ["tv", "tv_embedded", "web"],
+            ["web"],
+            ["mweb", "web"],
+            ["ios", "web"],
+        ]
+    else:
+        defaults = [
+            ["android", "web"],
+            ["tv", "tv_embedded", "android", "web"],
+            ["web"],
+            ["ios", "web"],
+            ["mweb", "web"],
+        ]
+    if primary:
+        return [primary] + [d for d in defaults if d != primary]
+    return defaults
+
+
+def _youtube_extractor_args(player_clients: list[str] | None = None) -> dict:
+    clients = player_clients or _player_client_attempts(use_cookies=True)[0]
     return {
         "youtube": {
-            "player_client": clients or ["android", "web"],
+            "player_client": clients,
             "player_skip": ["webpage"],
             "player_js_version": ["actual"],
         }
     }
 
 
-def _base_ydl_opts(**extra) -> dict:
+def _base_ydl_opts(*, use_cookies: bool = True, player_clients: list[str] | None = None, **extra) -> dict:
     opts: dict = {
         "quiet": True,
         "noplaylist": True,
         "proxy": _yt_proxy(),
         "force_ipv4": True,
-        "extractor_args": _youtube_extractor_args(),
+        "extractor_args": _youtube_extractor_args(player_clients),
     }
-    cookiefile = os.environ.get("WAVRICK_YT_COOKIES", "").strip()
-    if cookiefile and os.path.isfile(cookiefile):
-        opts["cookiefile"] = cookiefile
-    node = shutil.which("node")
-    if node:
-        opts["js_runtimes"] = {"node": {"path": node}}
+    if use_cookies:
+        cookiefile = _resolve_yt_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+    runtimes = _js_runtimes()
+    if runtimes:
+        opts["js_runtimes"] = runtimes
+    remote = _remote_components()
+    if remote:
+        opts["remote_components"] = remote
     opts.update(extra)
     return opts
 
 
-def _ydl_options(out_tmpl: str, *, format_selector: str | None = None) -> dict:
-    # YouTube はクライアント検証が頻繁に変わる。複数 player_client で 403 を回避。
+def _ydl_options(
+    out_tmpl: str,
+    *,
+    format_selector: str | None = None,
+    use_cookies: bool = True,
+    player_clients: list[str] | None = None,
+) -> dict:
+    # YouTube はクライアント検証が頻繁に変わる。複数 player_client で 403 / 形式なしを回避。
     opts = _base_ydl_opts(
+        use_cookies=use_cookies,
+        player_clients=player_clients,
         format=format_selector or _AUDIO_FORMAT,
         outtmpl=out_tmpl,
         no_warnings=False,
@@ -252,17 +381,30 @@ def probe_media_duration_sec(path: str) -> float:
 
 
 def youtube_video_duration_sec(url: str) -> float:
-    """yt-dlp で動画メタの長さ（秒）。"""
+    """yt-dlp で動画メタの長さ（秒）。失敗時は 0（ダウンロード側で再判定）。"""
     clear_download_proxies()
-    opts = _base_ydl_opts(skip_download=True)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if not info:
-        return 0.0
-    try:
-        return max(0.0, float(info.get("duration") or 0))
-    except (TypeError, ValueError):
-        return 0.0
+    last_err: BaseException | None = None
+    for use_cookies in (True, False) if _resolve_yt_cookiefile() else (False,):
+        for clients in _player_client_attempts(use_cookies=use_cookies):
+            try:
+                opts = _base_ydl_opts(
+                    skip_download=True,
+                    use_cookies=use_cookies,
+                    player_clients=clients,
+                )
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if not info:
+                    continue
+                return max(0.0, float(info.get("duration") or 0))
+            except Exception as exc:
+                last_err = exc
+                if not _is_format_or_challenge_error(exc):
+                    logger.warning("video duration probe failed (%s)", exc)
+                continue
+    if last_err:
+        logger.warning("video duration unavailable for %s: %s", url, last_err)
+    return 0.0
 
 
 def _is_audio_truncated(actual_sec: float, expected_sec: float) -> bool:
@@ -399,12 +541,22 @@ def _clear_out_files(out_dir: str) -> None:
 
 
 def download_youtube_audio(
-    url: str, out_dir: str, *, format_selector: str | None = None
+    url: str,
+    out_dir: str,
+    *,
+    format_selector: str | None = None,
+    use_cookies: bool = True,
+    player_clients: list[str] | None = None,
 ) -> str:
     out_tmpl = os.path.join(out_dir, "out.%(ext)s")
     clear_download_proxies()
     _clear_out_files(out_dir)
-    ydl_opts = _ydl_options(out_tmpl, format_selector=format_selector)
+    ydl_opts = _ydl_options(
+        out_tmpl,
+        format_selector=format_selector,
+        use_cookies=use_cookies,
+        player_clients=player_clients,
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
     files = glob.glob(os.path.join(out_dir, "out.*"))
@@ -413,13 +565,172 @@ def download_youtube_audio(
     return files[0]
 
 
+def _pick_downloadable_format_id(info: dict) -> str | None:
+    """利用可能な形式一覧から実際に URL のある音声（なければ動画+音声）を選ぶ。"""
+    formats = info.get("formats") or []
+
+    def has_stream(fmt: dict) -> bool:
+        return bool(fmt.get("url") or fmt.get("manifest_url"))
+
+    audio_only = [
+        f
+        for f in formats
+        if has_stream(f)
+        and f.get("acodec") not in (None, "none")
+        and f.get("vcodec") in (None, "none")
+    ]
+    if audio_only:
+        best = max(audio_only, key=lambda f: float(f.get("abr") or 0))
+        return str(best["format_id"])
+
+    mux = [
+        f
+        for f in formats
+        if has_stream(f)
+        and f.get("acodec") not in (None, "none")
+        and f.get("vcodec") not in (None, "none")
+    ]
+    if mux:
+        best = min(mux, key=lambda f: (float(f.get("height") or 9999), -float(f.get("abr") or 0)))
+        return str(best["format_id"])
+    return None
+
+
+def download_youtube_audio_probed(
+    url: str,
+    out_dir: str,
+    *,
+    use_cookies: bool = True,
+    player_clients: list[str] | None = None,
+) -> str:
+    """形式セレクタ文字列が全部失敗したとき、一覧から format_id を直接選んで取得。"""
+    clear_download_proxies()
+    _clear_out_files(out_dir)
+    opts = _base_ydl_opts(
+        skip_download=True,
+        use_cookies=use_cookies,
+        player_clients=player_clients,
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    fmt_id = _pick_downloadable_format_id(info or {})
+    if not fmt_id:
+        raise RuntimeError("no downloadable audio format in yt-dlp probe")
+    logger.warning(
+        "audio download using probed format_id=%s clients=%s cookies=%s",
+        fmt_id,
+        player_clients,
+        use_cookies,
+    )
+    return download_youtube_audio(
+        url,
+        out_dir,
+        format_selector=fmt_id,
+        use_cookies=use_cookies,
+        player_clients=player_clients,
+    )
+
+
+def _is_format_or_challenge_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "no video formats found",
+            "requested format is not available",
+            "sign in to confirm",
+            "not a bot",
+            "challenge solving failed",
+            "only images are available",
+        )
+    )
+
+
 def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, float, float]:
     """
     動画メタの長さと照合し、途中切断されていれば低ビットレート形式で再取得する。
     Returns (path, audio_duration_sec, video_duration_sec).
     """
     expected = youtube_video_duration_sec(url)
-    path = download_youtube_audio(url, out_dir)
+    format_attempts = [
+        _AUDIO_FORMAT,
+        _AUDIO_FORMAT_FALLBACK,
+        _AUDIO_FORMAT_ANY,
+        _AUDIO_FORMAT_MUX,
+        _AUDIO_FORMAT_BEST,
+        _AUDIO_FORMAT_LAST_RESORT,
+    ]
+
+    path = ""
+    last_err: BaseException | None = None
+    success_ctx: tuple[bool, list[str] | None] = (True, None)
+    cookie_modes = (True, False) if _resolve_yt_cookiefile() else (False,)
+    for use_cookies in cookie_modes:
+        for clients in _player_client_attempts(use_cookies=use_cookies):
+            for idx, fmt in enumerate(format_attempts):
+                try:
+                    path = download_youtube_audio(
+                        url,
+                        out_dir,
+                        format_selector=fmt,
+                        use_cookies=use_cookies,
+                        player_clients=clients,
+                    )
+                    last_err = None
+                    success_ctx = (use_cookies, clients)
+                    if idx > 0 or clients != _player_client_attempts(use_cookies=use_cookies)[0]:
+                        logger.warning(
+                            "audio download succeeded with cookies=%s clients=%s format=%s",
+                            use_cookies,
+                            clients,
+                            fmt,
+                        )
+                    break
+                except Exception as exc:
+                    last_err = exc
+                    if _is_format_or_challenge_error(exc) and idx < len(format_attempts) - 1:
+                        logger.warning(
+                            "audio download failed (%s) — retry format %s (clients=%s cookies=%s)",
+                            exc,
+                            format_attempts[idx + 1],
+                            clients,
+                            use_cookies,
+                        )
+                        continue
+                    if _is_format_or_challenge_error(exc):
+                        logger.warning(
+                            "audio download failed (%s) — try next client/cookie mode",
+                            exc,
+                        )
+                        break
+                    raise
+            if path:
+                break
+            try:
+                path = download_youtube_audio_probed(
+                    url,
+                    out_dir,
+                    use_cookies=use_cookies,
+                    player_clients=clients,
+                )
+                last_err = None
+                success_ctx = (use_cookies, clients)
+                break
+            except Exception as exc:
+                last_err = exc
+                if _is_format_or_challenge_error(exc):
+                    logger.warning(
+                        "probed audio download failed (%s) — try next client/cookie mode",
+                        exc,
+                    )
+                    continue
+                raise
+        if path:
+            break
+
+    if not path:
+        raise last_err or RuntimeError("yt-dlp produced no output file")
+
     actual = probe_media_duration_sec(path)
     if _is_audio_truncated(actual, expected):
         logger.warning(
@@ -428,7 +739,13 @@ def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, flo
             expected,
             _AUDIO_FORMAT_FALLBACK,
         )
-        path = download_youtube_audio(url, out_dir, format_selector=_AUDIO_FORMAT_FALLBACK)
+        path = download_youtube_audio(
+            url,
+            out_dir,
+            format_selector=_AUDIO_FORMAT_FALLBACK,
+            use_cookies=success_ctx[0],
+            player_clients=success_ctx[1],
+        )
         actual = probe_media_duration_sec(path)
     if _is_audio_truncated(actual, expected):
         raise RuntimeError(
@@ -444,6 +761,46 @@ def read_audio_file(path: str) -> tuple[bytes, str]:
     with open(path, "rb") as fh:
         data = fh.read()
     return data, _guess_mimetype(path)
+
+
+def supabase_storage_public_url(storage_path: str) -> str:
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    object_path = storage_path.lstrip("/")
+    return f"{base}/storage/v1/object/public/customer-uploads/{object_path}"
+
+
+def upload_to_supabase_storage(local_path: str, storage_path: str, content_type: str) -> str:
+    """Railway 上で音声を Supabase Storage に直接保存（Edge Function のメモリ節約）。"""
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not base or not key:
+        raise RuntimeError(
+            "delivery=storage には Railway の環境変数 SUPABASE_URL と "
+            "SUPABASE_SERVICE_ROLE_KEY が必要です。"
+        )
+    object_path = storage_path.lstrip("/")
+    url = f"{base}/storage/v1/object/customer-uploads/{object_path}"
+    with open(local_path, "rb") as fh:
+        payload = fh.read()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": content_type or "audio/mpeg",
+            "x-upsert": "true",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            if resp.status not in (200, 201):
+                body = resp.read(500)
+                raise RuntimeError(f"Supabase storage upload HTTP {resp.status}: {body!r}")
+    except urllib.error.HTTPError as e:
+        body = e.read(500)
+        raise RuntimeError(f"Supabase storage upload HTTP {e.code}: {body!r}") from e
+    return supabase_storage_public_url(object_path)
 
 
 @app.route("/extract", methods=["OPTIONS"])
@@ -495,18 +852,40 @@ def extract():
                 )
                 path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
                 separated = False
-        data, mime = read_audio_file(path)
+        mime = _guess_mimetype(path)
+        file_size = os.path.getsize(path)
         audio_dur = probe_media_duration_sec(path) or audio_dur
+
+        delivery = (payload.get("delivery") or "bytes").strip().lower()
+        storage_path = (payload.get("storagePath") or "").strip()
+        if delivery == "storage":
+            if not storage_path:
+                abort(400, description="storagePath is required when delivery=storage")
+            if file_size > MAX_BYTES:
+                abort(413)
+            if file_size < 256:
+                abort(502)
+            try:
+                public_url = upload_to_supabase_storage(path, storage_path, mime)
+            except RuntimeError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 502
+            return jsonify(
+                {
+                    "ok": True,
+                    "audioUrl": public_url,
+                    "vocalSeparated": separated,
+                    "audioDurationSec": audio_dur,
+                    "videoDurationSec": video_dur,
+                    "mime": mime,
+                    "byteLength": file_size,
+                }
+            )
+
+        data, mime = read_audio_file(path)
     except Exception as exc:
         logger.exception("extract failed for %s", url)
         shutil.rmtree(out_dir, ignore_errors=True)
-        detail = str(exc).strip() or exc.__class__.__name__
-        if "403" in detail or "Forbidden" in detail:
-            detail = (
-                "YouTube から音声を取得できませんでした（403）。"
-                " しばらくして再試行するか、音声ファイルを直接アップロードしてください。"
-                f" 詳細: {detail[:240]}"
-            )
+        detail = _friendly_yt_extract_error(str(exc).strip() or exc.__class__.__name__)
         return jsonify({"ok": False, "error": detail}), 502
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -592,6 +971,7 @@ def video_meta():
 
 @app.get("/health")
 def health():
+    cookie_path = _resolve_yt_cookiefile()
     return jsonify(
         {
             "ok": True,
@@ -604,6 +984,12 @@ def health():
             "downloadMaxFilesizeOnFetch": False,
             "minDurationRatio": _MIN_DURATION_RATIO,
             "rateLimit": rate_limit_config(),
+            "youtubeCookiesLoaded": bool(cookie_path),
+            "remoteComponents": _remote_components(),
+            "ytDlpVersion": yt_dlp.version.__version__,
+            "nodePath": shutil.which("node"),
+            "denoPath": shutil.which("deno"),
+            "extractBuild": _EXTRACT_BUILD,
         }
     )
 

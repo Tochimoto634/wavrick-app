@@ -20,6 +20,9 @@ Demucs を本番で有効にする場合は GPU インスタンスと `WAVRICK_V
 PROXY_SECRET=（ランダム長文字列。Supabase secrets の YOUTUBE_AUDIO_PROXY_SECRET と同一）
 WAVRICK_CORS_ORIGIN=https://wavrick.com
 PORT=8080
+# 文字起こし用（Edge のメモリ節約: 音声を Storage に直接保存）
+SUPABASE_URL=https://gdolqgcftxqxaacjyqla.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=（Supabase Dashboard → Settings → API → service_role）
 ```
 
 任意（レート制限 SEC-5）:
@@ -33,10 +36,35 @@ YouTube が Railway のデータセンター IP を拒否する場合（502 / 40
 
 ```env
 WAVRICK_YT_PROXY=socks5h://user:pass@proxy.example.com:7000
-WAVRICK_YT_PLAYER_CLIENT=tv,tv_embedded,android,web
+WAVRICK_YT_PLAYER_CLIENT=android,web
 ```
 
-住宅系プロキシが必要なケースがあります。`WAVRICK_YT_COOKIES` に cookies.txt のパスを指定することも可能です。
+住宅系プロキシが必要なケースがあります。
+
+**ボット判定**（`Sign in to confirm you're not a bot`）が出たら、ログイン済み cookies を Railway に渡す:
+
+```bash
+./scripts/export-youtube-cookies-for-railway.sh
+```
+
+Railway Variables:
+
+```env
+WAVRICK_YT_COOKIES_B64=<スクリプトが出力した base64 1行>
+```
+
+（ローカルファイルマウント可能な環境のみ `WAVRICK_YT_COOKIES=/path/to/cookies.txt` も可。cookies は数週間で再設定が必要なことがあります。）
+
+**重要:** 環境変数だけ追加では不十分です。**GitHub から Railway を再デプロイ**し、最新の `app.py`（cookies + `ejs:github` 対応）を反映してください。
+
+デプロイ後 `GET /health` で確認:
+
+```json
+"youtubeCookiesLoaded": true,
+"remoteComponents": ["ejs:github"]
+```
+
+どちらかが `false` / 空なら設定ミスです。
 
 ## 3. Supabase secrets
 

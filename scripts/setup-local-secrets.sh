@@ -51,7 +51,11 @@ fi
 
 cat >>"$DEST" <<'EOF'
 PROXY_SECRET=wavrick-local-dev-secret
-# RunPod / リモート WhisperX（ローカル 8081 不要）:
+# RunPod Serverless（推奨）— ローカル 8081 不要:
+# RUNPOD_API_KEY=rpa_...
+# RUNPOD_WHISPERX_ENDPOINT_ID=<endpoint-id>
+# → docs/whisperx-runpod-serverless.md
+# RunPod GPU Pod:
 # WHISPERX_SERVICE_URL=http://<RunPod-TCP-IP>:<外部ポート>
 # WHISPERX_SERVICE_SECRET=<Pod の env と同じ>
 # → docs/whisperx-runpod.md
