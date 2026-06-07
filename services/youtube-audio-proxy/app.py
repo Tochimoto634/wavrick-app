@@ -17,6 +17,7 @@ Docker: docker build -t wavrick-yt-audio . && docker run -e PROXY_SECRET=... -p 
 
 from __future__ import annotations
 
+import base64
 import glob
 import logging
 import os
@@ -24,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 from flask import Flask, Response, abort, jsonify, request
@@ -70,8 +73,65 @@ def _guess_mimetype(path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
+_COOKIE_CACHE_PATH: str | None = None
+
+
 def _yt_proxy() -> str:
     return os.environ.get("WAVRICK_YT_PROXY", "").strip()
+
+
+def _resolve_yt_cookiefile() -> str | None:
+    """ファイルパス / 環境変数テキスト / Base64 から yt-dlp 用 cookies.txt を用意。"""
+    global _COOKIE_CACHE_PATH
+
+    path = os.environ.get("WAVRICK_YT_COOKIES", "").strip()
+    if path and os.path.isfile(path):
+        return path
+    if _COOKIE_CACHE_PATH and os.path.isfile(_COOKIE_CACHE_PATH):
+        return _COOKIE_CACHE_PATH
+
+    text = os.environ.get("WAVRICK_YT_COOKIES_TEXT", "").strip()
+    if not text:
+        b64 = os.environ.get("WAVRICK_YT_COOKIES_B64", "").strip()
+        if b64:
+            try:
+                text = base64.b64decode(b64).decode("utf-8", errors="replace").strip()
+            except Exception:
+                logger.warning("WAVRICK_YT_COOKIES_B64 decode failed")
+                text = ""
+
+    if not text:
+        return None
+
+    fd, cache_path = tempfile.mkstemp(prefix="wavrick_yt_cookies_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else f"{text}\n")
+    _COOKIE_CACHE_PATH = cache_path
+    logger.info("YouTube cookies loaded from env (%d bytes)", len(text))
+    return cache_path
+
+
+def _friendly_yt_extract_error(detail: str) -> str:
+    if "Sign in to confirm" in detail or "not a bot" in detail.lower():
+        return (
+            "YouTube がボット判定しています（Railway の IP がブロックされています）。"
+            " 対処: ①依頼フォームで音声ファイルを直接アップロード ② Railway に YouTube ログイン済み cookies を設定"
+            "（WAVRICK_YT_COOKIES_B64・YouTube 用に絞り込み済み）。./scripts/export-youtube-cookies-for-railway.sh を参照。"
+        )
+    if "403" in detail or "Forbidden" in detail:
+        return (
+            "YouTube から音声を取得できませんでした（403）。"
+            " しばらくして再試行するか、音声ファイルを直接アップロードしてください。"
+            f" 詳細: {detail[:240]}"
+        )
+    return detail
+
+
+def _remote_components() -> list[str]:
+    raw = os.environ.get("WAVRICK_YT_REMOTE_COMPONENTS", "ejs:github").strip()
+    if raw.lower() in ("0", "false", "no", "off"):
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def _youtube_extractor_args() -> dict:
@@ -94,9 +154,12 @@ def _base_ydl_opts(**extra) -> dict:
         "force_ipv4": True,
         "extractor_args": _youtube_extractor_args(),
     }
-    cookiefile = os.environ.get("WAVRICK_YT_COOKIES", "").strip()
-    if cookiefile and os.path.isfile(cookiefile):
+    cookiefile = _resolve_yt_cookiefile()
+    if cookiefile:
         opts["cookiefile"] = cookiefile
+    remote = _remote_components()
+    if remote:
+        opts["remote_components"] = remote
     node = shutil.which("node")
     if node:
         opts["js_runtimes"] = {"node": {"path": node}}
@@ -446,6 +509,46 @@ def read_audio_file(path: str) -> tuple[bytes, str]:
     return data, _guess_mimetype(path)
 
 
+def supabase_storage_public_url(storage_path: str) -> str:
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    object_path = storage_path.lstrip("/")
+    return f"{base}/storage/v1/object/public/customer-uploads/{object_path}"
+
+
+def upload_to_supabase_storage(local_path: str, storage_path: str, content_type: str) -> str:
+    """Railway 上で音声を Supabase Storage に直接保存（Edge Function のメモリ節約）。"""
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not base or not key:
+        raise RuntimeError(
+            "delivery=storage には Railway の環境変数 SUPABASE_URL と "
+            "SUPABASE_SERVICE_ROLE_KEY が必要です。"
+        )
+    object_path = storage_path.lstrip("/")
+    url = f"{base}/storage/v1/object/customer-uploads/{object_path}"
+    with open(local_path, "rb") as fh:
+        payload = fh.read()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": content_type or "audio/mpeg",
+            "x-upsert": "true",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            if resp.status not in (200, 201):
+                body = resp.read(500)
+                raise RuntimeError(f"Supabase storage upload HTTP {resp.status}: {body!r}")
+    except urllib.error.HTTPError as e:
+        body = e.read(500)
+        raise RuntimeError(f"Supabase storage upload HTTP {e.code}: {body!r}") from e
+    return supabase_storage_public_url(object_path)
+
+
 @app.route("/extract", methods=["OPTIONS"])
 def extract_options():
     return Response("", status=204)
@@ -495,18 +598,40 @@ def extract():
                 )
                 path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
                 separated = False
-        data, mime = read_audio_file(path)
+        mime = _guess_mimetype(path)
+        file_size = os.path.getsize(path)
         audio_dur = probe_media_duration_sec(path) or audio_dur
+
+        delivery = (payload.get("delivery") or "bytes").strip().lower()
+        storage_path = (payload.get("storagePath") or "").strip()
+        if delivery == "storage":
+            if not storage_path:
+                abort(400, description="storagePath is required when delivery=storage")
+            if file_size > MAX_BYTES:
+                abort(413)
+            if file_size < 256:
+                abort(502)
+            try:
+                public_url = upload_to_supabase_storage(path, storage_path, mime)
+            except RuntimeError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 502
+            return jsonify(
+                {
+                    "ok": True,
+                    "audioUrl": public_url,
+                    "vocalSeparated": separated,
+                    "audioDurationSec": audio_dur,
+                    "videoDurationSec": video_dur,
+                    "mime": mime,
+                    "byteLength": file_size,
+                }
+            )
+
+        data, mime = read_audio_file(path)
     except Exception as exc:
         logger.exception("extract failed for %s", url)
         shutil.rmtree(out_dir, ignore_errors=True)
-        detail = str(exc).strip() or exc.__class__.__name__
-        if "403" in detail or "Forbidden" in detail:
-            detail = (
-                "YouTube から音声を取得できませんでした（403）。"
-                " しばらくして再試行するか、音声ファイルを直接アップロードしてください。"
-                f" 詳細: {detail[:240]}"
-            )
+        detail = _friendly_yt_extract_error(str(exc).strip() or exc.__class__.__name__)
         return jsonify({"ok": False, "error": detail}), 502
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -592,6 +717,7 @@ def video_meta():
 
 @app.get("/health")
 def health():
+    cookie_path = _resolve_yt_cookiefile()
     return jsonify(
         {
             "ok": True,
@@ -604,6 +730,9 @@ def health():
             "downloadMaxFilesizeOnFetch": False,
             "minDurationRatio": _MIN_DURATION_RATIO,
             "rateLimit": rate_limit_config(),
+            "youtubeCookiesLoaded": bool(cookie_path),
+            "remoteComponents": _remote_components(),
+            "ytDlpVersion": yt_dlp.version.__version__,
         }
     )
 
