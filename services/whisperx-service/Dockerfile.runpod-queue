@@ -1,0 +1,27 @@
+# RunPod Queue 型 Serverless 用（非同期 /run + /status）
+FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg git ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY constraints.runpod-serverless.txt requirements.runpod-serverless.txt \
+  install-runpod-serverless.sh verify-runpod-stack.py ./
+RUN chmod +x install-runpod-serverless.sh \
+  && ./install-runpod-serverless.sh
+
+COPY transcribe.py silence_detect.py runpod_handler.py ./
+
+ENV WHISPERX_DEVICE=cuda
+ENV WHISPERX_MODEL=large-v3
+ENV WHISPERX_COMPUTE_TYPE=float32
+ENV WHISPERX_BATCH_SIZE=16
+ENV WHISPERX_PRELOAD=1
+ENV RUNPOD_SERVERLESS=1
+ENV HF_HOME=/tmp/.cache/huggingface
+ENV TORCH_HOME=/tmp/.cache/torch
+ENV WHISPERX_VAD_MODEL_FP=/opt/whisperx-vad/pytorch_model.bin
+
+CMD ["python", "-u", "runpod_handler.py"]

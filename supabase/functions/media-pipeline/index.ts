@@ -14,7 +14,16 @@ import {
   appendTranscribeBuildMarker,
   WAVRICK_TRANSCRIBE_BUILD
 } from "../_shared/transcribe-build.ts";
-import { guessWhisperUploadFilename, transcribeWithWhisperX } from "../_shared/whisperx-client.ts";
+import {
+  canPassthroughAudioUrlToWhisperx,
+  getRunpodTranscribeStatus,
+  guessWhisperUploadFilename,
+  isRunpodAsyncMode,
+  isRunpodWhisperxMode,
+  submitRunpodTranscribeAsync,
+  transcribeWithWhisperX,
+  transcribeWithWhisperXFromUrl
+} from "../_shared/whisperx-client.ts";
 import {
   buildBracketTimelineFromWhisperX,
   buildTimelineCuesFromWhisperX,
@@ -47,10 +56,14 @@ type SpeakerInput = {
 };
 
 type PipelineBody = {
-  /** transcribe = Whisperのみ / script = 話者分け後にGrok / full = 従来の一括 */
-  mode?: "transcribe" | "script" | "full";
+  /** transcribe = Whisperのみ / prepare-audio = YouTube音声をStorageへ / status = ジョブ確認 / script / full */
+  mode?: "transcribe" | "prepare-audio" | "status" | "script" | "full";
+  /** status モードで参照する media_pipeline_jobs.id */
+  jobId?: string;
   videoUrl?: string;
   audioUrl?: string;
+  /** prepare-audio 後の transcribe で同じジョブを継続 */
+  existingJobId?: string;
   requestId?: string;
   speakerCount?: number;
   speakers?: SpeakerInput[];
@@ -135,14 +148,11 @@ async function fetchAudioFromProxy(
       "YOUTUBE_AUDIO_PROXY_URL が未設定です。services/youtube-audio-proxy をデプロイするか、body.audioUrl で音声URLを渡してください。"
     );
   }
-  const secret = (Deno.env.get("YOUTUBE_AUDIO_PROXY_SECRET") || "").trim();
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (secret) headers.Authorization = `Bearer ${secret}`;
   let r: Response;
   try {
     r = await fetch(proxyUrl, {
       method: "POST",
-      headers,
+      headers: proxyAuthHeaders(),
       body: JSON.stringify({ videoUrl, vocalSeparate })
     });
   } catch (e) {
@@ -178,20 +188,171 @@ async function fetchAudioFromProxy(
   return { buf, vocalSeparated, contentType: r.headers.get("Content-Type") };
 }
 
-async function uploadAudioToStorage(
+function pipelineRawAudioPath(
+  userId: string | null,
+  jobId: string,
+  videoId: string
+): string {
+  return userId
+    ? `${userId}/${videoId}_raw.mp3`
+    : `pipeline-temp/${jobId}_raw.mp3`;
+}
+
+function assertAudioSizeWithinLimit(byteLength: number, label: string): void {
+  if (byteLength > MAX_WHISPER_BYTES) {
+    throw new Error(
+      `${label}が大きすぎます（${byteLength} bytes）。上限は約48MBです。短い動画で試してください。`
+    );
+  }
+  if (byteLength < 256) {
+    throw new Error(`${label}が短すぎるか空です。`);
+  }
+}
+
+function proxyAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const secret = (Deno.env.get("YOUTUBE_AUDIO_PROXY_SECRET") || "").trim();
+  if (secret) headers.Authorization = `Bearer ${secret}`;
+  return headers;
+}
+
+/** Edge のメモリ節約: バイト列を抱えずストリームで Storage に保存 */
+async function streamBodyToStorage(
   admin: ReturnType<typeof createClient>,
-  userId: string,
-  videoId: string,
-  buf: Uint8Array,
-  suffix: "raw" | "cleaned"
+  storagePath: string,
+  body: ReadableStream<Uint8Array>,
+  contentType: string
 ): Promise<string> {
-  const path = `${userId}/${videoId}_${suffix}.mp3`;
-  const { error } = await admin.storage
-    .from("customer-uploads")
-    .upload(path, buf, { contentType: "audio/mpeg", upsert: true });
-  if (error) throw new Error(`Storage upload failed (${suffix}): ${error.message}`);
-  const { data } = admin.storage.from("customer-uploads").getPublicUrl(path);
+  const { error } = await admin.storage.from("customer-uploads").upload(storagePath, body, {
+    contentType,
+    upsert: true,
+    duplex: "half"
+  } as { contentType: string; upsert: boolean; duplex: string });
+  if (error) throw new Error(`Storage upload failed: ${error.message}`);
+  const { data } = admin.storage.from("customer-uploads").getPublicUrl(storagePath);
   return data.publicUrl;
+}
+
+async function fetchProxyAudioToStorage(
+  admin: ReturnType<typeof createClient>,
+  videoUrl: string,
+  storagePath: string,
+  vocalSeparate = false
+): Promise<{ publicUrl: string; vocalSeparated: boolean; audioDurationSec?: number }> {
+  const proxyUrl = Deno.env.get("YOUTUBE_AUDIO_PROXY_URL");
+  if (!proxyUrl) {
+    throw new Error("YOUTUBE_AUDIO_PROXY_URL が未設定です。");
+  }
+  let r: Response;
+  try {
+    r = await fetch(proxyUrl, {
+      method: "POST",
+      headers: proxyAuthHeaders(),
+      body: JSON.stringify({
+        videoUrl,
+        vocalSeparate,
+        delivery: "storage",
+        storagePath
+      })
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`音声プロキシへの接続に失敗しました: ${msg}`);
+  }
+
+  const contentType = (r.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+  if (contentType.includes("application/json")) {
+    const j = await r.json() as {
+      ok?: boolean;
+      error?: string;
+      audioUrl?: string;
+      vocalSeparated?: boolean;
+      audioDurationSec?: number;
+    };
+    if (!r.ok || j.ok === false) {
+      throw new Error(`音声プロキシが失敗しました (${r.status}): ${j.error || "unknown"}`);
+    }
+    const publicUrl = String(j.audioUrl || "").trim();
+    if (!publicUrl) throw new Error("音声プロキシが audioUrl を返しませんでした。");
+    if (!canPassthroughAudioUrlToWhisperx(publicUrl)) {
+      throw new Error("Storage URL を RunPod に渡せません。");
+    }
+    return {
+      publicUrl,
+      vocalSeparated: Boolean(j.vocalSeparated),
+      audioDurationSec: Number(j.audioDurationSec) > 0 ? Number(j.audioDurationSec) : undefined
+    };
+  }
+
+  if (!r.ok) {
+    const t = await r.text();
+    let detail = t.slice(0, 500);
+    try {
+      const parsed = JSON.parse(t) as { error?: string };
+      if (parsed?.error) detail = String(parsed.error);
+    } catch {
+      /* keep */
+    }
+    throw new Error(
+      `音声プロキシが旧形式で音声バイト列を返しました (${r.status})。` +
+      " Railway の youtube-audio-proxy を最新にデプロイし、環境変数 SUPABASE_URL と SUPABASE_SERVICE_ROLE_KEY を設定してください。"
+    );
+  }
+  const contentLength = Number(r.headers.get("Content-Length") || "0");
+  if (contentLength > 0) assertAudioSizeWithinLimit(contentLength, "音声");
+  if (!r.body) throw new Error("音声プロキシの応答ボディが空です。");
+
+  const mime = contentType || "audio/mpeg";
+  const publicUrl = await streamBodyToStorage(admin, storagePath, r.body, mime);
+  if (!canPassthroughAudioUrlToWhisperx(publicUrl)) {
+    throw new Error("Storage URL を RunPod に渡せません。");
+  }
+  return {
+    publicUrl,
+    vocalSeparated: r.headers.get("X-Wavrick-Vocal-Separated") === "1"
+  };
+}
+
+async function streamAudioUrlToStorage(
+  admin: ReturnType<typeof createClient>,
+  audioUrl: string,
+  storagePath: string
+): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(audioUrl);
+  } catch {
+    throw new Error("audioUrl が不正です。");
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error("audioUrl は https のみ対応です。");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "0.0.0.0" ||
+    host.endsWith(".local") ||
+    host === "metadata.google.internal"
+  ) {
+    throw new Error("この audioUrl ホストは SSRF 防止のためブロックされています。");
+  }
+
+  const r = await fetch(audioUrl, { redirect: "follow" });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`audioUrl の取得に失敗しました (${r.status}): ${t.slice(0, 300)}`);
+  }
+  const contentLength = Number(r.headers.get("Content-Length") || "0");
+  if (contentLength > 0) assertAudioSizeWithinLimit(contentLength, "audioUrl の音声");
+  if (!r.body) throw new Error("audioUrl の応答ボディが空です。");
+
+  const contentType = (r.headers.get("Content-Type") || "audio/mpeg").split(";")[0].trim();
+  const publicUrl = await streamBodyToStorage(admin, storagePath, r.body, contentType);
+  if (!canPassthroughAudioUrlToWhisperx(publicUrl)) {
+    throw new Error("Storage URL を RunPod に渡せません。");
+  }
+  return publicUrl;
 }
 
 async function fetchAudioFromUrl(audioUrl: string): Promise<Uint8Array> {
@@ -284,11 +445,7 @@ type TranscribeResult = {
   silenceGapCount: number;
 };
 
-async function transcribeWhisperX(
-  audio: Uint8Array,
-  filename: string
-): Promise<TranscribeResult> {
-  const wx = await transcribeWithWhisperX(audio, filename);
+async function buildTranscribeResult(wx: Awaited<ReturnType<typeof transcribeWithWhisperX>>): Promise<TranscribeResult> {
   const words = normalizeAlignWords(wx.words);
   const durationSec =
     Number(wx.duration) > 0
@@ -346,8 +503,7 @@ async function transcribeWhisperX(
     language: wx.language ?? null,
     duration: durationSec,
     text,
-    words: wx.words ?? [],
-    segments: wx.segments ?? [],
+    segmentCount: segments.length,
     timelineSegments: segments,
     whisperTimeline
   };
@@ -362,6 +518,260 @@ async function transcribeWhisperX(
     whisperxBuild: typeof wx.build === "number" ? wx.build : null,
     silenceGapCount: silenceGaps.length
   };
+}
+
+async function transcribeWhisperX(
+  audio: Uint8Array,
+  filename: string
+): Promise<TranscribeResult> {
+  return buildTranscribeResult(await transcribeWithWhisperX(audio, filename));
+}
+
+async function transcribeWhisperXFromUrl(audioUrl: string): Promise<TranscribeResult> {
+  return buildTranscribeResult(await transcribeWithWhisperXFromUrl(audioUrl));
+}
+
+type PipelineJobRow = {
+  id: string;
+  user_id: string | null;
+  video_url: string | null;
+  audio_url: string | null;
+  audio_source: string | null;
+  status: string;
+  step: string | null;
+  error: string | null;
+  whisper_transcript: string | null;
+  whisper_raw: Record<string, unknown> | null;
+  training_bundle: Record<string, unknown> | null;
+  models: Record<string, unknown> | null;
+  duration_ms: number | null;
+};
+
+function modelsRunpodJobId(models: Record<string, unknown> | null | undefined): string {
+  const id = models?.runpodJobId;
+  return typeof id === "string" ? id.trim() : "";
+}
+
+function buildTranscribeJsonResponse(params: {
+  jobId: string;
+  whisper: TranscribeResult;
+  whisperLang?: string;
+  durationMs: number;
+  rawAudioUrl?: string | null;
+  cleanedAudioUrl?: string | null;
+  status?: string;
+  async?: boolean;
+}): Record<string, unknown> {
+  const audioDurationSec = params.whisper.durationSec;
+  const whisperSegments = clampWhisperSegmentsToDuration(
+    params.whisper.segments,
+    audioDurationSec
+  );
+  return {
+    ok: true,
+    jobId: params.jobId,
+    mode: "transcribe",
+    status: params.status || "completed",
+    async: params.async === true,
+    whisperTranscript: appendTranscribeBuildMarker(params.whisper.text),
+    whisperLanguage: params.whisperLang ?? params.whisper.language ?? null,
+    whisperSegments,
+    whisperDurationSec: audioDurationSec,
+    whisperTimeline: appendTranscribeBuildMarker(params.whisper.whisperTimeline),
+    whisperSource: "whisperx",
+    transcribeBuild: WAVRICK_TRANSCRIBE_BUILD,
+    whisperxBuild: params.whisper.whisperxBuild,
+    silenceGapCount: params.whisper.silenceGapCount,
+    timelineLineCount: whisperSegments.length,
+    audioDurationSec,
+    durationMs: params.durationMs,
+    rawAudioUrl: params.rawAudioUrl ?? null,
+    cleanedAudioUrl: params.cleanedAudioUrl ?? null
+  };
+}
+
+function transcribeJsonResponseFromJob(
+  job: PipelineJobRow,
+  extras?: { rawAudioUrl?: string | null; cleanedAudioUrl?: string | null }
+): Record<string, unknown> {
+  const raw = (job.whisper_raw || {}) as Record<string, unknown>;
+  const segments = Array.isArray(raw.timelineSegments)
+    ? (raw.timelineSegments as LegacyWhisperSegment[])
+    : [];
+  const durationSec = Number(raw.duration) > 0 ? Number(raw.duration) : 0;
+  const whisperSegments = clampWhisperSegmentsToDuration(segments, durationSec);
+  const text = String(job.whisper_transcript || raw.text || "").trim();
+  return {
+    ok: true,
+    jobId: job.id,
+    mode: "transcribe",
+    status: "completed",
+    whisperTranscript: appendTranscribeBuildMarker(text),
+    whisperLanguage: raw.language ?? null,
+    whisperSegments,
+    whisperDurationSec: durationSec,
+    whisperTimeline: appendTranscribeBuildMarker(String(raw.whisperTimeline || "")),
+    whisperSource: "whisperx",
+    transcribeBuild: WAVRICK_TRANSCRIBE_BUILD,
+    whisperxBuild: typeof raw.build === "number" ? raw.build : null,
+    silenceGapCount: Array.isArray(raw.silenceGaps) ? raw.silenceGaps.length : null,
+    timelineLineCount: whisperSegments.length,
+    audioDurationSec: durationSec,
+    durationMs: job.duration_ms ?? null,
+    rawAudioUrl: extras?.rawAudioUrl ?? job.audio_url ?? null,
+    cleanedAudioUrl: extras?.cleanedAudioUrl ?? null
+  };
+}
+
+async function persistTranscribeJob(params: {
+  admin: ReturnType<typeof createClient>;
+  jobId: string;
+  whisper: TranscribeResult;
+  whisperLang?: string;
+  audioSource: string;
+  videoUrl: string;
+  audioUrl: string;
+  durationMs: number;
+  models?: Record<string, unknown>;
+}): Promise<void> {
+  const trainingBundle = buildTrainingBundle({
+    videoUrl: params.videoUrl || params.audioUrl,
+    transcriptLen: params.whisper.text.length,
+    audioSource: params.audioSource,
+    whisperLanguage: params.whisperLang ?? params.whisper.language,
+    segmentCount: params.whisper.segments.length
+  });
+  await params.admin
+    .from("media_pipeline_jobs")
+    .update({
+      status: "completed",
+      step: "transcribed",
+      error: null,
+      whisper_transcript: params.whisper.text,
+      whisper_raw: params.whisper.raw,
+      training_bundle: trainingBundle,
+      models: {
+        whisperx: params.whisper.raw.model ?? "whisperx",
+        ...(params.models || {})
+      },
+      duration_ms: params.durationMs,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", params.jobId);
+}
+
+async function finalizeRunpodTranscribeJob(params: {
+  admin: ReturnType<typeof createClient>;
+  job: PipelineJobRow;
+  runpodJobId: string;
+  startedMs: number;
+}): Promise<Record<string, unknown>> {
+  const rp = await getRunpodTranscribeStatus(params.runpodJobId);
+  const st = String(rp.status || "").toUpperCase();
+  if (st === "IN_QUEUE" || st === "IN_PROGRESS") {
+    return {
+      ok: true,
+      jobId: params.job.id,
+      mode: "transcribe",
+      status: "running",
+      step: params.job.step || "whisperx",
+      runpodStatus: st
+    };
+  }
+  if (st === "FAILED" || st === "CANCELLED" || st === "TIMED_OUT") {
+    const msg = String(rp.error || `RunPod ジョブが ${st} になりました。`);
+    await params.admin
+      .from("media_pipeline_jobs")
+      .update({
+        status: "failed",
+        step: "error",
+        error: msg,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", params.job.id);
+    return { ok: false, jobId: params.job.id, status: "failed", error: msg };
+  }
+  if (st !== "COMPLETED" || !rp.output) {
+    return {
+      ok: true,
+      jobId: params.job.id,
+      mode: "transcribe",
+      status: "running",
+      step: params.job.step || "whisperx",
+      runpodStatus: st || "UNKNOWN"
+    };
+  }
+
+  const whisper = await buildTranscribeResult(rp.output);
+  const durationMs = Date.now() - params.startedMs;
+  const audioSource = String(params.job.audio_source || "audio_url");
+  await persistTranscribeJob({
+    admin: params.admin,
+    jobId: params.job.id,
+    whisper,
+    whisperLang: whisper.language,
+    audioSource,
+    videoUrl: String(params.job.video_url || ""),
+    audioUrl: String(params.job.audio_url || ""),
+    durationMs,
+    models: {
+      ...(params.job.models || {}),
+      runpodJobId: params.runpodJobId,
+      whisperx: whisper.raw.model ?? "whisperx"
+    }
+  });
+  return transcribeJsonResponseFromJob(
+    {
+      ...params.job,
+      status: "completed",
+      step: "transcribed",
+      whisper_transcript: whisper.text,
+      whisper_raw: whisper.raw,
+      duration_ms: durationMs
+    },
+    { rawAudioUrl: params.job.audio_url }
+  );
+}
+
+declare const EdgeRuntime: { waitUntil: (promise: Promise<unknown>) => void };
+
+async function backgroundTranscribeJob(params: {
+  admin: ReturnType<typeof createClient>;
+  jobId: string;
+  whisperPassthroughUrl: string | null;
+  audio: Uint8Array | null;
+  filename: string;
+  audioSource: string;
+  videoUrl: string;
+  audioUrl: string;
+  startedMs: number;
+}): Promise<void> {
+  try {
+    const whisper = params.whisperPassthroughUrl
+      ? await transcribeWhisperXFromUrl(params.whisperPassthroughUrl)
+      : await transcribeWhisperX(params.audio!, params.filename);
+    await persistTranscribeJob({
+      admin: params.admin,
+      jobId: params.jobId,
+      whisper,
+      whisperLang: whisper.language,
+      audioSource: params.audioSource,
+      videoUrl: params.videoUrl,
+      audioUrl: params.audioUrl,
+      durationMs: Date.now() - params.startedMs
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await params.admin
+      .from("media_pipeline_jobs")
+      .update({
+        status: "failed",
+        step: "error",
+        error: msg,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", params.jobId);
+  }
 }
 
 async function callGrokJson<T>(system: string, userText: string): Promise<T> {
@@ -766,7 +1176,14 @@ Deno.serve(async (req) => {
     return jsonResponse({ ok: false, error: "JSON body が不正です。" }, 400);
   }
 
-  const mode = body.mode === "transcribe" || body.mode === "script" || body.mode === "full" ? body.mode : "full";
+  const mode =
+    body.mode === "transcribe" ||
+    body.mode === "prepare-audio" ||
+    body.mode === "status" ||
+    body.mode === "script" ||
+    body.mode === "full"
+      ? body.mode
+      : "full";
   const videoUrl = (body.videoUrl || "").trim();
   const audioUrl = (body.audioUrl || "").trim();
   const requestId = (body.requestId || "").trim() || null;
@@ -791,24 +1208,111 @@ Deno.serve(async (req) => {
     );
   }
 
-  const modeLimit = mediaPipelineLimits(mode);
-  const modeRl = await enforceRateLimit({
-    admin,
-    bucketPrefix: `media-pipeline:${mode}`,
-    clientKey,
-    limit: modeLimit.limit,
-    windowSec: modeLimit.windowSec
-  });
-  if (!modeRl.ok) {
-    return jsonResponse(
-      {
-        ok: false,
-        error: `この操作の利用上限（${modeLimit.limit}回/時間）に達しました。しばらく待ってから再試行してください。`,
-        retryAfterSec: modeRl.retryAfterSec
-      },
-      429,
-      rateLimitResponseHeaders(modeRl.retryAfterSec)
-    );
+  const existingJobIdForRl = (body.existingJobId || body.jobId || "").trim();
+  const skipTranscribeRl =
+    (mode === "transcribe" && Boolean((body.existingJobId || "").trim())) ||
+    mode === "status";
+
+  if (!skipTranscribeRl) {
+    const modeLimit = mediaPipelineLimits(mode);
+    const modeRl = await enforceRateLimit({
+      admin,
+      bucketPrefix: `media-pipeline:${mode}`,
+      clientKey,
+      limit: modeLimit.limit,
+      windowSec: modeLimit.windowSec
+    });
+    if (!modeRl.ok) {
+      const waitMin = Math.max(1, Math.ceil(modeRl.retryAfterSec / 60));
+      return jsonResponse(
+        {
+          ok: false,
+          error:
+            `この操作の利用上限（${modeLimit.limit}回/時間）に達しました。約${waitMin}分待ってから再試行してください。`,
+          retryAfterSec: modeRl.retryAfterSec
+        },
+        429,
+        rateLimitResponseHeaders(modeRl.retryAfterSec)
+      );
+    }
+  }
+
+  if (mode === "status") {
+    const statusJobId = (body.jobId || "").trim();
+    if (!statusJobId) {
+      return jsonResponse({ ok: false, error: "status には jobId が必要です。" }, 400);
+    }
+
+    const statusLimit = mediaPipelineLimits("status");
+    const statusRl = await enforceRateLimit({
+      admin,
+      bucketPrefix: "media-pipeline:status",
+      clientKey,
+      limit: statusLimit.limit,
+      windowSec: statusLimit.windowSec
+    });
+    if (!statusRl.ok) {
+      return jsonResponse(
+        {
+          ok: false,
+          error: "ステータス確認が多すぎます。しばらく待ってから再試行してください。",
+          retryAfterSec: statusRl.retryAfterSec
+        },
+        429,
+        rateLimitResponseHeaders(statusRl.retryAfterSec)
+      );
+    }
+
+    const { data: job, error: jobErr } = await admin
+      .from("media_pipeline_jobs")
+      .select(
+        "id, user_id, video_url, audio_url, audio_source, status, step, error, whisper_transcript, whisper_raw, training_bundle, models, duration_ms"
+      )
+      .eq("id", statusJobId)
+      .maybeSingle();
+
+    if (jobErr || !job?.id) {
+      return jsonResponse({ ok: false, error: "jobId が見つかりません。" }, 404);
+    }
+    if (userId && job.user_id && job.user_id !== userId) {
+      return jsonResponse({ ok: false, error: "このジョブを参照する権限がありません。" }, 403);
+    }
+
+    const row = job as PipelineJobRow;
+    if (row.status === "completed" && row.whisper_transcript) {
+      return jsonResponse(transcribeJsonResponseFromJob(row));
+    }
+    if (row.status === "failed") {
+      return jsonResponse(
+        { ok: false, jobId: row.id, status: "failed", error: row.error || "文字起こしに失敗しました。" },
+        422
+      );
+    }
+
+    const runpodJobId = modelsRunpodJobId(row.models);
+    if (runpodJobId) {
+      try {
+        const result = await finalizeRunpodTranscribeJob({
+          admin,
+          job: row,
+          runpodJobId,
+          startedMs: started
+        });
+        const httpStatus = result.ok === false ? 422 : 200;
+        return jsonResponse(result, httpStatus);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return jsonResponse({ ok: false, jobId: row.id, status: "running", error: msg }, 200);
+      }
+    }
+
+    return jsonResponse({
+      ok: true,
+      jobId: row.id,
+      mode: "transcribe",
+      status: row.status === "running" ? "running" : row.status || "running",
+      step: row.step || "whisperx"
+    });
   }
 
   if (mode === "script") {
@@ -927,6 +1431,82 @@ Deno.serve(async (req) => {
     }
   }
 
+  if (mode === "prepare-audio") {
+    if (!videoUrl) {
+      return jsonResponse({ ok: false, error: "prepare-audio には videoUrl が必要です。" }, 400);
+    }
+    if (!extractYouTubeVideoId(videoUrl)) {
+      return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。" }, 400);
+    }
+    if (!isRunpodWhisperxMode()) {
+      return jsonResponse(
+        { ok: false, error: "prepare-audio は RunPod 設定時のみ利用できます。" },
+        400
+      );
+    }
+
+    const { data: prepJob, error: prepInsErr } = await admin
+      .from("media_pipeline_jobs")
+      .insert({
+        user_id: userId,
+        request_id: requestId,
+        video_url: videoUrl,
+        audio_url: null,
+        audio_source: "youtube_proxy",
+        status: "running",
+        step: "extract"
+      })
+      .select("id")
+      .single();
+
+    if (prepInsErr || !prepJob?.id) {
+      return jsonResponse({ ok: false, error: prepInsErr?.message || "ジョブの作成に失敗しました。" }, 500);
+    }
+
+    const prepJobId = prepJob.id as string;
+    const prepVideoId = extractYouTubeVideoId(videoUrl) || "upload";
+    const prepStoragePath = pipelineRawAudioPath(userId, prepJobId, prepVideoId);
+
+    try {
+      const extracted = await fetchProxyAudioToStorage(admin, videoUrl, prepStoragePath, false);
+      const durationMs = Date.now() - started;
+      await admin
+        .from("media_pipeline_jobs")
+        .update({
+          status: "audio_ready",
+          step: "audio_ready",
+          audio_url: extracted.publicUrl,
+          audio_source: "youtube_proxy_storage",
+          error: null,
+          duration_ms: durationMs,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", prepJobId);
+
+      return jsonResponse({
+        ok: true,
+        jobId: prepJobId,
+        mode: "prepare-audio",
+        rawAudioUrl: extracted.publicUrl,
+        audioDurationSec: extracted.audioDurationSec ?? null,
+        durationMs,
+        transcribeBuild: WAVRICK_TRANSCRIBE_BUILD
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await admin
+        .from("media_pipeline_jobs")
+        .update({
+          status: "failed",
+          step: "error",
+          error: msg,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", prepJobId);
+      return jsonResponse({ ok: false, jobId: prepJobId, error: msg }, 422);
+    }
+  }
+
   if (!videoUrl && !audioUrl) {
     return jsonResponse({ ok: false, error: "videoUrl または audioUrl のどちらかが必要です。" }, 400);
   }
@@ -935,28 +1515,56 @@ Deno.serve(async (req) => {
     return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。" }, 400);
   }
 
-  const { data: inserted, error: insErr } = await admin
-    .from("media_pipeline_jobs")
-    .insert({
-      user_id: userId,
-      request_id: requestId,
-      video_url: videoUrl || null,
-      audio_url: audioUrl || null,
-      audio_source: "pending",
-      status: "running",
-      step: "init"
-    })
-    .select("id")
-    .single();
+  const existingJobId = (body.existingJobId || "").trim();
+  let jobId: string;
 
-  if (insErr || !inserted?.id) {
-    return jsonResponse({ ok: false, error: insErr?.message || "ジョブの作成に失敗しました。" }, 500);
+  if (existingJobId) {
+    const { data: existingJob, error: existingErr } = await admin
+      .from("media_pipeline_jobs")
+      .select("id, status, audio_url")
+      .eq("id", existingJobId)
+      .maybeSingle();
+    if (existingErr || !existingJob?.id) {
+      return jsonResponse({ ok: false, error: "existingJobId が見つかりません。" }, 404);
+    }
+    jobId = existingJob.id as string;
+    if (!audioUrl && typeof existingJob.audio_url === "string") {
+      body.audioUrl = existingJob.audio_url;
+    }
+    await admin
+      .from("media_pipeline_jobs")
+      .update({
+        status: "running",
+        step: "whisperx",
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", jobId);
+  } else {
+    const { data: inserted, error: insErr } = await admin
+      .from("media_pipeline_jobs")
+      .insert({
+        user_id: userId,
+        request_id: requestId,
+        video_url: videoUrl || null,
+        audio_url: audioUrl || null,
+        audio_source: "pending",
+        status: "running",
+        step: "init"
+      })
+      .select("id")
+      .single();
+
+    if (insErr || !inserted?.id) {
+      return jsonResponse({ ok: false, error: insErr?.message || "ジョブの作成に失敗しました。" }, 500);
+    }
+    jobId = inserted.id as string;
   }
 
-  const jobId = inserted.id as string;
+  const resolvedAudioUrl = (body.audioUrl || audioUrl || "").trim();
 
   try {
-    let audio: Uint8Array;
+    let audio: Uint8Array | null = null;
+    let whisperPassthroughUrl: string | null = null;
     let audioSource: string;
     let filename = "audio.mp3";
 
@@ -964,14 +1572,23 @@ Deno.serve(async (req) => {
     let cleanedAudioStorageUrl: string | null = null;
     const videoId = extractYouTubeVideoId(videoUrl || "") || "upload";
 
-    if (audioUrl) {
+    const rawStoragePath = pipelineRawAudioPath(userId, jobId, videoId);
+
+    if (resolvedAudioUrl) {
       audioSource = "audio_url";
-      audio = await fetchAudioFromUrl(audioUrl);
-      filename = guessWhisperUploadFilename(audio, { url: audioUrl });
-      if (userId) {
-        try {
-          rawAudioStorageUrl = await uploadAudioToStorage(admin, userId, videoId, audio, "raw");
-        } catch { /* non-critical */ }
+      if (isRunpodWhisperxMode()) {
+        if (canPassthroughAudioUrlToWhisperx(resolvedAudioUrl)) {
+          whisperPassthroughUrl = resolvedAudioUrl;
+          rawAudioStorageUrl = resolvedAudioUrl;
+        } else {
+          rawAudioStorageUrl = await streamAudioUrlToStorage(admin, resolvedAudioUrl, rawStoragePath);
+          whisperPassthroughUrl = rawAudioStorageUrl;
+        }
+      } else if (canPassthroughAudioUrlToWhisperx(resolvedAudioUrl)) {
+        whisperPassthroughUrl = resolvedAudioUrl;
+      } else {
+        audio = await fetchAudioFromUrl(resolvedAudioUrl);
+        filename = guessWhisperUploadFilename(audio, { url: resolvedAudioUrl });
       }
     } else {
       audioSource = Deno.env.get("YOUTUBE_AUDIO_PROXY_URL") ? "youtube_proxy" : "missing_proxy";
@@ -982,73 +1599,131 @@ Deno.serve(async (req) => {
       }
       await admin.from("media_pipeline_jobs").update({ step: "extract", audio_source: audioSource }).eq("id", jobId);
 
-      // Railway 本番は vocal separation OFF のため 1 回の取得で十分（2 回目は YouTube 負荷・502 の原因）
-      const audioResult = await fetchAudioFromProxy(videoUrl, false);
-      audio = audioResult.buf;
-      filename = guessWhisperUploadFilename(audio, { contentType: audioResult.contentType });
-
-      if (userId) {
-        try {
-          rawAudioStorageUrl = await uploadAudioToStorage(admin, userId, videoId, audioResult.buf, "raw");
-        } catch { /* non-critical */ }
+      if (isRunpodWhisperxMode()) {
+        const streamed = await fetchProxyAudioToStorage(admin, videoUrl, rawStoragePath, false);
+        rawAudioStorageUrl = streamed.publicUrl;
+        whisperPassthroughUrl = streamed.publicUrl;
+      } else {
+        // Pod 直結など RunPod 以外のみバイト列を保持
+        const audioResult = await fetchAudioFromProxy(videoUrl, false);
+        audio = audioResult.buf;
+        filename = guessWhisperUploadFilename(audio, { contentType: audioResult.contentType });
       }
     }
 
     await admin.from("media_pipeline_jobs").update({ step: "whisperx", audio_source: audioSource }).eq("id", jobId);
 
-    const whisper = await transcribeWhisperX(audio, filename);
-    const whisperLang = whisper.language;
+    if (isRunpodWhisperxMode()) {
+      if (!whisperPassthroughUrl) {
+        throw new Error("RunPod 用文字起こし URL を取得できませんでした（Storage 保存失敗）。");
+      }
+    } else if (!whisperPassthroughUrl && !audio) {
+      throw new Error("音声データを取得できませんでした。");
+    }
 
-    if (mode === "transcribe") {
-      const durationMs = Date.now() - started;
-      const trainingBundle = buildTrainingBundle({
-        videoUrl: videoUrl || audioUrl,
-        transcriptLen: whisper.text.length,
-        audioSource,
-        whisperLanguage: whisperLang,
-        segmentCount: whisper.segments.length
-      });
+    if (mode === "transcribe" && isRunpodAsyncMode() && whisperPassthroughUrl) {
+      let runpodJobId = "";
+      try {
+        const submitted = await submitRunpodTranscribeAsync(whisperPassthroughUrl);
+        runpodJobId = submitted.id;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn("[media-pipeline] RunPod async submit failed, using background transcribe:", msg);
+      }
+
+      if (runpodJobId) {
+        await admin
+          .from("media_pipeline_jobs")
+          .update({
+            status: "running",
+            step: "whisperx",
+            audio_url: whisperPassthroughUrl,
+            audio_source: audioSource,
+            error: null,
+            models: { runpodJobId, whisperxPending: true },
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", jobId);
+
+        return jsonResponse({
+          ok: true,
+          jobId,
+          mode: "transcribe",
+          status: "running",
+          async: true,
+          runpodJobId,
+          transcribeBuild: WAVRICK_TRANSCRIBE_BUILD,
+          rawAudioUrl: rawAudioStorageUrl ?? whisperPassthroughUrl,
+          cleanedAudioUrl: cleanedAudioStorageUrl
+        });
+      }
+
+      EdgeRuntime.waitUntil(
+        backgroundTranscribeJob({
+          admin,
+          jobId,
+          whisperPassthroughUrl,
+          audio,
+          filename,
+          audioSource,
+          videoUrl: videoUrl || "",
+          audioUrl: resolvedAudioUrl || whisperPassthroughUrl,
+          startedMs: started
+        })
+      );
 
       await admin
         .from("media_pipeline_jobs")
         .update({
-          status: "completed",
-          step: "transcribed",
+          status: "running",
+          step: "whisperx",
+          audio_url: whisperPassthroughUrl,
+          audio_source: audioSource,
           error: null,
-          whisper_transcript: whisper.text,
-          whisper_raw: whisper.raw,
-          training_bundle: trainingBundle,
-          models: { whisperx: whisper.raw.model ?? "whisperx" },
-          duration_ms: durationMs,
           updated_at: new Date().toISOString()
         })
         .eq("id", jobId);
-
-      const audioDurationSec = whisper.durationSec;
-      const whisperSegments = clampWhisperSegmentsToDuration(
-        whisper.segments,
-        audioDurationSec
-      );
 
       return jsonResponse({
         ok: true,
         jobId,
         mode: "transcribe",
-        whisperTranscript: appendTranscribeBuildMarker(whisper.text),
-        whisperLanguage: whisperLang ?? null,
-        whisperSegments,
-        whisperDurationSec: audioDurationSec,
-        whisperTimeline: appendTranscribeBuildMarker(whisper.whisperTimeline),
-        whisperSource: "whisperx",
+        status: "running",
+        async: true,
         transcribeBuild: WAVRICK_TRANSCRIBE_BUILD,
-        whisperxBuild: whisper.whisperxBuild,
-        silenceGapCount: whisper.silenceGapCount,
-        timelineLineCount: whisperSegments.length,
-        audioDurationSec,
-        durationMs,
-        rawAudioUrl: rawAudioStorageUrl,
+        rawAudioUrl: rawAudioStorageUrl ?? whisperPassthroughUrl,
         cleanedAudioUrl: cleanedAudioStorageUrl
       });
+    }
+
+    const whisper = whisperPassthroughUrl
+      ? await transcribeWhisperXFromUrl(whisperPassthroughUrl)
+      : await transcribeWhisperX(audio!, filename);
+    const whisperLang = whisper.language;
+
+    if (mode === "transcribe") {
+      const durationMs = Date.now() - started;
+      await persistTranscribeJob({
+        admin,
+        jobId,
+        whisper,
+        whisperLang,
+        audioSource,
+        videoUrl: videoUrl || audioUrl,
+        audioUrl: resolvedAudioUrl || audioUrl,
+        durationMs
+      });
+
+      return jsonResponse(
+        buildTranscribeJsonResponse({
+          jobId,
+          whisper,
+          whisperLang,
+          durationMs,
+          rawAudioUrl: rawAudioStorageUrl,
+          cleanedAudioUrl: cleanedAudioStorageUrl
+        })
+      );
     }
 
     await admin.from("media_pipeline_jobs").update({ step: "grok" }).eq("id", jobId);

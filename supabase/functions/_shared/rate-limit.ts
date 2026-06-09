@@ -112,9 +112,19 @@ export function rateLimitResponseHeaders(retryAfterSec: number): Record<string, 
 export function mediaPipelineLimits(mode: string): { limit: number; windowSec: number } {
   const hour = 3600;
   switch (mode) {
+    case "prepare-audio":
+      return {
+        limit: parsePositiveInt(Deno.env.get("WAVRICK_RL_PREPARE_AUDIO_HOUR"), 24),
+        windowSec: hour
+      };
     case "transcribe":
       return {
-        limit: parsePositiveInt(Deno.env.get("WAVRICK_RL_TRANSCRIBE_HOUR"), 8),
+        limit: parsePositiveInt(Deno.env.get("WAVRICK_RL_TRANSCRIBE_HOUR"), 24),
+        windowSec: hour
+      };
+    case "status":
+      return {
+        limit: parsePositiveInt(Deno.env.get("WAVRICK_RL_STATUS_HOUR"), 360),
         windowSec: hour
       };
     case "script":
