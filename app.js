@@ -3047,6 +3047,14 @@ function isLocalWavrickDevHost() {
 
 function formatMediaPipelineErrorMessage(raw) {
   const m = String(raw || "");
+  if (/Sign in to confirm|not a bot|ボット判定|WAVRICK_YT_COOKIES/i.test(m)) {
+    return (
+      "YouTube がボット判定しています（サーバーからの自動取得がブロックされています）。" +
+      " 今すぐ使う: 依頼フォームで「音声ファイル（mp3/m4a）」を直接アップロードして文字起こし。" +
+      " YouTube URL を使い続ける場合: Mac で ./scripts/export-youtube-cookies-for-railway.sh を実行し、" +
+      " 出た値を Railway の WAVRICK_YT_COOKIES_B64 に設定して Redeploy。"
+    );
+  }
   if (/proxy:\s*HTTP\s*502|プロキシ\s*502|YouTube から音声を取得できません/i.test(m)) {
     if (isLocalWavrickDevHost()) {
       return (
@@ -3079,6 +3087,58 @@ function formatMediaPipelineErrorMessage(raw) {
   if (/OPENAI_API_KEY|XAI_API_KEY|secrets\.env/i.test(m)) {
     return (
       `${m} ローカル開発では ${isLocalWavrickDevHost() ? "scripts/secrets.env.example を参照し .local/secrets.env を作成するか、" : ""}Supabase の secrets と同じキーを Mac に設定してください。`
+    );
+  }
+  if (/利用上限|rate_limit|429/i.test(m)) {
+    const wait = /約(\d+)分/.exec(m);
+    return (
+      (wait ? `利用上限に達しました。約${wait[1]}分待ってから再試行してください。` : m) +
+      " デバッグ中の連続再試行でもカウントされます。"
+    );
+  }
+  if (/IDLE_TIMEOUT|Gateway Timeout|504/i.test(m)) {
+    return (
+      "文字起こしがサーバーの時間制限（約2分半）を超えました。短い動画で試すか、1〜2分待って再試行してください。" +
+      " 長い動画は自動で2段階処理されます（最新 app.js が必要）。"
+    );
+  }
+  if (/compute resources|WORKER_LIMIT|Memory limit|CPU Time exceeded/i.test(m)) {
+    return (
+      "文字起こしサーバーがメモリ不足で止まりました。10分以内の動画で試してください。" +
+      " Railway の音声プロキシに SUPABASE_URL と SUPABASE_SERVICE_ROLE_KEY が設定されているか確認が必要です。"
+    );
+  }
+  if (/WHISPERX_SERVICE_URL|WhisperX が失敗|WhisperX \(/i.test(m)) {
+    if (isLocalWavrickDevHost()) {
+      if (/Invalid data found when processing input|Failed to load audio/i.test(m)) {
+        return (
+          `${m} ローカルでは YouTube 音声は mp3 ですが拡張子が m4a だと ffmpeg が失敗します。` +
+          " 最新コードで ./scripts/restart-local-ai.sh を実行してから再試行してください。"
+        );
+      }
+      return `${m} ローカル: ./scripts/start-local-ai.sh または RunPod 利用時は .local/secrets.env に RUNPOD_* を設定してください。`;
+    }
+    if (/\(502\)|\(430\)|Bad gateway|No Workers Available|runpod\.ai|RunPod GPU/i.test(m)) {
+      if (/TCP URL|WHISPERX_SERVICE_URL（/i.test(m)) {
+        return (
+          "RunPod GPU ワーカーが起動中か一時的に応答していません。1〜3分待ってから再試行してください。" +
+          " WHISPERX_SERVICE_URL（TCP URL）は不要です。Supabase secrets は RUNPOD_API_KEY と RUNPOD_WHISPERX_ENDPOINT_ID だけで足ります。"
+        );
+      }
+      if (/再試行してください|RUNPOD_WHISPERX_ENDPOINT_ID|TCP URL.*不要/i.test(m)) return m;
+      return (
+        "RunPod GPU ワーカーが起動中か一時的に応答していません。1〜3分待ってから再試行してください。" +
+        " WHISPERX_SERVICE_URL（TCP URL）は不要です。Supabase secrets は RUNPOD_API_KEY と RUNPOD_WHISPERX_ENDPOINT_ID だけで足ります。"
+      );
+    }
+    return (
+      `${m} Supabase secrets に RUNPOD_API_KEY と RUNPOD_WHISPERX_ENDPOINT_ID を設定し、media-pipeline を再デプロイしてください。` +
+      "（Serverless では WHISPERX_SERVICE_URL / WHISPERX_SERVICE_SECRET は不要です。）"
+    );
+  }
+  if (/YOUTUBE_AUDIO_PROXY_URL|音声プロキシが未設定|音声プロキシに接続/i.test(m)) {
+    return (
+      `${m} Supabase secrets に YOUTUBE_AUDIO_PROXY_URL と YOUTUBE_AUDIO_PROXY_SECRET を設定し、youtube-video-meta と media-pipeline をデプロイしてください。`
     );
   }
   if (/trycloudflare|dns error|lookup address|Name or service not known|音声プロキシ.*トンネル|Cloudflareトンネル/i.test(m)) {
@@ -3118,6 +3178,35 @@ async function invokeLocalMediaPipeline(body) {
     return { data, error: { message: String(msg) } };
   }
   return { data, error: null };
+}
+
+const YT_TRANSCRIBE_POLL_MS = 30_000;
+const YT_TRANSCRIBE_POLL_MAX_MS = 60 * 60 * 1000;
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollMediaPipelineTranscribe(jobId, onProgress) {
+  const started = Date.now();
+  let attempt = 0;
+  while (Date.now() - started < YT_TRANSCRIBE_POLL_MAX_MS) {
+    const { data, error } = await invokeMediaPipeline({ mode: "status", jobId });
+    if (error && (!data || data.ok === undefined)) {
+      throw new Error(formatMediaPipelineErrorMessage(error.message) || "ステータス確認に失敗しました。");
+    }
+    if (data?.status === "failed" || (data && data.ok === false && data.status === "failed")) {
+      throw new Error(formatMediaPipelineErrorMessage(data?.error) || "文字起こしに失敗しました。");
+    }
+    if (data?.whisperTranscript && (data.status === "completed" || data.ok === true)) {
+      return data;
+    }
+    attempt += 1;
+    if (typeof onProgress === "function") onProgress(data, attempt);
+    if (Date.now() - started >= YT_TRANSCRIBE_POLL_MAX_MS) break;
+    await sleepMs(YT_TRANSCRIBE_POLL_MS);
+  }
+  throw new Error("文字起こしがタイムアウトしました。しばらく待ってから再試行してください。");
 }
 
 async function invokeMediaPipeline(body) {
@@ -4878,16 +4967,74 @@ function bindYtPipelineWizard() {
     }
 
     try {
+      let prepData = null;
+      if (
+        !isLocalWavrickDevHost() &&
+        pipelineBody.mode === "transcribe" &&
+        pipelineBody.videoUrl &&
+        !pipelineBody.audioUrl
+      ) {
+        transcribeBtn.textContent = "音声を取得中...";
+        if (step1) {
+          step1.textContent = "YouTube から音声を取得して Storage に保存中...";
+        }
+        const prep = await invokeMediaPipeline({
+          mode: "prepare-audio",
+          videoUrl: pipelineBody.videoUrl,
+          requestId: pipelineBody.requestId
+        });
+        if (prep.error && (!prep.data || prep.data.ok === undefined)) {
+          setMessage("ytMessage", formatMediaPipelineErrorMessage(prep.error.message) || "音声の取得に失敗しました。", "err");
+          return;
+        }
+        if (!prep.data?.ok || !prep.data.rawAudioUrl) {
+          setMessage(
+            "ytMessage",
+            formatMediaPipelineErrorMessage(prep.data?.error) || "音声の取得に失敗しました。",
+            "err"
+          );
+          return;
+        }
+        prepData = prep.data;
+        pipelineBody = {
+          ...pipelineBody,
+          audioUrl: prep.data.rawAudioUrl,
+          existingJobId: prep.data.jobId
+        };
+        transcribeBtn.textContent = "文字起こし中...";
+        if (step1) {
+          step1.textContent = "WhisperX で文字起こし中...";
+        }
+      }
+
       const { data, error } = await invokeMediaPipeline(pipelineBody);
       if (error && (!data || data.ok === undefined)) {
         setMessage("ytMessage", formatMediaPipelineErrorMessage(error.message) || "文字起こしに失敗しました。", "err");
         return;
       }
-      if (data && data.ok === false) {
+      if (data && data.ok === false && !data.async) {
         setMessage("ytMessage", formatMediaPipelineErrorMessage(data.error) || "文字起こしに失敗しました。", "err");
         return;
       }
-      if (!data?.ok || !data.whisperTranscript) {
+
+      let finalData = data;
+      if (data?.async && data?.jobId) {
+        transcribeBtn.textContent = "文字起こし待機中...";
+        if (step1) {
+          step1.textContent = "WhisperX で文字起こし中（30秒ごとに進捗確認）...";
+        }
+        finalData = await pollMediaPipelineTranscribe(data.jobId, (statusData, attempt) => {
+          transcribeBtn.textContent = `文字起こし中... (${attempt * 30}秒)`;
+          const runpodStatus = statusData?.runpodStatus;
+          if (step1) {
+            step1.textContent = runpodStatus
+              ? `WhisperX 処理中（RunPod: ${runpodStatus}）...`
+              : "WhisperX で文字起こし中（30秒ごとに進捗確認）...";
+          }
+        });
+      }
+
+      if (!finalData?.ok || !finalData.whisperTranscript) {
         setMessage(
           "ytMessage",
           "文字起こし結果がありません。Edge Function media-pipeline を再デプロイしたか確認してください（mode=transcribe 対応）。",
@@ -4896,20 +5043,23 @@ function bindYtPipelineWizard() {
         return;
       }
 
-      await ingestWhisperTimingFromTranscribe(data);
-      ytTranscriptPlain = String(data.whisperTranscript || "").trim();
+      await ingestWhisperTimingFromTranscribe(finalData);
+      ytTranscriptPlain = String(finalData.whisperTranscript || "").trim();
       ytTranscriptPlainAtWhisper = ytTranscriptPlain;
       transcriptField.value = ytTranscriptSrt || ytTranscriptPlain;
-      if (data.rawAudioUrl || data.cleanedAudioUrl) {
-        storeReferenceAudioUrls(data.rawAudioUrl, data.cleanedAudioUrl);
+      if (finalData.rawAudioUrl || finalData.cleanedAudioUrl || prepData?.rawAudioUrl) {
+        storeReferenceAudioUrls(
+          finalData.rawAudioUrl || prepData?.rawAudioUrl,
+          finalData.cleanedAudioUrl
+        );
       }
       if (afterBox) afterBox.classList.remove("hidden");
       startYtSpeakerAssignFromTranscript(transcriptField);
       _wavrickSavePipelineState();
-      const ms = typeof data.durationMs === "number" ? Math.round(data.durationMs / 1000) : null;
-      const build = data.transcribeBuild;
-      const lineCount = data.timelineLineCount;
-      const gaps = data.silenceGapCount;
+      const ms = typeof finalData.durationMs === "number" ? Math.round(finalData.durationMs / 1000) : null;
+      const build = finalData.transcribeBuild;
+      const lineCount = finalData.timelineLineCount;
+      const gaps = finalData.silenceGapCount;
       const buildHint =
         build >= 8
           ? ` 末尾の [Wavrick-${build}] が見えれば最新パイプラインです。`
