@@ -9,4 +9,3 @@ COPY record-workspace.html record-booth.html oauth-done.html wavrick-share.html 
 COPY js/ ./js/
 
 EXPOSE 8080
-
