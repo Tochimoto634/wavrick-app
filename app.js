@@ -3198,7 +3198,7 @@ async function pollMediaPipelineTranscribe(jobId, onProgress) {
     if (data?.status === "failed" || (data && data.ok === false && data.status === "failed")) {
       throw new Error(formatMediaPipelineErrorMessage(data?.error) || "文字起こしに失敗しました。");
     }
-    if (data?.whisperTranscript && (data.status === "completed" || data.ok === true)) {
+    if (data?.status === "completed" && data?.whisperTranscript) {
       return data;
     }
     attempt += 1;
@@ -5018,7 +5018,11 @@ function bindYtPipelineWizard() {
       }
 
       let finalData = data;
-      if (data?.async && data?.jobId) {
+      const shouldPollTranscribe =
+        data?.jobId &&
+        !data?.whisperTranscript &&
+        (data?.async === true || data?.status === "running");
+      if (shouldPollTranscribe) {
         transcribeBtn.textContent = "文字起こし待機中...";
         if (step1) {
           step1.textContent = "WhisperX で文字起こし中（30秒ごとに進捗確認）...";
@@ -5035,9 +5039,19 @@ function bindYtPipelineWizard() {
       }
 
       if (!finalData?.ok || !finalData.whisperTranscript) {
+        const detail = [
+          finalData?.transcribeBuild != null ? `build=${finalData.transcribeBuild}` : null,
+          finalData?.status ? `status=${finalData.status}` : null,
+          finalData?.async != null ? `async=${finalData.async}` : null,
+          finalData?.error ? String(finalData.error) : null
+        ]
+          .filter(Boolean)
+          .join(" · ");
         setMessage(
           "ytMessage",
-          "文字起こし結果がありません。Edge Function media-pipeline を再デプロイしたか確認してください（mode=transcribe 対応）。",
+          "文字起こし結果がありません。" +
+            (detail ? `（${detail}）` : "") +
+            " Edge Function media-pipeline の再デプロイと RunPod 設定を確認してください。",
           "err"
         );
         return;
