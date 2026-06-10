@@ -9,10 +9,9 @@ GitHub の `main` をデプロイする設定例。
    - Repository: `Tochimoto634/wavrick-app`
    - Branch: **`main`**
    - Root Directory: **空**（リポジトリルート）
-3. **Settings → Build**
-   - Builder: **Dockerfile**
-   - Dockerfile Path: **`Dockerfile.railway-frontend`**
-   - ※ ルートの `railway.toml` は **ideal-commitment（音声プロキシ）** 用。フロントはこの Dockerfile を指定する
+3. **Settings → Config-as-code**（または Build 内の Railway Config File）
+   - **`railway.frontend.toml`** を指定
+   - ※ ルートの `railway.toml` は **ideal-commitment（音声プロキシ）** 用で UI から Dockerfile を変えられない。フロントサービスは別 toml が必要
 4. **Deployments → Deploy / Redeploy**
 
 ## 成功確認
