@@ -36,22 +36,22 @@ app = Flask(__name__)
 logger = logging.getLogger("wavrick.yt_audio")
 logging.basicConfig(level=logging.INFO)
 
-# 返却する音声の上限（Whisper 投入用 MP3 想定）。192kbps なら約 40 分弱まで。
+# 返却する音声の上限（Whisper 投入用 MP3 想定）。128kbps なら約 50 分弱まで。
 MAX_BYTES = int(os.environ.get("WAVRICK_MAX_AUDIO_BYTES", str(48 * 1024 * 1024)))
 
 # 高ビットレート単体ストリームは途中で切れることがあるため abr 上限付きで「動画全长」を優先
 _AUDIO_FORMAT = (
-    "bestaudio[ext=m4a][acodec^=mp4a][abr<=192]/"
-    "bestaudio[abr<=192]/"
+    "bestaudio[ext=m4a][acodec^=mp4a][abr<=128]/"
+    "bestaudio[abr<=128]/"
     "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 )
-_AUDIO_FORMAT_FALLBACK = "bestaudio[abr<=128]/bestaudio"
+_AUDIO_FORMAT_FALLBACK = "bestaudio[abr<=96]/bestaudio"
 _AUDIO_FORMAT_LAST_RESORT = "bestaudio/best"
 _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 2
+_EXTRACT_BUILD = 3
 # 動画長の何割未満なら「途中切断」とみなすか
 _MIN_DURATION_RATIO = float(os.environ.get("WAVRICK_AUDIO_MIN_DURATION_RATIO", "0.88"))
 
@@ -251,7 +251,7 @@ def _ydl_options(
             {
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
-                "preferredquality": "192",
+                "preferredquality": "128",
             }
         ]
     return opts
@@ -424,7 +424,7 @@ def audio_to_wav(input_path: str, wav_path: str) -> None:
 
 def wav_to_mp3(wav_path: str, mp3_path: str) -> None:
     _run_ffmpeg(
-        ["-y", "-i", wav_path, "-codec:a", "libmp3lame", "-q:a", "2", mp3_path],
+        ["-y", "-i", wav_path, "-codec:a", "libmp3lame", "-b:a", "128k", mp3_path],
         timeout=180,
     )
 

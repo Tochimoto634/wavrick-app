@@ -96,7 +96,7 @@ export YOUTUBE_AUDIO_PROXY_SECRET=your-secret
 | 401 | `Authorization: Bearer` と `PROXY_SECRET` の不一致 |
 | 429 | レート制限。`Retry-After` 秒後に再試行 |
 | タイムアウト | gunicorn `--timeout 300`。長い動画は demucs OFF 推奨 |
-| 書き起こしが途中で終わる | 旧版は yt-dlp `max_filesize` で元音声が途中切断されていた（10分→約4〜5分）。`WAVRICK_MAX_AUDIO_BYTES`（既定48MB）は **変換後** の返却のみに適用 |
+| 書き起こしが途中で終わる | 旧版は yt-dlp `max_filesize` で元音声が途中切断されていた（10分→約4〜5分）。`WAVRICK_MAX_AUDIO_BYTES`（既定48MB）は **変換後** の返却のみに適用（128kbps MP3 想定・約50分弱） |
 
 ## 6. グレースフルシャットダウン
 

@@ -42,7 +42,7 @@ import {
   rateLimitResponseHeaders
 } from "../_shared/rate-limit.ts";
 
-/** 返却 MP3 想定。48MB ≒ 192kbps で約40分弱（従来24MBは yt-dlp 途中打切りで約4〜5分止まりの原因だった） */
+/** 返却 MP3 想定。48MB ≒ 128kbps で約50分弱（従来24MBは yt-dlp 途中打切りで約4〜5分止まりの原因だった） */
 const MAX_WHISPER_BYTES = 48 * 1024 * 1024;
 const GROK_MODEL = Deno.env.get("GROK_MODEL") || "grok-4.3";
 /** 1 回の Grok に載せる行数（長尺・多話者でタイムアウトしないよう分割） */
