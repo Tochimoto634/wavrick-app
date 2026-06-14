@@ -3263,6 +3263,19 @@ async function invokeMediaPipeline(body) {
 
 const YT_CAST_SLOTS_KEY = "wavrick_yt_cast_slots";
 const YT_ASSIGN_GAP_SEC = 10;
+function buildYtSegmentPlain(segments) {
+  if (!Array.isArray(segments)) return "";
+  return segments
+    .map((s) => String(s?.text || "").trim())
+    .filter(Boolean)
+    .join("");
+}
+
+function resolveYtTranscriptPlainFromWhisper(data) {
+  const segPlain = buildYtSegmentPlain(data?.whisperSegments);
+  const whisperText = String(data?.whisperTranscript || "").trim();
+  return segPlain || whisperText;
+}
 let ytTranscriptPlain = "";
 let ytTranscriptPlainAtWhisper = "";
 /** 文字起こし欄に表示する SRT（話者割り当ては ytTranscriptPlain を使用） */
@@ -3714,14 +3727,46 @@ function formatPipelineScriptForField(data, count, slots) {
     castSlots: slots
   };
   const parts = ["--- WAVRICK_CAST ---", JSON.stringify(castMeta, null, 2), "---", ""];
-  const scriptsBySpeaker = data?.scriptsBySpeaker && typeof data.scriptsBySpeaker === "object" ? data.scriptsBySpeaker : {};
+  const scriptsBySpeaker =
+    data?.scriptsBySpeaker && typeof data.scriptsBySpeaker === "object"
+      ? data.scriptsBySpeaker
+      : {};
+  const hasPerSpeakerScripts = Object.values(scriptsBySpeaker).some((v) =>
+    String(v || "").trim()
+  );
+  const chronoBody = String(data?.script || "").trim();
+  const useChronological =
+    !hasPerSpeakerScripts &&
+    data?.timecodedByWhisper &&
+    chronoBody &&
+    /^\[(\d{1,2}):(\d{2})/m.test(chronoBody);
+
+  if (useChronological) {
+    parts.push("【台本（時系列）】");
+    const blockLines = splitYtScriptBodyIntoLines(chronoBody);
+    parts.push(blockLines.length ? blockLines.join("\n") : "（空）");
+    parts.push("");
+    parts.push("【キャスト】");
+    for (let i = 1; i <= count; i++) {
+      const slot = slots.find((s) => s.speakerIndex === i);
+      const speakerLabel = getYtSpeakerLabel(i);
+      const castLabel =
+        slot?.mode === "recruit" || slot?.mode === "omakase"
+          ? "募集"
+          : slot?.displayName || slot?.talentId || "未選択";
+      parts.push(`・${speakerLabel} → 声優: ${castLabel}`);
+    }
+    parts.push("");
+  } else {
   for (let i = 1; i <= count; i++) {
     const key = String(i);
     const bodyText = String(scriptsBySpeaker[key] || scriptsBySpeaker[i] || "").trim();
     const slot = slots.find((s) => s.speakerIndex === i);
     const speakerLabel = getYtSpeakerLabel(i);
     const castLabel =
-      slot?.mode === "omakase" ? "おまかせ" : slot?.displayName || slot?.talentId || "未選択";
+      slot?.mode === "recruit" || slot?.mode === "omakase"
+        ? "募集"
+        : slot?.displayName || slot?.talentId || "未選択";
     const blocks =
       /\d{2}:\d{2}:\d{2},\d{3}\s*-->/.test(bodyText)
         ? bodyText
@@ -3752,6 +3797,7 @@ function formatPipelineScriptForField(data, count, slots) {
       parts.push(blockLines.length ? blockLines.join("\n") : "（空）");
       parts.push("");
     });
+  }
   }
   const ref = String(data?.referenceTranslation || data?.translation || "").trim();
   if (ref) {
@@ -3886,7 +3932,10 @@ async function ingestWhisperTimingFromTranscribe(data) {
       /* ignore */
     }
   }
-  ytTranscriptPlainAtWhisper = String(data?.whisperTranscript || "").trim();
+  ytTranscriptPlainAtWhisper = resolveYtTranscriptPlainFromWhisper({
+    whisperTranscript: data?.whisperTranscript,
+    whisperSegments: ytWhisperSegments
+  });
   ytTranscriptSrt = await buildYtWhisperSrtForDisplay(
     ytWhisperSegments,
     ytWhisperDurationSec,
@@ -5058,7 +5107,7 @@ function bindYtPipelineWizard() {
       }
 
       await ingestWhisperTimingFromTranscribe(finalData);
-      ytTranscriptPlain = String(finalData.whisperTranscript || "").trim();
+      ytTranscriptPlain = resolveYtTranscriptPlainFromWhisper(finalData);
       ytTranscriptPlainAtWhisper = ytTranscriptPlain;
       transcriptField.value = ytTranscriptSrt || ytTranscriptPlain;
       if (finalData.rawAudioUrl || finalData.cleanedAudioUrl || prepData?.rawAudioUrl) {
@@ -5157,6 +5206,21 @@ function bindYtPipelineWizard() {
     genBtn.textContent = "台本生成中...";
 
     try {
+      const SA = getSpeakerAssignApi();
+      const timedAssignRanges =
+        typeof SA?.enrichAssignRangesWithWhisperTiming === "function"
+          ? SA.enrichAssignRangesWithWhisperTiming(
+              ytAssignRanges,
+              ytTranscriptPlain,
+              ytWhisperSegments,
+              ytWhisperDurationSec || 0
+            )
+          : ytAssignRanges.map((r) => ({
+              start: r.start,
+              end: r.end,
+              speakerIndex: r.speakerIndex
+            }));
+
       const { data, error } = await invokeMediaPipeline({
         mode: "script",
         videoUrl: videoUrl || undefined,
@@ -5165,7 +5229,16 @@ function bindYtPipelineWizard() {
         tone,
         whisperSegments: ytWhisperSegments.slice(0, 2500),
         whisperDurationSec: ytWhisperDurationSec || 0,
-        whisperTimeline: ytWhisperTimeline || ytTranscriptSrt || undefined
+        whisperTimeline: ytWhisperTimeline || ytTranscriptSrt || undefined,
+        transcriptPlain: ytTranscriptPlain || "",
+        assignRanges: timedAssignRanges.map((r) => ({
+          start: r.start,
+          end: r.end,
+          speakerIndex: r.speakerIndex,
+          text: ytTranscriptPlain.slice(r.start, r.end),
+          startSec: r.startSec,
+          endSec: r.endSec
+        }))
       });
       if (error && (!data || data.ok === undefined)) {
         setMessage("ytMessage", formatMediaPipelineErrorMessage(error.message) || "台本生成に失敗しました。", "err");

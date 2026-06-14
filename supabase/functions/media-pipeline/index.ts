@@ -1,13 +1,14 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
-  applyTranslationsToTimedCues,
+  buildChronologicalScriptFromWhisperTimeline,
+  buildChronologicalTimedCuesFromAssignRanges,
   buildScriptsBySpeakerFromWhisperTimeline,
-  buildTimedCuesBySpeakerFromAssignRanges,
+  chronologicalCuesToScript,
   GROK_TRANSLATE_LINES_SYSTEM,
   mergeTranslationsIntoWhisperTimeline,
   normalizeWhisperSegsForGrok,
+  scriptsBySpeakerFromChronologicalCues,
   speakerAssignmentsToPlainText,
-  timedCuesToSpeakerScript,
   whisperSegmentsToBracketTimelineText
 } from "../_shared/grok-timecode-prompt.ts";
 import {
@@ -27,6 +28,7 @@ import {
 import {
   buildBracketTimelineFromWhisperX,
   buildTimelineCuesFromWhisperX,
+  joinWordTexts,
   normalizeAlignWords,
   timelineCuesToLegacySegments,
   type LegacyWhisperSegment,
@@ -76,7 +78,13 @@ type PipelineBody = {
   /** 話者割り当て UI のプレーンテキスト（文字オフセットの基準） */
   transcriptPlain?: string;
   /** 話者割り当て範囲（ドラッグ選択） */
-  assignRanges?: { start: number; end: number; speakerIndex: number }[];
+  assignRanges?: {
+    start: number;
+    end: number;
+    speakerIndex: number;
+    startSec?: number;
+    endSec?: number;
+  }[];
 };
 
 function makeJsonResponse(corsHeaders: Record<string, string>) {
@@ -490,11 +498,23 @@ async function buildTranscribeResult(wx: Awaited<ReturnType<typeof transcribeWit
     silenceGaps,
     roughSegments
   );
-  const text =
+  const textFromCues =
     segments.map((s) => s.text).join(" ").trim() ||
     (Array.isArray(wx.segments)
       ? wx.segments.map((s) => String(s.text || "").trim()).filter(Boolean).join(" ")
       : "");
+  const textFromWords = words.length
+    ? joinWordTexts(words.map((w) => w.word))
+    : "";
+  const digitScore = (s: string) => (String(s || "").match(/\d/g) || []).length;
+  const text =
+    textFromWords &&
+    (digitScore(textFromWords) > digitScore(textFromCues) ||
+      (textFromWords.length > textFromCues.length + 3 &&
+        textFromCues.length > 0 &&
+        textFromWords.includes(textFromCues.slice(0, Math.min(24, textFromCues.length)))))
+      ? textFromWords
+      : textFromCues || textFromWords;
   if (!text) throw new Error("WhisperX の結果が空でした。");
 
   const raw: Record<string, unknown> = {
@@ -903,12 +923,12 @@ async function translatePreviewLinesWithGrok(
   previewLines: string[],
   extraUserHint = ""
 ): Promise<{ translation: string; lines: string[] }> {
-  const trimmed = previewLines.map((l) => String(l || "").trim()).filter(Boolean);
-  if (!trimmed.length) {
+  const lines = previewLines.map((l) => String(l ?? "").trim());
+  if (!lines.length) {
     return { translation: "", lines: [] };
   }
 
-  const chunks = chunkPreviewLinesForGrok(trimmed);
+  const chunks = chunkPreviewLinesForGrok(lines);
   if (chunks.length <= 1) {
     return translatePreviewLinesBatchWithGrok(trimmed, extraUserHint);
   }
@@ -920,7 +940,7 @@ async function translatePreviewLinesWithGrok(
     const chunk = chunks[bi];
     const batchHint = [
       extraUserHint,
-      `（この話者の ${offset + 1}〜${offset + chunk.length} 行目 / 全 ${trimmed.length} 行。行数・順序を変えないでください。）`
+      `（${offset + 1}〜${offset + chunk.length} 行目 / 全 ${lines.length} 行。行数・順序を変えないでください。）`
     ]
       .filter(Boolean)
       .join("\n");
@@ -1013,11 +1033,19 @@ async function scriptBySpeakersWithGrok(params: {
   durationSec?: number;
   whisperTimeline?: string;
   transcriptPlain?: string;
-  assignRanges?: { start: number; end: number; speakerIndex: number }[];
+  speakerCount?: number;
+  assignRanges?: {
+    start: number;
+    end: number;
+    speakerIndex: number;
+    startSec?: number;
+    endSec?: number;
+  }[];
 }): Promise<{
   scriptsBySpeaker: Record<string, string>;
   referenceTranslation: string;
   translatedLines: string[];
+  chronologicalScript: string;
 }> {
   if (!params.whisperSegments.length) {
     throw new Error("whisperSegments が空です。");
@@ -1027,65 +1055,69 @@ async function scriptBySpeakersWithGrok(params: {
   const dur = Number(params.durationSec) > 0 ? Number(params.durationSec) : 0;
   const assignRanges = Array.isArray(params.assignRanges) ? params.assignRanges : [];
   const transcriptPlain = String(params.transcriptPlain || "").trim();
-  const speakerCount = params.speakers.length;
+  const maxAssignSpeaker = assignRanges.reduce(
+    (m, r) => Math.max(m, Number(r.speakerIndex) || 0),
+    0
+  );
+  const maxSpeakerId = params.speakers.reduce((m, s) => Math.max(m, s.id), 0);
+  const speakerCount = Math.max(
+    Number(params.speakerCount) || 0,
+    params.speakers.length,
+    maxAssignSpeaker,
+    maxSpeakerId
+  );
+  const speakerMeta = params.speakers.map((s) => ({
+    id: s.id,
+    label: (s.label && String(s.label).trim()) || `話者${s.id}`,
+    lines: s.lines
+  }));
+  const speakerPlain = speakerAssignmentsToPlainText(speakerMeta);
 
   if (assignRanges.length && transcriptPlain) {
-    const cuesBySpeaker = buildTimedCuesBySpeakerFromAssignRanges(
+    const chronoCues = buildChronologicalTimedCuesFromAssignRanges(
       transcriptPlain,
       assignRanges,
       speakerCount,
+      speakerMeta.map(({ id, label }) => ({ id, label })),
       {
+        whisperTimeline:
+          params.whisperTimeline?.trim() ||
+          whisperSegmentsToBracketTimelineText(params.whisperSegments, dur),
         whisperSegments: params.whisperSegments,
         durationSec: dur
       }
     );
-
-    const scriptsBySpeaker: Record<string, string> = {};
-    const translatedLines: string[] = [];
-    const refParts: string[] = [];
-
-    const speakerJobs = params.speakers.map(async (s) => {
-      const key = String(s.id);
-      const cues = cuesBySpeaker[key] || [];
-      if (!cues.length) return null;
-
-      const sourceLines = cues.map((c) => c.text);
-      const hint = [
-        `話者${s.id}（${(s.label && String(s.label).trim()) || `話者${s.id}`}）`,
-        toneHint
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      const { translation, lines } = await translatePreviewLinesWithGrok(
-        sourceLines,
-        hint
-      );
-      const merged = applyTranslationsToTimedCues(cues, lines);
-      return {
-        key,
-        translation,
-        lines,
-        script: timedCuesToSpeakerScript(merged)
-      };
-    });
-
-    const results = await Promise.all(speakerJobs);
-    for (const row of results) {
-      if (!row) continue;
-      if (row.translation) refParts.push(row.translation);
-      scriptsBySpeaker[row.key] = row.script;
-      translatedLines.push(...row.lines);
+    if (!chronoCues.length) {
+      throw new Error("話者割り当てから時系列キューを組み立てられませんでした。");
     }
 
-    if (!Object.keys(scriptsBySpeaker).some((k) => scriptsBySpeaker[k]?.trim())) {
-      throw new Error("話者別プレビューから台本を組み立てられませんでした。");
+    const sourceLines = chronoCues.map((c) => c.text);
+    const hint = [
+      speakerPlain,
+      "【重要】入力行は動画の時系列順です。行数・順序を変えないでください。",
+      "各行はセリフ本文のみ。話者名 (てつや) などのラベルは付けないでください。",
+      toneHint
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const { translation: referenceTranslation, lines } =
+      await translatePreviewLinesWithGrok(sourceLines, hint);
+    const translatedCues = chronoCues.map((cue, i) => ({
+      ...cue,
+      text: (lines[i] || "").trim() || cue.text
+    }));
+    const chronologicalScript = chronologicalCuesToScript(translatedCues);
+    const scriptsBySpeaker = scriptsBySpeakerFromChronologicalCues(translatedCues);
+
+    if (!chronologicalScript.trim()) {
+      throw new Error("話者割り当てから時系列台本を組み立てられませんでした。");
     }
 
     return {
       scriptsBySpeaker,
-      referenceTranslation: refParts.join("\n").trim(),
-      translatedLines
+      referenceTranslation,
+      translatedLines: lines,
+      chronologicalScript
     };
   }
 
@@ -1093,25 +1125,24 @@ async function scriptBySpeakersWithGrok(params: {
     params.whisperTimeline?.trim() ||
     whisperSegmentsToBracketTimelineText(params.whisperSegments, dur);
 
-  const speakerPlain = speakerAssignmentsToPlainText(
-    params.speakers.map((s) => ({
-      id: s.id,
-      label: (s.label && String(s.label).trim()) || `話者${s.id}`,
-      lines: s.lines
-    }))
-  );
-
   const { translation: referenceTranslation, lines, script: mergedScript } =
     await translateWhisperTimelineWithGrok(
       whisperTimeline,
       [speakerPlain, toneHint].filter(Boolean).join("\n")
     );
 
-  const speakerRows = params.speakers.map((s) => ({ id: s.id, lines: s.lines }));
+  let chronologicalScript = buildChronologicalScriptFromWhisperTimeline(
+    whisperTimeline,
+    speakerMeta,
+    lines
+  );
+  if (!chronologicalScript.trim()) {
+    chronologicalScript = mergedScript;
+  }
 
   let scriptsBySpeaker = buildScriptsBySpeakerFromWhisperTimeline(
     whisperTimeline,
-    speakerRows,
+    speakerMeta.map((s) => ({ id: s.id, lines: s.lines })),
     lines,
     null
   );
@@ -1119,15 +1150,23 @@ async function scriptBySpeakersWithGrok(params: {
   if (params.speakers.length === 1) {
     const key = String(params.speakers[0].id);
     if (!scriptsBySpeaker[key]?.trim()) {
-      scriptsBySpeaker = { [key]: mergedScript };
+      scriptsBySpeaker = { [key]: chronologicalScript };
     }
   }
 
-  if (!Object.keys(scriptsBySpeaker).some((k) => scriptsBySpeaker[k]?.trim())) {
+  if (
+    !chronologicalScript.trim() &&
+    !Object.keys(scriptsBySpeaker).some((k) => scriptsBySpeaker[k]?.trim())
+  ) {
     throw new Error("話者別台本の組み立てに失敗しました。");
   }
 
-  return { scriptsBySpeaker, referenceTranslation, translatedLines: lines };
+  return {
+    scriptsBySpeaker,
+    referenceTranslation,
+    translatedLines: lines,
+    chronologicalScript
+  };
 }
 
 function buildTrainingBundle(params: {
@@ -1368,15 +1407,18 @@ Deno.serve(async (req) => {
         durationSec: scriptDur,
         whisperTimeline,
         transcriptPlain: String(body.transcriptPlain || "").trim() || undefined,
+        speakerCount: Number(body.speakerCount) || speakers.length,
         assignRanges: Array.isArray(body.assignRanges) ? body.assignRanges : undefined
       });
-      const combinedScript = speakers
-        .map((s) => {
-          const key = String(s.id);
-          const bodyText = grok.scriptsBySpeaker[key] || grok.scriptsBySpeaker[s.id] || "";
-          return `【${s.label}】\n${bodyText}`.trim();
-        })
-        .join("\n\n");
+      const combinedScript =
+        grok.chronologicalScript?.trim() ||
+        speakers
+          .map((s) => {
+            const key = String(s.id);
+            const bodyText = grok.scriptsBySpeaker[key] || grok.scriptsBySpeaker[s.id] || "";
+            return `【${s.label}】\n${bodyText}`.trim();
+          })
+          .join("\n\n");
       const durationMs = Date.now() - started;
 
       await admin
