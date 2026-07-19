@@ -1,14 +1,25 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
+  buildGrokTranslateLinesSystem,
+  buildGrokTranslateUserPreamble,
+  buildTranslateFidelityHint,
+  normalizeScriptLanguageCode,
+  type ScriptLanguageCode
+} from "../_shared/script-languages.ts";
+import {
   buildChronologicalScriptFromWhisperTimeline,
   buildChronologicalTimedCuesFromAssignRanges,
+  buildPlainFromWhisperTimeline,
   buildScriptsBySpeakerFromWhisperTimeline,
   chronologicalCuesToScript,
   GROK_TRANSLATE_LINES_SYSTEM,
   mergeTranslationsIntoWhisperTimeline,
+  normalizePreviewTextForCompare,
   normalizeWhisperSegsForGrok,
+  parseBracketTimelineText,
   scriptsBySpeakerFromChronologicalCues,
   speakerAssignmentsToPlainText,
+  speakerAssignmentToPlainTextSingle,
   whisperSegmentsToBracketTimelineText
 } from "../_shared/grok-timecode-prompt.ts";
 import {
@@ -26,15 +37,38 @@ import {
   transcribeWithWhisperXFromUrl
 } from "../_shared/whisperx-client.ts";
 import {
-  buildBracketTimelineFromWhisperX,
-  buildTimelineCuesFromWhisperX,
+  buildBracketTimelineFromTimelineSegments,
+  collapseExcessiveTextRepetition,
   joinWordTexts,
   normalizeAlignWords,
+  normalizeSilenceGapsFromRaw,
+  normalizeWhisperSegmentsFromRaw,
+  sanitizeAlignWordsForTranscript,
+  TRANSCRIPT_PHRASE_MAX_RUN,
   timelineCuesToLegacySegments,
+  type AlignWord,
   type LegacyWhisperSegment,
   type SilenceGap,
   type WhisperSeg
 } from "../_shared/whisperx-timeline-rules.ts";
+import {
+  adlibMarkersPreserved,
+  ADLIB_CLOSE,
+  ADLIB_OPEN,
+  buildAssignRangeDraftPipeline,
+  buildReconciledScriptPipeline,
+  extractAdlibTextsFromTranslatedLine,
+  formatScriptRowsBlock,
+  GROK_ADLIB_TRANSLATE_RULES,
+  rowToGrokLine,
+  stripAdlibMarkers,
+  type ReconcileTimingOptions,
+  type ScriptRow,
+} from "../_shared/transcript-edit-reconcile.ts";
+import {
+  joinAlignWordsCompactText,
+  joinAlignWordsDisplayText,
+} from "../_shared/word-timestamp-align.ts";
 import { corsHeadersForRequest } from "../_shared/cors.ts";
 import {
   burstLimitPerMinute,
@@ -43,6 +77,17 @@ import {
   mediaPipelineLimits,
   rateLimitResponseHeaders
 } from "../_shared/rate-limit.ts";
+import {
+  buildAdrSpeakersAndCues,
+  diarizeJsonResponseFromJob,
+  diarizeWithServiceFromUrl,
+  getRunpodDiarizeStatus,
+  isDiarizeAsyncCapable,
+  normalizeDiarizeResponse,
+  submitRunpodDiarizeAsync,
+  type DiarizeResponse,
+  type DiarizeSegment
+} from "../_shared/diarize-client.ts";
 
 /** 返却 MP3 想定。48MB ≒ 128kbps で約50分弱（従来24MBは yt-dlp 途中打切りで約4〜5分止まりの原因だった） */
 const MAX_WHISPER_BYTES = 48 * 1024 * 1024;
@@ -58,8 +103,8 @@ type SpeakerInput = {
 };
 
 type PipelineBody = {
-  /** transcribe = Whisperのみ / prepare-audio = YouTube音声をStorageへ / status = ジョブ確認 / script / full */
-  mode?: "transcribe" | "prepare-audio" | "status" | "script" | "full";
+  /** transcribe = Whisperのみ / prepare-audio = YouTube音声をStorageへ / adr-prepare = v3 ADR / status = ジョブ確認 / script / script-reconcile / full */
+  mode?: "transcribe" | "prepare-audio" | "adr-prepare" | "status" | "script" | "script-reconcile" | "full";
   /** status モードで参照する media_pipeline_jobs.id */
   jobId?: string;
   videoUrl?: string;
@@ -77,6 +122,10 @@ type PipelineBody = {
   whisperTimeline?: string;
   /** 話者割り当て UI のプレーンテキスト（文字オフセットの基準） */
   transcriptPlain?: string;
+  /** status / script で参照する文字起こしジョブ ID（単語タイムコード取得用） */
+  transcribeJobId?: string;
+  /** 文字起こし時の Whisper 原文（表示用・編集 diff の基準） */
+  transcriptPlainAtWhisper?: string;
   /** 話者割り当て範囲（ドラッグ選択） */
   assignRanges?: {
     start: number;
@@ -85,6 +134,11 @@ type PipelineBody = {
     startSec?: number;
     endSec?: number;
   }[];
+  /** 吹替台本の出力言語（ja / en / ko / zh / es） */
+  scriptLanguage?: string;
+  /** v3 ADR: 抽出する吹替トラックの言語（現状 ja のみ） */
+  targetLang?: string;
+  customerEmail?: string;
 };
 
 function makeJsonResponse(corsHeaders: Record<string, string>) {
@@ -245,12 +299,22 @@ async function fetchProxyAudioToStorage(
   admin: ReturnType<typeof createClient>,
   videoUrl: string,
   storagePath: string,
-  vocalSeparate = false
-): Promise<{ publicUrl: string; vocalSeparated: boolean; audioDurationSec?: number }> {
+  vocalSeparate = false,
+  targetLang?: string,
+  opts?: { requireDubTrack?: boolean }
+): Promise<{
+  publicUrl: string;
+  vocalSeparated: boolean;
+  audioDurationSec?: number;
+  byteLength?: number;
+  selectedFormatId?: string | null;
+  targetLang?: string | null;
+}> {
   const proxyUrl = Deno.env.get("YOUTUBE_AUDIO_PROXY_URL");
   if (!proxyUrl) {
     throw new Error("YOUTUBE_AUDIO_PROXY_URL が未設定です。");
   }
+  const lang = (targetLang || "").trim() || undefined;
   let r: Response;
   try {
     r = await fetch(proxyUrl, {
@@ -260,7 +324,9 @@ async function fetchProxyAudioToStorage(
         videoUrl,
         vocalSeparate,
         delivery: "storage",
-        storagePath
+        storagePath,
+        targetLang: lang,
+        requireDubTrack: Boolean(opts?.requireDubTrack && lang)
       })
     });
   } catch (e) {
@@ -273,12 +339,21 @@ async function fetchProxyAudioToStorage(
     const j = await r.json() as {
       ok?: boolean;
       error?: string;
+      errorCode?: string;
       audioUrl?: string;
       vocalSeparated?: boolean;
       audioDurationSec?: number;
+      byteLength?: number;
+      selectedFormatId?: string | null;
+      targetLang?: string | null;
     };
     if (!r.ok || j.ok === false) {
-      throw new Error(`音声プロキシが失敗しました (${r.status}): ${j.error || "unknown"}`);
+      const code = String(j.errorCode || "").trim();
+      const err = String(j.error || "unknown");
+      if (code === "NO_LANGUAGE_TRACK" || code === "SAME_AS_ORIGINAL" || code === "WRONG_LANGUAGE_TRACK") {
+        throw new Error(err);
+      }
+      throw new Error(`音声プロキシが失敗しました (${r.status}): ${err}`);
     }
     const publicUrl = String(j.audioUrl || "").trim();
     if (!publicUrl) throw new Error("音声プロキシが audioUrl を返しませんでした。");
@@ -288,7 +363,10 @@ async function fetchProxyAudioToStorage(
     return {
       publicUrl,
       vocalSeparated: Boolean(j.vocalSeparated),
-      audioDurationSec: Number(j.audioDurationSec) > 0 ? Number(j.audioDurationSec) : undefined
+      audioDurationSec: Number(j.audioDurationSec) > 0 ? Number(j.audioDurationSec) : undefined,
+      byteLength: Number(j.byteLength) > 0 ? Number(j.byteLength) : undefined,
+      selectedFormatId: j.selectedFormatId != null ? String(j.selectedFormatId) : null,
+      targetLang: j.targetLang != null ? String(j.targetLang) : lang || null
     };
   }
 
@@ -317,7 +395,10 @@ async function fetchProxyAudioToStorage(
   }
   return {
     publicUrl,
-    vocalSeparated: r.headers.get("X-Wavrick-Vocal-Separated") === "1"
+    vocalSeparated: r.headers.get("X-Wavrick-Vocal-Separated") === "1",
+    byteLength: contentLength > 0 ? contentLength : undefined,
+    selectedFormatId: r.headers.get("X-Wavrick-Selected-Format") || null,
+    targetLang: r.headers.get("X-Wavrick-Target-Lang") || lang || null
   };
 }
 
@@ -454,7 +535,13 @@ type TranscribeResult = {
 };
 
 async function buildTranscribeResult(wx: Awaited<ReturnType<typeof transcribeWithWhisperX>>): Promise<TranscribeResult> {
-  const words = normalizeAlignWords(wx.words);
+  const roughSegmentsRaw = Array.isArray(wx.roughSegments)
+    ? normalizeWhisperSegmentsFromRaw(wx.roughSegments)
+    : [];
+  const words = sanitizeAlignWordsForTranscript(
+    normalizeAlignWords(wx.words),
+    roughSegmentsRaw
+  );
   const durationSec =
     Number(wx.duration) > 0
       ? Number(wx.duration)
@@ -462,81 +549,80 @@ async function buildTranscribeResult(wx: Awaited<ReturnType<typeof transcribeWit
         ? Math.max(...words.map((w) => w.end))
         : 0;
 
-  const wxSegments: WhisperSeg[] = Array.isArray(wx.segments)
-    ? wx.segments
-        .map((s) => ({
-          start: Number(s.start) || 0,
-          end: Number(s.end) || 0,
-          text: String(s.text || "").trim()
-        }))
-        .filter((s) => s.text)
-    : [];
+  let displayText = "";
+  let compactText = "";
+  let silenceGapCount = 0;
 
-  const silenceGaps: SilenceGap[] = Array.isArray(wx.silenceGaps) ? wx.silenceGaps : [];
-  const roughSegments: WhisperSeg[] = Array.isArray(wx.roughSegments)
-    ? wx.roughSegments
-        .map((s) => ({
-          start: Number(s.start) || 0,
-          end: Number(s.end) || 0,
-          text: String(s.text || "").trim()
-        }))
-        .filter((s) => s.text)
-    : [];
+  if (words.length) {
+    displayText = joinAlignWordsDisplayText(words);
+    compactText = joinAlignWordsCompactText(words);
+    displayText = collapseExcessiveTextRepetition(displayText, TRANSCRIPT_PHRASE_MAX_RUN);
+    compactText = collapseExcessiveTextRepetition(compactText, TRANSCRIPT_PHRASE_MAX_RUN);
+    for (let i = 1; i < words.length; i++) {
+      const gap = words[i].start - words[i - 1].end;
+      if (gap >= 2.0 - 0.05) silenceGapCount++;
+    }
+  } else {
+    const wxSegments: WhisperSeg[] = Array.isArray(wx.segments)
+      ? wx.segments
+          .map((s) => ({
+            start: Number(s.start) || 0,
+            end: Number(s.end) || 0,
+            text: String(s.text || "").trim()
+          }))
+          .filter((s) => s.text)
+      : [];
+    compactText =
+      wxSegments.map((s) => s.text).join("").trim() ||
+      wxSegments.map((s) => s.text).join(" ").trim();
+    displayText = compactText;
+  }
 
-  const cues = buildTimelineCuesFromWhisperX(
-    words,
-    wxSegments,
-    durationSec,
-    silenceGaps,
-    roughSegments
-  );
-  const segments = timelineCuesToLegacySegments(cues);
-  const whisperTimeline = buildBracketTimelineFromWhisperX(
-    words,
-    wxSegments,
-    durationSec,
-    silenceGaps,
-    roughSegments
-  );
-  const textFromCues =
-    segments.map((s) => s.text).join(" ").trim() ||
-    (Array.isArray(wx.segments)
-      ? wx.segments.map((s) => String(s.text || "").trim()).filter(Boolean).join(" ")
-      : "");
-  const textFromWords = words.length
-    ? joinWordTexts(words.map((w) => w.word))
-    : "";
-  const digitScore = (s: string) => (String(s || "").match(/\d/g) || []).length;
-  const text =
-    textFromWords &&
-    (digitScore(textFromWords) > digitScore(textFromCues) ||
-      (textFromWords.length > textFromCues.length + 3 &&
-        textFromCues.length > 0 &&
-        textFromWords.includes(textFromCues.slice(0, Math.min(24, textFromCues.length)))))
-      ? textFromWords
-      : textFromCues || textFromWords;
-  if (!text) throw new Error("WhisperX の結果が空でした。");
+  if (!displayText.trim() && !compactText.trim()) {
+    throw new Error("WhisperX の結果が空でした。");
+  }
+  if (!displayText.trim()) displayText = compactText;
+  if (!compactText.trim()) compactText = displayText.replace(/\r?\n/g, "");
+
+  const silenceGaps = Array.isArray(wx.silenceGaps) ? wx.silenceGaps : [];
+  if (silenceGaps.length) silenceGapCount = silenceGaps.length;
+  const roughSegments = roughSegmentsRaw.map((s) => ({
+    ...s,
+    text: collapseExcessiveTextRepetition(s.text),
+  }));
+  const wxSegments = Array.isArray(wx.segments)
+    ? normalizeWhisperSegmentsFromRaw(wx.segments).map((s) => ({
+        ...s,
+        text: collapseExcessiveTextRepetition(s.text),
+      }))
+    : [];
 
   const raw: Record<string, unknown> = {
     source: "whisperx",
     model: wx.model ?? null,
     language: wx.language ?? null,
     duration: durationSec,
-    text,
-    segmentCount: segments.length,
-    timelineSegments: segments,
-    whisperTimeline
+    text: compactText,
+    displayText,
+    wordCount: words.length,
+    alignWords: words,
+    silenceGaps,
+    roughSegments,
+    segments: wxSegments,
+    segmentCount: wxSegments.length,
+    timelineSegments: [],
+    whisperTimeline: ""
   };
 
   return {
-    text,
+    text: displayText,
     raw,
-    whisperTimeline,
-    segments,
+    whisperTimeline: "",
+    segments: [],
     durationSec,
     language: typeof wx.language === "string" ? wx.language : undefined,
     whisperxBuild: typeof wx.build === "number" ? wx.build : null,
-    silenceGapCount: silenceGaps.length
+    silenceGapCount
   };
 }
 
@@ -565,6 +651,10 @@ type PipelineJobRow = {
   training_bundle: Record<string, unknown> | null;
   models: Record<string, unknown> | null;
   duration_ms: number | null;
+  pipeline_kind?: string | null;
+  target_lang?: string | null;
+  diarization_raw?: Record<string, unknown> | null;
+  request_id?: string | null;
 };
 
 function modelsRunpodJobId(models: Record<string, unknown> | null | undefined): string {
@@ -794,7 +884,379 @@ async function backgroundTranscribeJob(params: {
   }
 }
 
-async function callGrokJson<T>(system: string, userText: string): Promise<T> {
+function normalizeTargetLang(raw: string | undefined): string {
+  const code = String(raw || "ja").trim().toLowerCase().split("-")[0];
+  return code || "ja";
+}
+
+function targetLangDisplayName(code: string): string {
+  const map: Record<string, string> = {
+    ja: "日本語",
+    en: "英語",
+    ko: "韓国語",
+    zh: "中国語",
+    es: "スペイン語"
+  };
+  return map[code] || code;
+}
+
+type ProxyExtractedAudio = {
+  publicUrl: string;
+  vocalSeparated: boolean;
+  audioDurationSec?: number;
+  byteLength?: number;
+  selectedFormatId?: string | null;
+  targetLang?: string | null;
+};
+
+/**
+ * ADR: 翻訳先吹替トラックは必ず原盤と別物でなければならない。
+ * 同一バイト長・同一尺・同一 format なら「吹替が取れていない」とみなして失敗させる。
+ */
+function assertDistinctTargetLangAudio(
+  targetLang: string,
+  extracted: ProxyExtractedAudio,
+  original: ProxyExtractedAudio
+): void {
+  const name = targetLangDisplayName(targetLang);
+  if (!extracted.publicUrl) {
+    throw new Error(
+      `${name}の吹替トラックを取得できませんでした。\n` +
+        `YouTube Studio で${name}の音声トラックを追加・公開してから再度お試しください。`
+    );
+  }
+  if (extracted.publicUrl === original.publicUrl) {
+    throw new Error(
+      `${name}の吹替トラックを取得できませんでした（オリジナルと同じ音声 URL でした）。\n` +
+        `YouTube Studio で${name}の AI 吹替／追加音声トラックを公開してから再度お試しください。`
+    );
+  }
+
+  const tBytes = Number(extracted.byteLength) || 0;
+  const oBytes = Number(original.byteLength) || 0;
+  const tDur = Number(extracted.audioDurationSec) || 0;
+  const oDur = Number(original.audioDurationSec) || 0;
+  const sameBytes = tBytes > 0 && oBytes > 0 && tBytes === oBytes;
+  const sameDuration = tDur > 0 && oDur > 0 && Math.abs(tDur - oDur) < 0.15;
+  const tFmt = String(extracted.selectedFormatId || "").trim();
+  const oFmt = String(original.selectedFormatId || "").trim();
+  const sameFormat = Boolean(tFmt && oFmt && tFmt === oFmt);
+
+  if (sameBytes || (sameDuration && sameFormat) || (sameDuration && sameBytes)) {
+    throw new Error(
+      `選択した翻訳先言語（${name}）の吹替トラックを正しく取得できませんでした。\n` +
+        `抽出結果がオリジナル音声と同じでした。\n` +
+        `この動画に${name}トラックがある場合でも、音声プロキシ（yt-dlp / cookies）が吹替ストリームを取り違えることがあります。\n` +
+        `① YouTube Studio で${name}の AI 吹替トラックが公開されているか確認\n` +
+        `② 音声プロキシを最新に再デプロイし、YouTube cookies が有効か確認してから再度お試しください。`
+    );
+  }
+}
+
+async function persistDiarizeJob(params: {
+  admin: ReturnType<typeof createClient>;
+  jobId: string;
+  diarize: DiarizeResponse;
+  audioSource: string;
+  videoUrl: string;
+  audioUrl: string;
+  targetLang: string;
+  durationMs: number;
+  models?: Record<string, unknown>;
+}): Promise<void> {
+  await params.admin
+    .from("media_pipeline_jobs")
+    .update({
+      status: "completed",
+      step: "diarized",
+      error: null,
+      pipeline_kind: "v3_diarize",
+      target_lang: params.targetLang,
+      diarization_raw: params.diarize,
+      models: {
+        diarize: params.diarize.source ?? "pyannote",
+        ...(params.models || {})
+      },
+      duration_ms: params.durationMs,
+      updated_at: new Date().toISOString()
+    })
+    .eq("id", params.jobId);
+}
+
+function originalAudioFromJobModels(models: unknown): string {
+  if (!models || typeof models !== "object") return "";
+  const m = models as Record<string, unknown>;
+  return String(m.originalAudioUrl || m.original_audio_url || "").trim();
+}
+
+async function upsertAdrProject(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string;
+  customerUserId: string | null;
+  customerEmail: string | null;
+  videoUrl: string;
+  targetLang: string;
+  audioUrl: string;
+  originalAudioUrl?: string | null;
+  extractMeta?: Record<string, unknown> | null;
+  audioDurationSec?: number | null;
+  pipelineJobId: string;
+  segments: DiarizeSegment[];
+}): Promise<string | null> {
+  const { speakers, cues } = buildAdrSpeakersAndCues(params.segments);
+  const originalAudioUrl = String(params.originalAudioUrl || "").trim() || null;
+  const extractMeta = params.extractMeta || {
+    targetLang: params.targetLang,
+    targetAudioUrl: params.audioUrl,
+    originalAudioUrl,
+    audioDurationSec: params.audioDurationSec ?? null
+  };
+  const row = {
+    request_id: params.requestId,
+    customer_user_id: params.customerUserId,
+    customer_email: params.customerEmail,
+    video_url: params.videoUrl,
+    target_lang: params.targetLang,
+    audio_url: params.audioUrl,
+    original_audio_url: originalAudioUrl,
+    extract_meta: extractMeta,
+    audio_duration_sec:
+      params.audioDurationSec != null && Number(params.audioDurationSec) > 0
+        ? Number(params.audioDurationSec)
+        : null,
+    pipeline_job_id: params.pipelineJobId,
+    speakers,
+    cues,
+    status: "editing",
+    updated_at: new Date().toISOString()
+  };
+  const { data, error } = await params.admin
+    .from("adr_projects")
+    .upsert(row, { onConflict: "request_id" })
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    console.error("[media-pipeline] adr_projects upsert failed", error.message);
+    return null;
+  }
+  return (data?.id as string) || null;
+}
+
+async function notifyAdrReady(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string;
+  customerEmail: string | null;
+  targetLang: string;
+}): Promise<void> {
+  const email = (params.customerEmail || "").trim().toLowerCase();
+  if (!email) return;
+  const langLabel = params.targetLang === "ja" ? "日本語" : params.targetLang;
+  const editorUrl = `./adr-region-editor.html?requestId=${encodeURIComponent(params.requestId)}`;
+  const notificationId = `ntf_adr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  await params.admin.from("notifications_public").insert({
+    id: notificationId,
+    requestId: params.requestId,
+    text: `${langLabel}吹替トラックの話者分離が完了しました。Region 編集画面で区間を確認・修正してください: ${editorUrl}`,
+    kind: "system",
+    target_role: "customer",
+    target_emails: [email],
+    category: "request",
+    target_mode: "users",
+    admin_sent: false,
+    read: false,
+    created_at: new Date().toISOString()
+  });
+}
+
+async function finalizeRunpodDiarizeJob(params: {
+  admin: ReturnType<typeof createClient>;
+  job: PipelineJobRow;
+  runpodJobId: string;
+  startedMs: number;
+  customerEmail: string | null;
+}): Promise<Record<string, unknown>> {
+  const rp = await getRunpodDiarizeStatus(params.runpodJobId);
+  const st = String(rp.status || "").toUpperCase();
+  if (st === "IN_QUEUE" || st === "IN_PROGRESS") {
+    return {
+      ok: true,
+      jobId: params.job.id,
+      mode: "diarize",
+      status: "running",
+      step: params.job.step || "diarize",
+      runpodStatus: st
+    };
+  }
+  if (st === "FAILED" || st === "CANCELLED" || st === "TIMED_OUT") {
+    const msg = String(rp.error || `RunPod ジョブが ${st} になりました。`);
+    await params.admin
+      .from("media_pipeline_jobs")
+      .update({
+        status: "failed",
+        step: "error",
+        error: msg,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", params.job.id);
+    return { ok: false, jobId: params.job.id, status: "failed", error: msg };
+  }
+  if (st !== "COMPLETED" || !rp.output) {
+    return {
+      ok: true,
+      jobId: params.job.id,
+      mode: "diarize",
+      status: "running",
+      step: params.job.step || "diarize",
+      runpodStatus: st || "UNKNOWN"
+    };
+  }
+
+  let diarize: DiarizeResponse;
+  try {
+    diarize = normalizeDiarizeResponse(rp.output);
+  } catch (normErr) {
+    const msg = normErr instanceof Error ? normErr.message : String(normErr);
+    await params.admin
+      .from("media_pipeline_jobs")
+      .update({ status: "failed", step: "error", error: msg, updated_at: new Date().toISOString() })
+      .eq("id", params.job.id);
+    return { ok: false, jobId: params.job.id, status: "failed", error: msg };
+  }
+  const segments = Array.isArray(diarize.segments) ? diarize.segments : [];
+
+  const durationMs = Date.now() - params.startedMs;
+  const targetLang = normalizeTargetLang(params.job.target_lang || "ja");
+  await persistDiarizeJob({
+    admin: params.admin,
+    jobId: params.job.id,
+    diarize,
+    audioSource: String(params.job.audio_source || "audio_url"),
+    videoUrl: String(params.job.video_url || ""),
+    audioUrl: String(params.job.audio_url || ""),
+    targetLang,
+    durationMs,
+    models: {
+      ...(params.job.models || {}),
+      runpodJobId: params.runpodJobId
+    }
+  });
+
+  let adrProjectId: string | null = null;
+  const reqId = String(params.job.request_id || "").trim();
+  if (reqId) {
+    const originalAudioUrl = originalAudioFromJobModels(params.job.models);
+    adrProjectId = await upsertAdrProject({
+      admin: params.admin,
+      requestId: reqId,
+      customerUserId: params.job.user_id,
+      customerEmail: params.customerEmail,
+      videoUrl: String(params.job.video_url || ""),
+      targetLang,
+      audioUrl: String(params.job.audio_url || ""),
+      originalAudioUrl,
+      extractMeta: {
+        targetLang,
+        targetAudioUrl: String(params.job.audio_url || ""),
+        originalAudioUrl: originalAudioUrl || null
+      },
+      pipelineJobId: params.job.id,
+      segments
+    });
+    await notifyAdrReady({
+      admin: params.admin,
+      requestId: reqId,
+      customerEmail: params.customerEmail,
+      targetLang
+    });
+  }
+
+  return diarizeJsonResponseFromJob(
+    {
+      ...params.job,
+      status: "completed",
+      step: "diarized",
+      target_lang: targetLang,
+      diarization_raw: diarize,
+      duration_ms: durationMs
+    },
+    adrProjectId
+  );
+}
+
+async function backgroundDiarizeJob(params: {
+  admin: ReturnType<typeof createClient>;
+  jobId: string;
+  audioUrl: string;
+  originalAudioUrl?: string | null;
+  extractMeta?: Record<string, unknown> | null;
+  audioDurationSec?: number | null;
+  videoUrl: string;
+  targetLang: string;
+  audioSource: string;
+  requestId: string | null;
+  customerEmail: string | null;
+  customerUserId: string | null;
+  startedMs: number;
+}): Promise<void> {
+  try {
+    const diarize = await diarizeWithServiceFromUrl(params.audioUrl);
+    const segments = Array.isArray(diarize.segments) ? diarize.segments : [];
+    if (!segments.length) throw new Error("話者分離の結果が空でした。");
+    await persistDiarizeJob({
+      admin: params.admin,
+      jobId: params.jobId,
+      diarize,
+      audioSource: params.audioSource,
+      videoUrl: params.videoUrl,
+      audioUrl: params.audioUrl,
+      targetLang: params.targetLang,
+      durationMs: Date.now() - params.startedMs,
+      models: {
+        originalAudioUrl: params.originalAudioUrl || null,
+        extractMeta: params.extractMeta || null
+      }
+    });
+    if (params.requestId) {
+      await upsertAdrProject({
+        admin: params.admin,
+        requestId: params.requestId,
+        customerUserId: params.customerUserId,
+        customerEmail: params.customerEmail,
+        videoUrl: params.videoUrl,
+        targetLang: params.targetLang,
+        audioUrl: params.audioUrl,
+        originalAudioUrl: params.originalAudioUrl,
+        extractMeta: params.extractMeta,
+        audioDurationSec: params.audioDurationSec,
+        pipelineJobId: params.jobId,
+        segments
+      });
+      await notifyAdrReady({
+        admin: params.admin,
+        requestId: params.requestId,
+        customerEmail: params.customerEmail,
+        targetLang: params.targetLang
+      });
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await params.admin
+      .from("media_pipeline_jobs")
+      .update({
+        status: "failed",
+        step: "error",
+        error: msg,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", params.jobId);
+  }
+}
+
+async function callGrokJson<T>(
+  system: string,
+  userText: string,
+  temperature = 0.1
+): Promise<T> {
   const key = Deno.env.get("XAI_API_KEY");
   if (!key) throw new Error("XAI_API_KEY が未設定です（Grok / xAI）。");
 
@@ -806,7 +1268,7 @@ async function callGrokJson<T>(system: string, userText: string): Promise<T> {
     },
     body: JSON.stringify({
       model: GROK_MODEL,
-      temperature: 0.25,
+      temperature,
       messages: [
         { role: "system", content: system },
         { role: "user", content: userText }
@@ -836,8 +1298,15 @@ async function callGrokJson<T>(system: string, userText: string): Promise<T> {
 const GROK_JSON_OUTPUT_RULES = [
   "応答は有効な JSON のみ（説明文・コードフェンス禁止）。",
   'lines は入力と同じ行数の配列。各要素は吹替セリフ本文のみ（タイムコード [ ] を含めない）。',
-  "行の追加・削除・順序変更は禁止。"
+  "行の追加・削除・順序変更は禁止。",
+  "各行の意味内容を省略・要約しない（忠実翻訳）。"
 ].join("\n");
+
+const GROK_TRANSLATE_USER_PREAMBLE = buildGrokTranslateUserPreamble("ja");
+
+function resolveScriptLanguage(body?: PipelineBody | null): ScriptLanguageCode {
+  return normalizeScriptLanguageCode(body?.scriptLanguage);
+}
 
 function resolveWhisperTimeline(
   body: PipelineBody,
@@ -878,29 +1347,32 @@ function chunkPreviewLinesForGrok(
 
 async function translatePreviewLinesBatchWithGrok(
   previewLines: string[],
-  extraUserHint = ""
+  extraUserHint = "",
+  options: { includeAdlibRules?: boolean; scriptLanguage?: ScriptLanguageCode } = {}
 ): Promise<{ translation: string; lines: string[] }> {
+  const lang = options.scriptLanguage ?? "ja";
   const numbered = previewLines
     .map((line, i) => `${i + 1}. ${String(line || "").trim()}`)
     .join("\n");
   const userText = [
-    "【話者別プレビューのセリフ（行数・順序厳守）】",
-    "各行を必ず日本語の吹替に翻訳してください（原語のまま返さない）。",
-    "タイムコード [ ] は出力しないでください。",
-    "",
+    buildGrokTranslateUserPreamble(lang),
     numbered,
     extraUserHint ? `\n${extraUserHint}` : ""
   ]
     .filter(Boolean)
     .join("\n");
 
-  const system = [
-    GROK_TRANSLATE_LINES_SYSTEM,
+  const systemParts = [
+    buildGrokTranslateLinesSystem(lang),
     "",
     "次の JSON のみを返してください:",
-    '{"translation":"参考訳（短くてよい）","lines":["1行目の吹替のみ","2行目…"]}',
+    '{"translation":"参考訳","lines":["1行目の吹替のみ","2行目…"]}',
     GROK_JSON_OUTPUT_RULES
-  ].join("\n");
+  ];
+  if (options.includeAdlibRules) {
+    systemParts.push("", GROK_ADLIB_TRANSLATE_RULES);
+  }
+  const system = systemParts.join("\n");
 
   const parsed = await callGrokJson<{ translation?: string; lines?: string[] }>(
     system,
@@ -919,9 +1391,103 @@ async function translatePreviewLinesBatchWithGrok(
   return { translation, lines };
 }
 
+async function translateSingleScriptRowWithGrok(
+  sourceLine: string,
+  lineNumber: number,
+  totalLines: number,
+  extraUserHint = "",
+  scriptLanguage: ScriptLanguageCode = "ja"
+): Promise<string> {
+  const userText = [
+    buildGrokTranslateUserPreamble(scriptLanguage),
+    `1. ${String(sourceLine || "").trim()}`,
+    `（全 ${totalLines} 行中 ${lineNumber} 行目。追加台詞マーカー \\uE000 \\uE001 を必ず保持してください。）`,
+    extraUserHint ? `\n${extraUserHint}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const system = [
+    buildGrokTranslateLinesSystem(scriptLanguage),
+    "",
+    GROK_ADLIB_TRANSLATE_RULES,
+    "",
+    "次の JSON のみを返してください:",
+    '{"lines":["訳文1行のみ"]}',
+    "lines は1要素のみ。\\uE000 と \\uE001 マーカーの数と順序を入力と同じにする。"
+  ].join("\n");
+
+  const parsed = await callGrokJson<{ lines?: string[] }>(system, userText, 0.05);
+  const lines = Array.isArray(parsed.lines) ? parsed.lines : [];
+  return String(lines[0] ?? "").trim();
+}
+
+async function translateScriptRowPartsWithGrok(
+  row: ScriptRow,
+  lineNumber: number,
+  totalLines: number,
+  extraUserHint = "",
+  scriptLanguage: ScriptLanguageCode = "ja"
+): Promise<string> {
+  const chunks: string[] = [];
+  for (const part of row.parts) {
+    const src = part.kind === "adlib" ? part.text : part.text;
+    if (!String(src || "").trim()) continue;
+    const translated = await translateSingleScriptRowWithGrok(
+      src,
+      lineNumber,
+      totalLines,
+      extraUserHint,
+      scriptLanguage
+    );
+    const body = stripAdlibMarkers(translated);
+    if (part.kind === "adlib") {
+      chunks.push(`${ADLIB_OPEN}${body}${ADLIB_CLOSE}`);
+    } else {
+      chunks.push(body);
+    }
+  }
+  return chunks.join("");
+}
+
+async function translateScriptRowsWithGrok(
+  sourceLines: string[],
+  extraUserHint = "",
+  scriptLanguage: ScriptLanguageCode = "ja"
+): Promise<{ translation: string; lines: string[] }> {
+  const hasAdlib = sourceLines.some((l) => /\uE000|【ADLIB】/.test(l));
+  const { translation, lines } = await translatePreviewLinesWithGrok(sourceLines, extraUserHint, {
+    includeAdlibRules: hasAdlib,
+    scriptLanguage
+  });
+
+  if (!hasAdlib) return { translation, lines };
+
+  const out = [...lines];
+  for (let i = 0; i < sourceLines.length; i++) {
+    if (adlibMarkersPreserved(sourceLines[i], out[i] || "")) continue;
+    const retried = await translateSingleScriptRowWithGrok(
+      sourceLines[i],
+      i + 1,
+      sourceLines.length,
+      extraUserHint,
+      scriptLanguage
+    );
+    if (retried && adlibMarkersPreserved(sourceLines[i], retried)) {
+      out[i] = retried;
+      continue;
+    }
+    throw new Error(
+      `行 ${i + 1} の追加台詞マーカーを翻訳後も保持できませんでした。入力行: ${sourceLines[i].slice(0, 80)}`
+    );
+  }
+  return { translation, lines: out };
+}
+
 async function translatePreviewLinesWithGrok(
   previewLines: string[],
-  extraUserHint = ""
+  extraUserHint = "",
+  options: { includeAdlibRules?: boolean; scriptLanguage?: ScriptLanguageCode } = {}
 ): Promise<{ translation: string; lines: string[] }> {
   const lines = previewLines.map((l) => String(l ?? "").trim());
   if (!lines.length) {
@@ -930,7 +1496,7 @@ async function translatePreviewLinesWithGrok(
 
   const chunks = chunkPreviewLinesForGrok(lines);
   if (chunks.length <= 1) {
-    return translatePreviewLinesBatchWithGrok(trimmed, extraUserHint);
+    return translatePreviewLinesBatchWithGrok(lines, extraUserHint, options);
   }
 
   const allLines: string[] = [];
@@ -944,12 +1510,13 @@ async function translatePreviewLinesWithGrok(
     ]
       .filter(Boolean)
       .join("\n");
-    const { translation, lines } = await translatePreviewLinesBatchWithGrok(
+    const { translation, lines: batchLines } = await translatePreviewLinesBatchWithGrok(
       chunk,
-      batchHint
+      batchHint,
+      options
     );
     if (translation) refParts.push(translation);
-    allLines.push(...lines);
+    allLines.push(...batchLines);
     offset += chunk.length;
   }
   return { translation: refParts.join("\n").trim(), lines: allLines };
@@ -959,11 +1526,14 @@ async function translateWhisperTimelineWithGrok(
   whisperTimeline: string,
   extraUserHint = ""
 ): Promise<{ translation: string; lines: string[]; script: string }> {
+  const canon = parseBracketTimelineText(whisperTimeline);
+  const sourceLines = canon.map((r) => r.text);
+  const numbered = sourceLines
+    .map((line, i) => `${i + 1}. ${String(line || "").trim()}`)
+    .join("\n");
   const userText = [
-    "【WhisperX タイムコード付き書き起こし（行数・順序厳守）】",
-    "各行のセリフを必ず日本語の吹替に翻訳してください（原語のまま返さない）。タイムコードは出力しないでください。",
-    "",
-    whisperTimeline,
+    GROK_TRANSLATE_USER_PREAMBLE,
+    numbered,
     extraUserHint ? `\n${extraUserHint}` : ""
   ]
     .filter(Boolean)
@@ -973,7 +1543,7 @@ async function translateWhisperTimelineWithGrok(
     GROK_TRANSLATE_LINES_SYSTEM,
     "",
     "次の JSON のみを返してください:",
-    '{"translation":"参考訳（短くてよい）","lines":["1行目の吹替のみ","2行目…"]}',
+    '{"translation":"参考訳","lines":["1行目の吹替のみ","2行目…"]}',
     GROK_JSON_OUTPUT_RULES
   ].join("\n");
 
@@ -981,9 +1551,15 @@ async function translateWhisperTimelineWithGrok(
     system,
     userText
   );
-  const lines = Array.isArray(parsed.lines)
+  let lines = Array.isArray(parsed.lines)
     ? parsed.lines.map((l) => String(l ?? "").trim())
     : [];
+  if (lines.length > sourceLines.length) {
+    lines = lines.slice(0, sourceLines.length);
+  }
+  while (lines.length < sourceLines.length) {
+    lines.push("");
+  }
   const script = mergeTranslationsIntoWhisperTimeline(whisperTimeline, lines);
   const translation = typeof parsed.translation === "string" ? parsed.translation : "";
   return { translation, lines, script };
@@ -1026,6 +1602,275 @@ function normalizeSpeakers(body: PipelineBody): SpeakerInput[] {
   return out;
 }
 
+function loadAlignWordsFromJobRaw(raw: Record<string, unknown> | null | undefined): AlignWord[] {
+  if (!raw) return [];
+  const fromAlign = normalizeAlignWords(raw.alignWords);
+  if (fromAlign.length) return fromAlign;
+  return normalizeAlignWords(raw.words);
+}
+
+async function loadAlignWordsFromTranscribeJob(
+  admin: ReturnType<typeof createClient>,
+  jobId: string,
+  opts?: { alignWordsOnly?: boolean }
+): Promise<{
+  words: AlignWord[];
+  durationSec: number;
+  displayText: string;
+  silenceGaps: SilenceGap[];
+  roughSegments: WhisperSeg[];
+  segments: WhisperSeg[];
+}> {
+  const { data: row, error } = await admin
+    .from("media_pipeline_jobs")
+    .select("whisper_raw, whisper_transcript")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (error || !row) {
+    throw new Error("文字起こしジョブが見つかりません。先に WhisperX で文字起こししてください。");
+  }
+  const raw = (row.whisper_raw || {}) as Record<string, unknown>;
+  const words = loadAlignWordsFromJobRaw(raw);
+  if (!words.length) {
+    throw new Error(
+      "単語タイムコードがありません。文字起こしからやり直してください（WhisperX alignWords が必要です）。"
+    );
+  }
+  const durationSec = Number(raw.duration) > 0 ? Number(raw.duration) : Math.max(...words.map((w) => w.end));
+  const displayText =
+    typeof raw.displayText === "string" && raw.displayText.trim()
+      ? String(raw.displayText).trim()
+      : String(row.whisper_transcript || raw.text || "").trim();
+  if (opts?.alignWordsOnly) {
+    return {
+      words,
+      durationSec,
+      displayText,
+      silenceGaps: [],
+      roughSegments: [],
+      segments: [],
+    };
+  }
+  return {
+    words,
+    durationSec,
+    displayText,
+    silenceGaps: normalizeSilenceGapsFromRaw(raw.silenceGaps),
+    roughSegments: normalizeWhisperSegmentsFromRaw(raw.roughSegments),
+    segments: normalizeWhisperSegmentsFromRaw(raw.segments),
+  };
+}
+
+async function loadScriptReconcileInputs(
+  body: PipelineBody,
+  admin: ReturnType<typeof createClient>,
+  opts?: { alignWordsOnly?: boolean }
+): Promise<{
+  speakers: SpeakerInput[];
+  alignWords: AlignWord[];
+  transcribeDurationSec: number;
+  transcriptPlainAtWhisper: string;
+  reconcileTiming: ReconcileTimingOptions | undefined;
+  whisperSegments: WhisperSeg[];
+}> {
+  const speakers = normalizeSpeakers(body);
+  if (!speakers.length) {
+    throw new Error("speakers に、話者 id と lines（1行以上）が必要です。");
+  }
+
+  const transcribeJobId = String(body.transcribeJobId || "").trim();
+  let alignWords: AlignWord[] = [];
+  let transcribeDurationSec = Number(body.whisperDurationSec) > 0 ? Number(body.whisperDurationSec) : 0;
+  let transcriptPlainAtWhisper = String(body.transcriptPlainAtWhisper || "").trim();
+  let reconcileTiming: ReconcileTimingOptions | undefined;
+
+  if (transcribeJobId) {
+    const loaded = await loadAlignWordsFromTranscribeJob(admin, transcribeJobId, {
+      alignWordsOnly: Boolean(opts?.alignWordsOnly),
+    });
+    alignWords = loaded.words;
+    if (!transcribeDurationSec) transcribeDurationSec = loaded.durationSec;
+    if (!transcriptPlainAtWhisper) transcriptPlainAtWhisper = loaded.displayText;
+    reconcileTiming = opts?.alignWordsOnly
+      ? { durationSec: loaded.durationSec }
+      : {
+          durationSec: loaded.durationSec,
+          silenceGaps: loaded.silenceGaps,
+          roughSegments: loaded.roughSegments,
+          segments: loaded.segments,
+        };
+  }
+
+  const whisperSegments = normalizeWhisperSegsForGrok(body.whisperSegments);
+  if (!alignWords.length && !whisperSegments.length) {
+    throw new Error(
+      "transcribeJobId（単語タイムコード付き文字起こしジョブ）が必要です。先に WhisperX で文字起こししてください。"
+    );
+  }
+
+  return {
+    speakers,
+    alignWords,
+    transcribeDurationSec,
+    transcriptPlainAtWhisper,
+    reconcileTiming,
+    whisperSegments,
+  };
+}
+
+function plainLineFromRow(row: ScriptRow): string {
+  return stripAdlibMarkers(rowToGrokLine(row));
+}
+
+function adlibSegmentsFromRows(rows: ScriptRow[]): Array<{ speakerIndex: number; text: string }> {
+  const out: Array<{ speakerIndex: number; text: string }> = [];
+  for (const row of rows) {
+    const sp = Number(row.speakerIndex) || 0;
+    for (const part of row.parts) {
+      if (part.kind === "adlib" && String(part.text || "").trim()) {
+        out.push({ speakerIndex: sp, text: String(part.text).trim() });
+      }
+    }
+  }
+  return out;
+}
+
+function formatReconciledScriptsFromPipeline(
+  pipeline: ReturnType<typeof buildReconciledScriptPipeline>,
+  speakerMeta: { id: number; label: string }[]
+): {
+  scriptsBySpeaker: Record<string, string>;
+  chronologicalScript: string;
+  grokSourceLinesBySpeaker: Record<number, string[]>;
+  adlibSegments: Array<{ speakerIndex: number; text: string }>;
+  adlibSpans: ReturnType<typeof buildReconciledScriptPipeline>["adlibSpans"];
+} {
+  const labelById = Object.fromEntries(
+    speakerMeta.map((s) => [s.id, (s.label && String(s.label).trim()) || `話者${s.id}`])
+  );
+
+  const speakerIds = Object.keys(pipeline.rowsBySpeaker)
+    .map((k) => Number(k))
+    .filter((n) => Number.isFinite(n) && n >= 1)
+    .sort((a, b) => a - b);
+
+  const scriptsBySpeaker: Record<string, string> = {};
+  const chronoPairs: { row: ScriptRow; line: string }[] = [];
+  const grokSourceLinesBySpeaker: Record<number, string[]> = {};
+  const adlibSegments: Array<{ speakerIndex: number; text: string }> = [];
+
+  for (const sp of speakerIds) {
+    const rows = pipeline.rowsBySpeaker[sp] || [];
+    const plainLines = rows.map(plainLineFromRow);
+    const sourceLines = pipeline.grokSourceLinesBySpeaker[sp] || rows.map(rowToGrokLine);
+    grokSourceLinesBySpeaker[sp] = sourceLines;
+    scriptsBySpeaker[String(sp)] = formatScriptRowsBlock(rows, plainLines);
+    adlibSegments.push(...adlibSegmentsFromRows(rows));
+    rows.forEach((row, i) => {
+      chronoPairs.push({ row, line: plainLines[i] || plainLineFromRow(row) });
+    });
+  }
+
+  chronoPairs.sort((a, b) => {
+    const ta = a.row.startSec ?? 0;
+    const tb = b.row.startSec ?? 0;
+    if (Math.abs(ta - tb) > 0.001) return ta - tb;
+    return (a.row.speakerIndex ?? 0) - (b.row.speakerIndex ?? 0);
+  });
+
+  const chronologicalScript = formatScriptRowsBlock(
+    chronoPairs.map((p) => p.row),
+    chronoPairs.map((p) => p.line),
+    labelById
+  );
+
+  if (!chronologicalScript.trim()) {
+    throw new Error("話者割り当てから時系列台本を組み立てられませんでした。");
+  }
+
+  return {
+    scriptsBySpeaker,
+    chronologicalScript,
+    grokSourceLinesBySpeaker,
+    adlibSegments,
+    adlibSpans: pipeline.adlibSpans ?? [],
+  };
+}
+
+function reconcileScriptBySpeakers(params: {
+  speakers: SpeakerInput[];
+  durationSec?: number;
+  transcriptPlain?: string;
+  transcriptPlainAtWhisper?: string;
+  speakerCount?: number;
+  assignRanges?: {
+    start: number;
+    end: number;
+    speakerIndex: number;
+    text?: string;
+    startSec?: number;
+    endSec?: number;
+  }[];
+  alignWords?: AlignWord[];
+  reconcileTiming?: ReconcileTimingOptions;
+  /** assign-plain = 顧客下書き（割当テキストそのまま） / full = Grok 用 reconcile */
+  draftMode?: "assign-plain" | "full";
+}): ReturnType<typeof formatReconciledScriptsFromPipeline> & {
+  pipeline: ReturnType<typeof buildReconciledScriptPipeline>;
+} {
+  const assignRanges = Array.isArray(params.assignRanges) ? params.assignRanges : [];
+  const transcriptPlain = String(params.transcriptPlain || "").trim();
+  const hasAlignWords = Array.isArray(params.alignWords) && params.alignWords.length > 0;
+
+  if (!hasAlignWords) {
+    throw new Error("単語タイムコード付き台本の下書きには、話者割り当てと編集テキストが必要です。");
+  }
+  if (!assignRanges.length || !transcriptPlain) {
+    throw new Error("話者割り当てと編集済み文字起こしが必要です。");
+  }
+
+  const dur = Number(params.durationSec) > 0 ? Number(params.durationSec) : 0;
+  const speakerMeta = params.speakers.map((s) => ({
+    id: s.id,
+    label: (s.label && String(s.label).trim()) || `話者${s.id}`,
+  }));
+
+  const originalPlain =
+    joinAlignWordsCompactText(params.alignWords!) ||
+    String(params.transcriptPlainAtWhisper || "").trim() ||
+    joinAlignWordsDisplayText(params.alignWords!);
+
+  const pipeline =
+    params.draftMode === "assign-plain"
+      ? buildAssignRangeDraftPipeline({
+          words: params.alignWords!,
+          editedPlain: transcriptPlain,
+          assignRanges,
+        })
+      : buildReconciledScriptPipeline({
+          words: params.alignWords!,
+          originalPlain,
+          editedPlain: transcriptPlain,
+          assignRanges,
+          timing: {
+            durationSec: dur,
+            silenceGaps: params.reconcileTiming?.silenceGaps,
+            roughSegments: params.reconcileTiming?.roughSegments,
+            segments: params.reconcileTiming?.segments,
+            clipWords: params.reconcileTiming?.clipWords,
+          },
+        });
+
+  if (!pipeline.rows.length) {
+    throw new Error("編集テキストと単語タイムコードの照合に失敗しました。");
+  }
+
+  return {
+    pipeline,
+    ...formatReconciledScriptsFromPipeline(pipeline, speakerMeta),
+  };
+}
+
 async function scriptBySpeakersWithGrok(params: {
   whisperSegments: WhisperSeg[];
   speakers: SpeakerInput[];
@@ -1033,6 +1878,7 @@ async function scriptBySpeakersWithGrok(params: {
   durationSec?: number;
   whisperTimeline?: string;
   transcriptPlain?: string;
+  transcriptPlainAtWhisper?: string;
   speakerCount?: number;
   assignRanges?: {
     start: number;
@@ -1041,20 +1887,29 @@ async function scriptBySpeakersWithGrok(params: {
     startSec?: number;
     endSec?: number;
   }[];
+  alignWords?: AlignWord[];
+  reconcileTiming?: ReconcileTimingOptions;
+  scriptLanguage?: ScriptLanguageCode;
 }): Promise<{
   scriptsBySpeaker: Record<string, string>;
   referenceTranslation: string;
   translatedLines: string[];
   chronologicalScript: string;
+  adlibSegments: Array<{ speakerIndex: number; text: string }>;
 }> {
-  if (!params.whisperSegments.length) {
+  const scriptLanguage = params.scriptLanguage ?? "ja";
+  const assignRanges = Array.isArray(params.assignRanges) ? params.assignRanges : [];
+  const transcriptPlain = String(params.transcriptPlain || "").trim();
+  const hasAlignWords = Array.isArray(params.alignWords) && params.alignWords.length > 0;
+  const hasWhisperSegments =
+    Array.isArray(params.whisperSegments) && params.whisperSegments.length > 0;
+
+  if (!hasAlignWords && !hasWhisperSegments) {
     throw new Error("whisperSegments が空です。");
   }
 
   const toneHint = (params.tone || "").trim() ? `希望トーン: ${params.tone.trim()}` : "";
   const dur = Number(params.durationSec) > 0 ? Number(params.durationSec) : 0;
-  const assignRanges = Array.isArray(params.assignRanges) ? params.assignRanges : [];
-  const transcriptPlain = String(params.transcriptPlain || "").trim();
   const maxAssignSpeaker = assignRanges.reduce(
     (m, r) => Math.max(m, Number(r.speakerIndex) || 0),
     0
@@ -1073,16 +1928,150 @@ async function scriptBySpeakersWithGrok(params: {
   }));
   const speakerPlain = speakerAssignmentsToPlainText(speakerMeta);
 
+  if (assignRanges.length && transcriptPlain && params.alignWords?.length) {
+    const { pipeline } = reconcileScriptBySpeakers({
+      speakers: params.speakers,
+      durationSec: dur,
+      transcriptPlain,
+      transcriptPlainAtWhisper: params.transcriptPlainAtWhisper,
+      speakerCount,
+      assignRanges,
+      alignWords: params.alignWords,
+      reconcileTiming: params.reconcileTiming,
+    });
+
+    const labelById = Object.fromEntries(
+      speakerMeta.map((s) => [
+        s.id,
+        (s.label && String(s.label).trim()) || `話者${s.id}`
+      ])
+    );
+
+    const speakerIds = Object.keys(pipeline.rowsBySpeaker)
+      .map((k) => Number(k))
+      .filter((n) => Number.isFinite(n) && n >= 1)
+      .sort((a, b) => a - b);
+
+    const linesBySpeaker: Record<number, string[]> = {};
+    const translationParts: string[] = [];
+    const adlibSegments: Array<{ speakerIndex: number; text: string }> = [];
+
+    for (const sp of speakerIds) {
+      const rows = pipeline.rowsBySpeaker[sp] || [];
+      const sourceLines = pipeline.grokSourceLinesBySpeaker[sp] || [];
+      if (!sourceLines.length) continue;
+      const spLabel = labelById[sp] || `話者${sp}`;
+      const spMeta = speakerMeta.find((s) => s.id === sp);
+      const spHintOnly = spMeta
+        ? speakerAssignmentToPlainTextSingle(spMeta)
+        : `話者${sp}（${spLabel}）`;
+      const hint = [
+        spHintOnly,
+        `【翻訳対象】話者${sp}（${spLabel}）に割り当てられた行だけです。`,
+        "入力行に存在しない他話者のセリフ・単語は一切出力しないでください。",
+        `話者${sp}の行だけを、入力順のまま1行ずつ翻訳してください（行の統合・分割・順序変更禁止）。`,
+        "各行はセリフ本文のみ。話者名 (てつや) などのラベルは付けないでください。",
+        buildTranslateFidelityHint(scriptLanguage),
+        `${GROK_ADLIB_TRANSLATE_RULES}`,
+        toneHint
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const { translation, lines } = await translateScriptRowsWithGrok(sourceLines, hint, scriptLanguage);
+      const finalLines: string[] = [];
+
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const src = sourceLines[i] || rowToGrokLine(row);
+        let line = String(lines[i] ?? "").trim();
+
+        if (row.parts.some((p) => p.kind === "adlib")) {
+          if (!adlibMarkersPreserved(src, line)) {
+            line = await translateScriptRowPartsWithGrok(row, i + 1, rows.length, hint, scriptLanguage);
+          }
+          for (const t of extractAdlibTextsFromTranslatedLine(line)) {
+            if (t.trim()) adlibSegments.push({ speakerIndex: sp, text: t.trim() });
+          }
+        }
+
+        finalLines.push(line || rowToGrokLine(row));
+      }
+
+      linesBySpeaker[sp] = finalLines;
+      if (translation?.trim()) {
+        translationParts.push(`【話者${sp} ${spLabel}】\n${translation.trim()}`);
+      }
+    }
+
+    const referenceTranslation = translationParts.join("\n\n");
+
+    const scriptsBySpeaker: Record<string, string> = {};
+    const chronoPairs: { row: ScriptRow; line: string }[] = [];
+
+    for (const sp of speakerIds) {
+      const rows = pipeline.rowsBySpeaker[sp] || [];
+      const lines = linesBySpeaker[sp] || rows.map(rowToGrokLine);
+      scriptsBySpeaker[String(sp)] = formatScriptRowsBlock(rows, lines);
+      rows.forEach((row, i) => {
+        chronoPairs.push({
+          row,
+          line: String(lines[i] ?? rowToGrokLine(row)).trim() || rowToGrokLine(row)
+        });
+      });
+    }
+
+    chronoPairs.sort((a, b) => {
+      const ta = a.row.startSec ?? 0;
+      const tb = b.row.startSec ?? 0;
+      if (Math.abs(ta - tb) > 0.001) return ta - tb;
+      return (a.row.speakerIndex ?? 0) - (b.row.speakerIndex ?? 0);
+    });
+
+    const chronologicalScript = formatScriptRowsBlock(
+      chronoPairs.map((p) => p.row),
+      chronoPairs.map((p) => p.line),
+      labelById
+    );
+
+    const translatedLines = chronoPairs.map((p) => p.line);
+
+    if (!chronologicalScript.trim()) {
+      throw new Error("話者割り当てから時系列台本を組み立てられませんでした。");
+    }
+
+    return {
+      scriptsBySpeaker,
+      referenceTranslation,
+      translatedLines,
+      chronologicalScript,
+      adlibSegments
+    };
+  }
+
+  if (hasAlignWords) {
+    throw new Error(
+      "単語タイムコード付き台本生成には、話者割り当てと編集テキストが必要です。"
+    );
+  }
+
   if (assignRanges.length && transcriptPlain) {
+    const whisperTimeline =
+      params.whisperTimeline?.trim() ||
+      whisperSegmentsToBracketTimelineText(params.whisperSegments, dur);
+    if (!whisperTimeline.trim()) {
+      throw new Error(
+        "Whisper タイムラインがありません。文字起こしからやり直してください。"
+      );
+    }
+
     const chronoCues = buildChronologicalTimedCuesFromAssignRanges(
       transcriptPlain,
       assignRanges,
       speakerCount,
       speakerMeta.map(({ id, label }) => ({ id, label })),
       {
-        whisperTimeline:
-          params.whisperTimeline?.trim() ||
-          whisperSegmentsToBracketTimelineText(params.whisperSegments, dur),
+        whisperTimeline,
         whisperSegments: params.whisperSegments,
         durationSec: dur
       }
@@ -1091,17 +2080,28 @@ async function scriptBySpeakersWithGrok(params: {
       throw new Error("話者割り当てから時系列キューを組み立てられませんでした。");
     }
 
+    const timelinePlain = buildPlainFromWhisperTimeline(whisperTimeline);
+    const plainNorm = normalizePreviewTextForCompare(transcriptPlain);
+    const timelineNorm = normalizePreviewTextForCompare(timelinePlain);
+    if (timelinePlain && plainNorm !== timelineNorm) {
+      console.warn("[wavrick] transcriptPlain と whisperTimeline の本文が一致しません", {
+        transcriptLen: plainNorm.length,
+        timelineLen: timelineNorm.length
+      });
+    }
+
     const sourceLines = chronoCues.map((c) => c.text);
     const hint = [
       speakerPlain,
       "【重要】入力行は動画の時系列順です。行数・順序を変えないでください。",
       "各行はセリフ本文のみ。話者名 (てつや) などのラベルは付けないでください。",
+      buildTranslateFidelityHint(scriptLanguage),
       toneHint
     ]
       .filter(Boolean)
       .join("\n");
     const { translation: referenceTranslation, lines } =
-      await translatePreviewLinesWithGrok(sourceLines, hint);
+      await translatePreviewLinesWithGrok(sourceLines, hint, { scriptLanguage });
     const translatedCues = chronoCues.map((cue, i) => ({
       ...cue,
       text: (lines[i] || "").trim() || cue.text
@@ -1117,7 +2117,8 @@ async function scriptBySpeakersWithGrok(params: {
       scriptsBySpeaker,
       referenceTranslation,
       translatedLines: lines,
-      chronologicalScript
+      chronologicalScript,
+      adlibSegments: []
     };
   }
 
@@ -1165,7 +2166,8 @@ async function scriptBySpeakersWithGrok(params: {
     scriptsBySpeaker,
     referenceTranslation,
     translatedLines: lines,
-    chronologicalScript
+    chronologicalScript,
+    adlibSegments: []
   };
 }
 
@@ -1218,14 +2220,18 @@ Deno.serve(async (req) => {
   const mode =
     body.mode === "transcribe" ||
     body.mode === "prepare-audio" ||
+    body.mode === "adr-prepare" ||
     body.mode === "status" ||
     body.mode === "script" ||
+    body.mode === "script-reconcile" ||
     body.mode === "full"
       ? body.mode
       : "full";
   const videoUrl = (body.videoUrl || "").trim();
   const audioUrl = (body.audioUrl || "").trim();
   const requestId = (body.requestId || "").trim() || null;
+  const targetLang = normalizeTargetLang(body.targetLang || body.scriptLanguage);
+  const customerEmail = (body.customerEmail || "").trim().toLowerCase() || null;
 
   const userId = await resolveUserId(req);
   const admin = createClient(supabaseUrl, serviceKey);
@@ -1305,7 +2311,7 @@ Deno.serve(async (req) => {
     const { data: job, error: jobErr } = await admin
       .from("media_pipeline_jobs")
       .select(
-        "id, user_id, video_url, audio_url, audio_source, status, step, error, whisper_transcript, whisper_raw, training_bundle, models, duration_ms"
+        "id, user_id, request_id, video_url, audio_url, audio_source, status, step, error, whisper_transcript, whisper_raw, training_bundle, models, duration_ms, pipeline_kind, target_lang, diarization_raw"
       )
       .eq("id", statusJobId)
       .maybeSingle();
@@ -1318,18 +2324,65 @@ Deno.serve(async (req) => {
     }
 
     const row = job as PipelineJobRow;
-    if (row.status === "completed" && row.whisper_transcript) {
+    const isV3Diarize = String(row.pipeline_kind || "") === "v3_diarize";
+
+    if (isV3Diarize && row.status === "completed" && row.diarization_raw) {
+      let adrProjectId: string | null = null;
+      if (row.request_id) {
+        const { data: adrRow } = await admin
+          .from("adr_projects")
+          .select("id")
+          .eq("request_id", row.request_id)
+          .maybeSingle();
+        adrProjectId = (adrRow?.id as string) || null;
+      }
+      try {
+        return jsonResponse(diarizeJsonResponseFromJob(row, adrProjectId));
+      } catch (normErr) {
+        const msg = normErr instanceof Error ? normErr.message : String(normErr);
+        return jsonResponse(
+          { ok: false, jobId: row.id, status: "failed", error: msg, pipelineKind: "v3_diarize" },
+          422
+        );
+      }
+    }
+
+    if (!isV3Diarize && row.status === "completed" && row.whisper_transcript) {
       return jsonResponse(transcribeJsonResponseFromJob(row));
     }
     if (row.status === "failed") {
       return jsonResponse(
-        { ok: false, jobId: row.id, status: "failed", error: row.error || "文字起こしに失敗しました。" },
+        {
+          ok: false,
+          jobId: row.id,
+          status: "failed",
+          error: row.error || (isV3Diarize ? "話者分離に失敗しました。" : "文字起こしに失敗しました。")
+        },
         422
       );
     }
 
     const runpodJobId = modelsRunpodJobId(row.models);
-    if (runpodJobId) {
+    // v3 diarize uses Load Balancer POST /diarize by default. Queue /status is only
+    // valid when RUNPOD_WHISPERX_QUEUE_DIARIZE is explicitly enabled on a Queue endpoint.
+    if (runpodJobId && isV3Diarize && isDiarizeAsyncCapable()) {
+      try {
+        const result = await finalizeRunpodDiarizeJob({
+          admin,
+          job: row,
+          runpodJobId,
+          startedMs: started,
+          customerEmail
+        });
+        const httpStatus = result.ok === false ? 422 : 200;
+        return jsonResponse(result, httpStatus);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return jsonResponse({ ok: false, jobId: row.id, status: "running", error: msg }, 200);
+      }
+    }
+
+    if (runpodJobId && !isV3Diarize) {
       try {
         const result = await finalizeRunpodTranscribeJob({
           admin,
@@ -1348,31 +2401,309 @@ Deno.serve(async (req) => {
     return jsonResponse({
       ok: true,
       jobId: row.id,
-      mode: "transcribe",
+      mode: isV3Diarize ? "diarize" : "transcribe",
       status: row.status === "running" ? "running" : row.status || "running",
-      step: row.step || "whisperx"
+      step: row.step || (isV3Diarize ? "diarize" : "whisperx")
     });
   }
 
-  if (mode === "script") {
-    const speakers = normalizeSpeakers(body);
-    if (!speakers.length) {
+  if (mode === "adr-prepare") {
+    if (!videoUrl) {
+      return jsonResponse({ ok: false, error: "adr-prepare には videoUrl が必要です。" }, 400);
+    }
+    if (!extractYouTubeVideoId(videoUrl)) {
+      return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。" }, 400);
+    }
+    if (!requestId) {
+      return jsonResponse({ ok: false, error: "adr-prepare には requestId が必要です。" }, 400);
+    }
+    if (!targetLang) {
       return jsonResponse(
-        { ok: false, error: "speakers に、話者 id と lines（1行以上）が必要です。" },
+        { ok: false, error: "翻訳先言語（吹替トラック）を選択してください。" },
+        400
+      );
+    }
+    if (!isRunpodWhisperxMode() && !Deno.env.get("WHISPERX_SERVICE_URL")) {
+      return jsonResponse(
+        { ok: false, error: "v3 ADR には WhisperX サービス（話者分離）の設定が必要です。" },
         400
       );
     }
 
-    const whisperSegments = normalizeWhisperSegsForGrok(body.whisperSegments);
-    if (!whisperSegments.length) {
-      return jsonResponse(
-        {
-          ok: false,
-          error:
-            "whisperSegments が必要です。先に「文字起こし（WhisperX）」を実行し、タイムスタンプ付きデータを取得してから台本生成してください。"
-        },
-        400
+    const { data: adrJob, error: adrInsErr } = await admin
+      .from("media_pipeline_jobs")
+      .insert({
+        user_id: userId,
+        request_id: requestId,
+        video_url: videoUrl,
+        audio_url: null,
+        audio_source: "youtube_proxy",
+        status: "running",
+        step: "extract",
+        pipeline_kind: "v3_diarize",
+        target_lang: targetLang
+      })
+      .select("id")
+      .single();
+
+    if (adrInsErr || !adrJob?.id) {
+      return jsonResponse({ ok: false, error: adrInsErr?.message || "ジョブの作成に失敗しました。" }, 500);
+    }
+
+    const adrJobId = adrJob.id as string;
+    const adrVideoId = extractYouTubeVideoId(videoUrl) || "upload";
+    const adrTargetPath = pipelineRawAudioPath(userId, adrJobId, `${adrVideoId}_${targetLang}`);
+    const adrOriginalPath = pipelineRawAudioPath(userId, adrJobId, `${adrVideoId}_original`);
+
+    try {
+      // 1) 翻訳先吹替トラック（必須・原盤と別物） 2) オリジナル（比較・切替用）
+      const extracted = await fetchProxyAudioToStorage(
+        admin,
+        videoUrl,
+        adrTargetPath,
+        false,
+        targetLang,
+        { requireDubTrack: true }
       );
+      const originalExtracted = await fetchProxyAudioToStorage(
+        admin,
+        videoUrl,
+        adrOriginalPath,
+        false
+      );
+      assertDistinctTargetLangAudio(targetLang, extracted, originalExtracted);
+
+      const originalAudioUrl =
+        originalExtracted.publicUrl && originalExtracted.publicUrl !== extracted.publicUrl
+          ? originalExtracted.publicUrl
+          : null;
+      const extractMeta = {
+        targetLang,
+        targetAudioUrl: extracted.publicUrl,
+        originalAudioUrl,
+        audioDurationSec: extracted.audioDurationSec ?? null,
+        originalAudioDurationSec: originalExtracted.audioDurationSec ?? null,
+        targetByteLength: extracted.byteLength ?? null,
+        originalByteLength: originalExtracted.byteLength ?? null,
+        targetFormatId: extracted.selectedFormatId ?? null,
+        originalFormatId: originalExtracted.selectedFormatId ?? null
+      };
+
+      await admin
+        .from("media_pipeline_jobs")
+        .update({
+          status: "audio_ready",
+          step: "audio_ready",
+          audio_url: extracted.publicUrl,
+          audio_source: "youtube_proxy_storage",
+          error: null,
+          models: {
+            originalAudioUrl,
+            extractMeta,
+            dualExtract: true
+          },
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", adrJobId);
+
+      if (isDiarizeAsyncCapable()) {
+        const submitted = await submitRunpodDiarizeAsync(extracted.publicUrl);
+        await admin
+          .from("media_pipeline_jobs")
+          .update({
+            status: "running",
+            step: "diarize",
+            models: {
+              runpodJobId: submitted.id,
+              diarizeMode: "async",
+              originalAudioUrl,
+              extractMeta,
+              dualExtract: true
+            },
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", adrJobId);
+
+        return jsonResponse({
+          ok: true,
+          jobId: adrJobId,
+          mode: "adr-prepare",
+          pipelineKind: "v3_diarize",
+          status: "running",
+          async: true,
+          targetLang,
+          rawAudioUrl: extracted.publicUrl,
+          originalAudioUrl,
+          audioDurationSec: extracted.audioDurationSec ?? null,
+          requestId
+        });
+      }
+
+      await admin
+        .from("media_pipeline_jobs")
+        .update({ step: "diarize", updated_at: new Date().toISOString() })
+        .eq("id", adrJobId);
+
+      if (typeof EdgeRuntime !== "undefined") {
+        EdgeRuntime.waitUntil(
+          backgroundDiarizeJob({
+            admin,
+            jobId: adrJobId,
+            audioUrl: extracted.publicUrl,
+            originalAudioUrl,
+            extractMeta,
+            audioDurationSec: extracted.audioDurationSec ?? null,
+            videoUrl,
+            targetLang,
+            audioSource: "youtube_proxy_storage",
+            requestId,
+            customerEmail,
+            customerUserId: userId,
+            startedMs: started
+          })
+        );
+        return jsonResponse({
+          ok: true,
+          jobId: adrJobId,
+          mode: "adr-prepare",
+          pipelineKind: "v3_diarize",
+          status: "running",
+          async: true,
+          targetLang,
+          rawAudioUrl: extracted.publicUrl,
+          originalAudioUrl,
+          requestId
+        });
+      }
+
+      const diarize = await diarizeWithServiceFromUrl(extracted.publicUrl);
+      const segments = Array.isArray(diarize.segments) ? diarize.segments : [];
+      if (!segments.length) throw new Error("話者分離の結果が空でした。");
+      const durationMs = Date.now() - started;
+      await persistDiarizeJob({
+        admin,
+        jobId: adrJobId,
+        diarize,
+        audioSource: "youtube_proxy_storage",
+        videoUrl,
+        audioUrl: extracted.publicUrl,
+        targetLang,
+        durationMs,
+        models: {
+          originalAudioUrl,
+          extractMeta,
+          dualExtract: true
+        }
+      });
+      const adrProjectId = await upsertAdrProject({
+        admin,
+        requestId,
+        customerUserId: userId,
+        customerEmail,
+        videoUrl,
+        targetLang,
+        audioUrl: extracted.publicUrl,
+        originalAudioUrl,
+        extractMeta,
+        audioDurationSec: extracted.audioDurationSec ?? null,
+        pipelineJobId: adrJobId,
+        segments
+      });
+      await notifyAdrReady({ admin, requestId, customerEmail, targetLang });
+
+      return jsonResponse({
+        ...diarizeJsonResponseFromJob(
+          {
+            id: adrJobId,
+            audio_url: extracted.publicUrl,
+            video_url: videoUrl,
+            target_lang: targetLang,
+            diarization_raw: diarize,
+            duration_ms: durationMs
+          },
+          adrProjectId
+        ),
+        originalAudioUrl,
+        extractMeta
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await admin
+        .from("media_pipeline_jobs")
+        .update({
+          status: "failed",
+          step: "error",
+          error: msg,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", adrJobId);
+      return jsonResponse({ ok: false, jobId: adrJobId, error: msg }, 422);
+    }
+  }
+
+  if (mode === "script-reconcile") {
+    try {
+      const {
+        speakers,
+        alignWords,
+        transcribeDurationSec,
+        transcriptPlainAtWhisper,
+        reconcileTiming,
+      } = await loadScriptReconcileInputs(body, admin, { alignWordsOnly: true });
+      const scriptDur =
+        transcribeDurationSec > 0
+          ? transcribeDurationSec
+          : Number(body.whisperDurationSec) > 0
+            ? Number(body.whisperDurationSec)
+            : 0;
+      const reconciled = reconcileScriptBySpeakers({
+        speakers,
+        durationSec: scriptDur,
+        transcriptPlain: String(body.transcriptPlain || "").trim() || undefined,
+        transcriptPlainAtWhisper: transcriptPlainAtWhisper || undefined,
+        speakerCount: Number(body.speakerCount) || speakers.length,
+        assignRanges: Array.isArray(body.assignRanges) ? body.assignRanges : undefined,
+        alignWords,
+        reconcileTiming,
+        draftMode: "assign-plain",
+      });
+      const durationMs = Date.now() - started;
+      return jsonResponse({
+        ok: true,
+        mode: "script-reconcile",
+        scriptsBySpeaker: reconciled.scriptsBySpeaker,
+        script: reconciled.chronologicalScript,
+        chronologicalScript: reconciled.chronologicalScript,
+        adlibSegments: reconciled.adlibSegments,
+        adlibSpans: reconciled.adlibSpans,
+        timecodedByWhisper: true,
+        sourceOnly: true,
+        durationMs,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return jsonResponse({ ok: false, error: msg }, 422);
+    }
+  }
+
+  if (mode === "script") {
+    let speakers: SpeakerInput[];
+    let alignWords: AlignWord[];
+    let transcribeDurationSec: number;
+    let transcriptPlainAtWhisper: string;
+    let reconcileTiming: ReconcileTimingOptions | undefined;
+    let whisperSegments: WhisperSeg[];
+    try {
+      const loaded = await loadScriptReconcileInputs(body, admin);
+      speakers = loaded.speakers;
+      alignWords = loaded.alignWords;
+      transcribeDurationSec = loaded.transcribeDurationSec;
+      transcriptPlainAtWhisper = loaded.transcriptPlainAtWhisper;
+      reconcileTiming = loaded.reconcileTiming;
+      whisperSegments = loaded.whisperSegments;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return jsonResponse({ ok: false, error: msg }, 400);
     }
 
     const { data: inserted, error: insErr } = await admin
@@ -1396,10 +2727,13 @@ Deno.serve(async (req) => {
 
     try {
       const scriptDur =
-        Number(body.whisperDurationSec) > 0
-          ? Number(body.whisperDurationSec)
-          : whisperAudioDurationSec(null, whisperSegments);
+        transcribeDurationSec > 0
+          ? transcribeDurationSec
+          : Number(body.whisperDurationSec) > 0
+            ? Number(body.whisperDurationSec)
+            : whisperAudioDurationSec(null, whisperSegments);
       const whisperTimeline = resolveWhisperTimeline(body, whisperSegments, scriptDur);
+      const scriptLanguage = resolveScriptLanguage(body);
       const grok = await scriptBySpeakersWithGrok({
         whisperSegments,
         speakers,
@@ -1407,8 +2741,12 @@ Deno.serve(async (req) => {
         durationSec: scriptDur,
         whisperTimeline,
         transcriptPlain: String(body.transcriptPlain || "").trim() || undefined,
+        transcriptPlainAtWhisper: transcriptPlainAtWhisper || undefined,
         speakerCount: Number(body.speakerCount) || speakers.length,
-        assignRanges: Array.isArray(body.assignRanges) ? body.assignRanges : undefined
+        assignRanges: Array.isArray(body.assignRanges) ? body.assignRanges : undefined,
+        alignWords: alignWords.length ? alignWords : undefined,
+        reconcileTiming,
+        scriptLanguage
       });
       const combinedScript =
         grok.chronologicalScript?.trim() ||
@@ -1449,6 +2787,7 @@ Deno.serve(async (req) => {
         referenceTranslation: grok.referenceTranslation,
         translatedLines: grok.translatedLines,
         script: combinedScript,
+        adlibSegments: grok.adlibSegments ?? [],
         timecodedByWhisper: true,
         whisperTimeline,
         whisperSegments,
