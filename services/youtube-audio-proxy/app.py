@@ -52,7 +52,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 13
+_EXTRACT_BUILD = 14
 
 # v3 ADR: language-specific dubbed track extraction
 _LANG_DISPLAY = {
@@ -766,19 +766,16 @@ def _merge_audio_tracks(*track_lists: list[dict]) -> list[dict]:
     return merged
 
 
-def _track_declared_lang_code(track: dict) -> str:
-    """
-    Language code declared on the track metadata only.
-    Does not use weak heuristics that can mis-label other dubs.
-    """
+def _track_lang_signals(track: dict) -> set[str]:
+    """Collect all language codes hinted by metadata (field, note, xtags)."""
+    signals: set[str] = set()
     raw = str(track.get("language") or "").strip().lower()
-    # Guard against language_preference numeric pollution (e.g. "-1", "10").
     if raw and re.fullmatch(r"[a-z]{2,3}([_-][a-z0-9]+)?", raw):
-        return _normalize_lang_code(raw)
+        signals.add(_normalize_lang_code(raw))
     note = str(track.get("formatNote") or "").lower()
     bracket = re.search(r"\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]", note)
     if bracket:
-        return _normalize_lang_code(bracket.group(1))
+        signals.add(_normalize_lang_code(bracket.group(1)))
     name_map = {
         "japanese": "ja",
         "日本語": "ja",
@@ -788,10 +785,63 @@ def _track_declared_lang_code(track: dict) -> str:
         "spanish": "es",
         "chinese": "zh",
         "mandarin": "zh",
+        "arabic": "ar",
+        "french": "fr",
+        "german": "de",
+        "hindi": "hi",
+        "indonesian": "id",
+        "italian": "it",
+        "portuguese": "pt",
+        "russian": "ru",
     }
     for name, code in name_map.items():
         if name in note:
+            signals.add(code)
+    xt = _track_xtags_lang(track)
+    if xt:
+        xt_code = _normalize_lang_code(xt)
+        if xt_code:
+            signals.add(xt_code)
+    signals.discard("")
+    return signals
+
+
+def _track_declared_lang_code(track: dict) -> str:
+    """
+    Best language code for a track.
+
+    Prefer format_note markers ([ko] Korean, …) over the `language` field when
+    they disagree — some yt-dlp clients mis-tag the default dub language onto
+    every 140-* variant (which caused ko-as-ja downloads).
+    """
+    note = str(track.get("formatNote") or "").lower()
+    bracket = re.search(r"\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]", note)
+    if bracket:
+        return _normalize_lang_code(bracket.group(1))
+    name_map = (
+        ("japanese", "ja"),
+        ("日本語", "ja"),
+        ("korean", "ko"),
+        ("한국어", "ko"),
+        ("english", "en"),
+        ("spanish", "es"),
+        ("chinese", "zh"),
+        ("mandarin", "zh"),
+        ("arabic", "ar"),
+        ("french", "fr"),
+        ("german", "de"),
+        ("hindi", "hi"),
+        ("indonesian", "id"),
+        ("italian", "it"),
+        ("portuguese", "pt"),
+        ("russian", "ru"),
+    )
+    for name, code in name_map:
+        if name in note:
             return code
+    raw = str(track.get("language") or "").strip().lower()
+    if raw and re.fullmatch(r"[a-z]{2,3}([_-][a-z0-9]+)?", raw):
+        return _normalize_lang_code(raw)
     return ""
 
 
@@ -799,8 +849,13 @@ def _track_matches_language(track: dict, target_lang: str) -> bool:
     code = _normalize_lang_code(target_lang)
     if not code:
         return False
-    declared = _track_declared_lang_code(track)
-    return bool(declared) and declared == code
+    signals = _track_lang_signals(track)
+    if not signals:
+        return False
+    # Any conflicting signal → not a match (never treat ko note as ja).
+    if any(s != code for s in signals):
+        return False
+    return code in signals
 
 
 def _select_language_format_id(tracks: list[dict], target_lang: str) -> str | None:
@@ -925,19 +980,8 @@ def _track_xtags_lang(track: dict) -> str:
 
 
 def _track_confirms_target_lang(track: dict, target_lang: str) -> bool:
-    """True only when declared language (and xtags when present) equal target."""
-    code = _normalize_lang_code(target_lang)
-    if not code:
-        return False
-    declared = _track_declared_lang_code(track)
-    if declared != code:
-        return False
-    xt_lang = _track_xtags_lang(track)
-    if xt_lang:
-        xt_code = _normalize_lang_code(xt_lang)
-        if xt_code and xt_code != code:
-            return False
-    return True
+    """True only when all language signals agree with the target language."""
+    return _track_matches_language(track, target_lang)
 
 
 def _assert_selected_format_is_target_lang(

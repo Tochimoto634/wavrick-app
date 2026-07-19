@@ -194,8 +194,8 @@ function pipelineRawAudioPath(
   videoId: string
 ): string {
   return userId
-    ? `${userId}/${videoId}_raw.mp3`
-    : `pipeline-temp/${jobId}_raw.mp3`;
+    ? `${userId}/${jobId}_${videoId}_raw.mp3`
+    : `pipeline-temp/${jobId}_${videoId}_raw.mp3`;
 }
 
 function assertAudioSizeWithinLimit(byteLength: number, label: string): void {
