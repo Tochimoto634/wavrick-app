@@ -17,6 +17,7 @@ COPY services/youtube-audio-proxy/app.py \
      services/youtube-audio-proxy/cors_utils.py \
      services/youtube-audio-proxy/rate_limit.py \
      services/youtube-audio-proxy/run_demucs.py \
+     services/youtube-audio-proxy/lang_tracks.py \
      ./
 
 ENV WAVRICK_VOCAL_SEPARATION=0
