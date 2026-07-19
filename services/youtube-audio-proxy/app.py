@@ -52,7 +52,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 14
+_EXTRACT_BUILD = 15
 
 # v3 ADR: language-specific dubbed track extraction
 _LANG_DISPLAY = {
@@ -858,12 +858,82 @@ def _track_matches_language(track: dict, target_lang: str) -> bool:
     return code in signals
 
 
+def _format_id_lang_signals(tracks: list[dict], format_id: str) -> set[str]:
+    """Union of language signals for a format_id across all probe clients/entries."""
+    fid = str(format_id or "").strip()
+    if not fid:
+        return set()
+    signals: set[str] = set()
+    for t in tracks:
+        if str(t.get("formatId") or "").strip() != fid:
+            continue
+        signals |= _track_lang_signals(t)
+    signals.discard("")
+    return signals
+
+
+def _format_id_exclusively_target_lang(
+    tracks: list[dict], format_id: str, target_lang: str
+) -> bool:
+    """
+    True only when every language signal seen for this format_id equals target.
+
+    Important: yt-dlp may emit duplicate format rows such as (language=ja, 140-9)
+    from a buggy client AND (language=ko, 140-9) from a good one. Matching a single
+    row is not enough — the format_id as a whole must be unambiguous.
+    """
+    code = _normalize_lang_code(target_lang)
+    if not code:
+        return False
+    signals = _format_id_lang_signals(tracks, format_id)
+    return bool(signals) and signals == {code}
+
+
+def _tracks_for_target_lang(tracks: list[dict], target_lang: str) -> list[dict]:
+    """Return downloadable track rows whose format_id is exclusively target_lang."""
+    code = _normalize_lang_code(target_lang)
+    if not code:
+        return []
+    out: list[dict] = []
+    seen_fid: set[str] = set()
+    # Prefer richer rows (hasUrl, dubbed) but only for exclusive format ids.
+    candidates = [t for t in tracks if _track_matches_language(t, target_lang)]
+    for t in sorted(candidates, key=_score_language_track, reverse=True):
+        fid = str(t.get("formatId") or "").strip()
+        if not fid or fid in seen_fid:
+            continue
+        if not _format_id_exclusively_target_lang(tracks, fid, target_lang):
+            logger.warning(
+                "reject ambiguous/mis-tagged format_id=%s for target=%s signals=%s",
+                fid,
+                target_lang,
+                sorted(_format_id_lang_signals(tracks, fid)),
+            )
+            continue
+        seen_fid.add(fid)
+        out.append(t)
+    # Also pick a representative row for exclusive format ids even if the "best"
+    # scored row lost the soft match (should be rare).
+    by_fid: dict[str, list[dict]] = {}
+    for t in tracks:
+        fid = str(t.get("formatId") or "").strip()
+        if fid:
+            by_fid.setdefault(fid, []).append(t)
+    for fid, group in by_fid.items():
+        if fid in seen_fid:
+            continue
+        if not _format_id_exclusively_target_lang(tracks, fid, target_lang):
+            continue
+        best = max(group, key=_score_language_track)
+        seen_fid.add(fid)
+        out.append(best)
+    return out
+
+
 def _select_language_format_id(tracks: list[dict], target_lang: str) -> str | None:
-    # Only xtags/language-confirmed tracks — never soft-match fallbacks.
-    pool_src = [t for t in tracks if _track_confirms_target_lang(t, target_lang)]
+    pool_src = _tracks_for_target_lang(tracks, target_lang)
     if not pool_src:
         return None
-    # Prefer tracks that still have a downloadable URL after SABR filtering.
     with_url = [t for t in pool_src if t.get("hasUrl")]
     pool = with_url or pool_src
     best = max(pool, key=_score_language_track)
@@ -984,14 +1054,42 @@ def _track_confirms_target_lang(track: dict, target_lang: str) -> bool:
     return _track_matches_language(track, target_lang)
 
 
+def _track_has_strong_lang_label(track: dict) -> bool:
+    """True when format_note carries an explicit language mark ([ja], Japanese, …)."""
+    note = str(track.get("formatNote") or "").lower()
+    if re.search(r"\[[a-z]{2,3}(?:-[a-z0-9]+)?\]", note):
+        return True
+    for name in (
+        "japanese",
+        "日本語",
+        "korean",
+        "한국어",
+        "english",
+        "spanish",
+        "chinese",
+        "mandarin",
+        "arabic",
+        "french",
+        "german",
+        "hindi",
+        "indonesian",
+        "italian",
+        "portuguese",
+        "russian",
+    ):
+        if name in note:
+            return True
+    return False
+
+
 def _assert_selected_format_is_target_lang(
     tracks: list[dict],
     selected_format_id: str | None,
     target_lang: str,
 ) -> str:
     """
-    Ensure the downloaded format ID is catalogued as target_lang.
-    Returns the normalized selected format id or raises WRONG_LANGUAGE_TRACK / NO_LANGUAGE_TRACK.
+    Ensure the downloaded format ID is exclusively catalogued as target_lang.
+    Returns the normalized selected format id or raises WRONG_LANGUAGE_TRACK.
     """
     code = _normalize_lang_code(target_lang)
     fid = str(selected_format_id or "").strip()
@@ -1001,36 +1099,27 @@ def _assert_selected_format_is_target_lang(
             + _wrong_language_track_error(target_lang, format_id=fid or "(selector)")
             + "\n（言語固定の format ID 以外での取得は許可していません）"
         )
-    same_id = [t for t in tracks if str(t.get("formatId") or "").strip() == fid]
-    if not same_id:
+    signals = _format_id_lang_signals(tracks, fid)
+    if not signals:
         raise RuntimeError(
             "WRONG_LANGUAGE_TRACK: "
             + _wrong_language_track_error(target_lang, format_id=fid)
             + "\n（取得した format がプローブ一覧にありません）"
         )
-    declared_langs = sorted(
-        {c for t in same_id if (c := _track_declared_lang_code(t))}
-    )
-    if code not in declared_langs:
-        got = declared_langs[0] if declared_langs else None
+    if signals != {code}:
+        got = ",".join(sorted(s for s in signals if s != code)) or ",".join(sorted(signals))
         raise RuntimeError(
             "WRONG_LANGUAGE_TRACK: "
             + _wrong_language_track_error(target_lang, got_lang=got, format_id=fid)
+            + f"\n（format {fid} の言語信号: {', '.join(sorted(signals))}）"
         )
-    # Ambiguous id tagged as multiple languages — refuse.
-    if any(lang != code for lang in declared_langs):
-        raise RuntimeError(
-            "WRONG_LANGUAGE_TRACK: "
-            + _wrong_language_track_error(
-                target_lang,
-                got_lang=",".join(declared_langs),
-                format_id=fid,
-            )
-        )
-    if not any(_track_confirms_target_lang(t, target_lang) for t in same_id):
+    # Require at least one strongly labeled row for this format_id.
+    same_id = [t for t in tracks if str(t.get("formatId") or "").strip() == fid]
+    if not any(_track_has_strong_lang_label(t) for t in same_id):
         raise RuntimeError(
             "WRONG_LANGUAGE_TRACK: "
             + _wrong_language_track_error(target_lang, format_id=fid)
+            + "\n（言語ラベルが弱いため確定できませんでした）"
         )
     return fid
 
@@ -1147,15 +1236,34 @@ def probe_youtube_audio_tracks(
                     merged = _merge_audio_tracks(merged, tracks)
 
                     has_langs = any(t.get("language") for t in tracks)
-                    has_target = bool(
-                        want and any(_track_matches_language(t, want) for t in tracks)
+                    # Only early-stop on a STRONG target match (note/[lang] evidence).
+                    # Weak language=ja tagging on Korean 140-9 caused wrong downloads
+                    # when we stopped probing before a correctly labeled client appeared.
+                    has_target_strong = bool(
+                        want
+                        and any(
+                            _track_matches_language(t, want) and _track_has_strong_lang_label(t)
+                            for t in merged
+                        )
                     )
-                    # Good enough: found requested language, or multi-language listing.
-                    if has_target or (has_langs and len(langs) >= 2 and not want):
+                    # When multiple 140-* dubs exist, wait until we know ≥2 languages
+                    # so a single mis-tagged row cannot win alone.
+                    family_langs = {
+                        s
+                        for t in merged
+                        if str(t.get("formatId") or "").startswith("140")
+                        for s in _track_lang_signals(t)
+                    }
+                    multi_dub_ok = (not want) or len(family_langs) >= 2 or not any(
+                        str(t.get("formatId") or "").startswith("140") for t in merged
+                    )
+                    if has_target_strong and multi_dub_ok:
+                        return best_info, merged, None
+                    if has_langs and len(langs) >= 2 and not want:
                         return best_info, merged, None
                     if has_langs and not want:
                         return best_info, merged, None
-                    # Found langs but not target — keep probing other clients.
+                    # Found langs but not a strong target — keep probing other clients.
                     if has_langs:
                         break  # move to next client; don't thrash IP families
                 except Exception as exc:
@@ -1291,17 +1399,17 @@ def download_youtube_audio_by_language(
         detail = _friendly_yt_extract_error(str(probe_err).strip() or probe_err.__class__.__name__)
         raise RuntimeError(f"FETCH_FAILED: {detail}")
 
-    # Soft match first (declared language == target), then hard-confirm.
-    soft = [t for t in tracks if _track_matches_language(t, target_lang)]
-    if not soft:
-        raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
-
-    lang_tracks = [t for t in soft if _track_confirms_target_lang(t, target_lang)]
+    # Exclusive format_id match across all probe clients (rejects mis-tagged rows
+    # when another client correctly labels the same format_id as a different lang).
+    lang_tracks = _tracks_for_target_lang(tracks, target_lang)
+    # Prefer rows with explicit note/[lang] evidence.
+    strong = [t for t in lang_tracks if _track_has_strong_lang_label(t)]
+    if strong:
+        lang_tracks = strong
     if not lang_tracks:
         raise RuntimeError(
-            "NO_LANGUAGE_TRACK: "
-            + _no_language_track_error(target_lang, found_langs)
-            + "\n（言語メタ／xtags が一致する確定トラックがありません。他言語への切り替えは行いません。）"
+            f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}"
+            + "\n（確定できる対象言語 format がありません。他言語への切り替えは行いません。）"
         )
 
     lang_tracks = _prefer_dub_language_tracks(
