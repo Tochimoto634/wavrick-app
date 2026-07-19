@@ -21,6 +21,7 @@ import base64
 import glob
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,7 +52,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 12
+_EXTRACT_BUILD = 13
 
 # v3 ADR: language-specific dubbed track extraction
 _LANG_DISPLAY = {
@@ -685,11 +686,12 @@ def _audio_tracks_from_info(info: dict) -> list[dict]:
         if acodec in (None, "none"):
             continue
         vcodec = fmt.get("vcodec")
-        lang = str(fmt.get("language") or fmt.get("language_preference") or "").lower()
-        # Some clients put language only in format_note / format / audio_track
+        lang_raw = str(fmt.get("language") or "").strip().lower()
+        # Never use language_preference — it is often numeric and pollutes matching.
         note = str(fmt.get("format_note") or "")
         fmt_str = str(fmt.get("format") or "")
         audio_track = str(fmt.get("audio_track") or "")
+        lang = lang_raw if re.fullmatch(r"[a-z]{2,3}([_-][a-z0-9]+)?", lang_raw or "") else ""
         if not lang:
             blob = f"{note} {fmt_str} {audio_track}".lower()
             for code in ("ja", "en", "es", "ko", "zh", "fr", "de", "pt", "it", "ru", "hi", "id", "th", "vi"):
@@ -704,7 +706,6 @@ def _audio_tracks_from_info(info: dict) -> list[dict]:
                 ):
                     lang = code
                     break
-            # Human-readable names from YouTube UI style notes
             name_map = {
                 "japanese": "ja",
                 "日本語": "ja",
@@ -765,30 +766,46 @@ def _merge_audio_tracks(*track_lists: list[dict]) -> list[dict]:
     return merged
 
 
+def _track_declared_lang_code(track: dict) -> str:
+    """
+    Language code declared on the track metadata only.
+    Does not use weak heuristics that can mis-label other dubs.
+    """
+    raw = str(track.get("language") or "").strip().lower()
+    # Guard against language_preference numeric pollution (e.g. "-1", "10").
+    if raw and re.fullmatch(r"[a-z]{2,3}([_-][a-z0-9]+)?", raw):
+        return _normalize_lang_code(raw)
+    note = str(track.get("formatNote") or "").lower()
+    bracket = re.search(r"\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]", note)
+    if bracket:
+        return _normalize_lang_code(bracket.group(1))
+    name_map = {
+        "japanese": "ja",
+        "日本語": "ja",
+        "korean": "ko",
+        "한국어": "ko",
+        "english": "en",
+        "spanish": "es",
+        "chinese": "zh",
+        "mandarin": "zh",
+    }
+    for name, code in name_map.items():
+        if name in note:
+            return code
+    return ""
+
+
 def _track_matches_language(track: dict, target_lang: str) -> bool:
     code = _normalize_lang_code(target_lang)
     if not code:
         return False
-    lang = str(track.get("language") or "").lower()
-    if lang == code or lang.startswith(f"{code}-") or lang.startswith(f"{code}_"):
-        return True
-    note = str(track.get("formatNote") or "").lower()
-    if f"[{code}]" in note or note.startswith(f"{code},") or f",{code}" in note:
-        return True
-    if code == "ja" and any(x in note for x in ("japanese", "日本語", "ja-jp", "ja_jp")):
-        return True
-    return False
+    declared = _track_declared_lang_code(track)
+    return bool(declared) and declared == code
 
 
 def _select_language_format_id(tracks: list[dict], target_lang: str) -> str | None:
-    matches = [
-        t
-        for t in tracks
-        if _track_confirms_target_lang(t, target_lang) or _track_matches_language(t, target_lang)
-    ]
-    # Prefer confirmed (xtags-consistent) matches when available
-    confirmed = [t for t in matches if _track_confirms_target_lang(t, target_lang)]
-    pool_src = confirmed or matches
+    # Only xtags/language-confirmed tracks — never soft-match fallbacks.
+    pool_src = [t for t in tracks if _track_confirms_target_lang(t, target_lang)]
     if not pool_src:
         return None
     # Prefer tracks that still have a downloadable URL after SABR filtering.
@@ -808,6 +825,7 @@ def _no_language_track_error(target_lang: str, found_langs: list[str] | None = N
     msg = (
         f"この動画には{name}の音声トラックが見つかりませんでした。\n"
         f"YouTube Studio の「言語」で{name}の音声トラックを追加・公開してから再度お試しください。"
+        f"\n他言語の音声への切り替えは行いません。"
     )
     langs = [x for x in (found_langs or []) if x]
     if langs:
@@ -826,11 +844,50 @@ def _no_dub_track_error(target_lang: str, found_langs: list[str] | None = None) 
         f"この動画には{name}の吹替（非オリジナル）音声トラックが見つかりませんでした。\n"
         f"見つかったのは原盤言語トラックのみです。"
         f" YouTube Studio で{name}の AI 吹替／追加音声トラックを公開してから再度お試しください。"
+        f"\n他言語の吹替への切り替えは行いません。"
     )
     langs = [x for x in (found_langs or []) if x]
     if langs:
         msg += f"\n（yt-dlp が見つけた言語: {', '.join(langs)}）"
     return msg
+
+
+def _language_download_failed_error(
+    target_lang: str,
+    *,
+    format_ids: list[str] | None = None,
+    found_langs: list[str] | None = None,
+    detail: str | None = None,
+) -> str:
+    name = _lang_display_name(target_lang)
+    msg = (
+        f"{name}の音声トラックは検出されましたが取得できませんでした。\n"
+        f"他言語の音声への切り替えは行いません。"
+    )
+    ids = [x for x in (format_ids or []) if x]
+    if ids:
+        msg += f"\n（試した format: {', '.join(ids[:12])}）"
+    langs = [x for x in (found_langs or []) if x]
+    if langs:
+        msg += f"\n（yt-dlp が見つけた言語: {', '.join(langs)}）"
+    if detail:
+        msg += f"\n詳細: {detail}"
+    return msg
+
+
+def _wrong_language_track_error(
+    target_lang: str,
+    *,
+    got_lang: str | None = None,
+    format_id: str | None = None,
+) -> str:
+    name = _lang_display_name(target_lang)
+    got = _lang_display_name(got_lang) if got_lang else "別言語"
+    fid = f" / format {format_id}" if format_id else ""
+    return (
+        f"指定した{name}の音声ではなく、{got}の音声が返されました{fid}。\n"
+        f"他言語へのフォールバックは無効です。{name}トラックを取得できる状態で再度お試しください。"
+    )
 
 
 def _is_original_language_track(track: dict) -> bool:
@@ -868,11 +925,12 @@ def _track_xtags_lang(track: dict) -> str:
 
 
 def _track_confirms_target_lang(track: dict, target_lang: str) -> bool:
-    """True only when metadata (and xtags when present) agree with target language."""
+    """True only when declared language (and xtags when present) equal target."""
     code = _normalize_lang_code(target_lang)
     if not code:
         return False
-    if not _track_matches_language(track, code):
+    declared = _track_declared_lang_code(track)
+    if declared != code:
         return False
     xt_lang = _track_xtags_lang(track)
     if xt_lang:
@@ -880,6 +938,57 @@ def _track_confirms_target_lang(track: dict, target_lang: str) -> bool:
         if xt_code and xt_code != code:
             return False
     return True
+
+
+def _assert_selected_format_is_target_lang(
+    tracks: list[dict],
+    selected_format_id: str | None,
+    target_lang: str,
+) -> str:
+    """
+    Ensure the downloaded format ID is catalogued as target_lang.
+    Returns the normalized selected format id or raises WRONG_LANGUAGE_TRACK / NO_LANGUAGE_TRACK.
+    """
+    code = _normalize_lang_code(target_lang)
+    fid = str(selected_format_id or "").strip()
+    if not fid or fid.startswith("ba[") or "/" in fid:
+        raise RuntimeError(
+            "WRONG_LANGUAGE_TRACK: "
+            + _wrong_language_track_error(target_lang, format_id=fid or "(selector)")
+            + "\n（言語固定の format ID 以外での取得は許可していません）"
+        )
+    same_id = [t for t in tracks if str(t.get("formatId") or "").strip() == fid]
+    if not same_id:
+        raise RuntimeError(
+            "WRONG_LANGUAGE_TRACK: "
+            + _wrong_language_track_error(target_lang, format_id=fid)
+            + "\n（取得した format がプローブ一覧にありません）"
+        )
+    declared_langs = sorted(
+        {c for t in same_id if (c := _track_declared_lang_code(t))}
+    )
+    if code not in declared_langs:
+        got = declared_langs[0] if declared_langs else None
+        raise RuntimeError(
+            "WRONG_LANGUAGE_TRACK: "
+            + _wrong_language_track_error(target_lang, got_lang=got, format_id=fid)
+        )
+    # Ambiguous id tagged as multiple languages — refuse.
+    if any(lang != code for lang in declared_langs):
+        raise RuntimeError(
+            "WRONG_LANGUAGE_TRACK: "
+            + _wrong_language_track_error(
+                target_lang,
+                got_lang=",".join(declared_langs),
+                format_id=fid,
+            )
+        )
+    if not any(_track_confirms_target_lang(t, target_lang) for t in same_id):
+        raise RuntimeError(
+            "WRONG_LANGUAGE_TRACK: "
+            + _wrong_language_track_error(target_lang, format_id=fid)
+        )
+    return fid
 
 
 def _prefer_dub_language_tracks(
@@ -1128,6 +1237,9 @@ def download_youtube_audio_by_language(
     Download language-specific audio track.
     Returns (path, audio_duration_sec, video_duration_sec, selected_format_id).
     Raises RuntimeError with user-facing message on failure.
+
+    Never falls back to a different language. If the target language track cannot
+    be downloaded, raises NO_LANGUAGE_TRACK / FETCH_FAILED / WRONG_LANGUAGE_TRACK.
     """
     info, tracks, probe_err, found_langs = probe_youtube_audio_tracks_for_lang(url, target_lang)
     expected = max(0.0, float((info or {}).get("duration") or 0))
@@ -1135,19 +1247,17 @@ def download_youtube_audio_by_language(
         detail = _friendly_yt_extract_error(str(probe_err).strip() or probe_err.__class__.__name__)
         raise RuntimeError(f"FETCH_FAILED: {detail}")
 
-    lang_tracks = [t for t in tracks if _track_matches_language(t, target_lang)]
-    if not lang_tracks:
+    # Soft match first (declared language == target), then hard-confirm.
+    soft = [t for t in tracks if _track_matches_language(t, target_lang)]
+    if not soft:
         raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
 
-    # Drop tracks whose CDN xtags disagree (prevents downloading ko/en when requesting ja).
-    confirmed = [t for t in lang_tracks if _track_confirms_target_lang(t, target_lang)]
-    if confirmed:
-        lang_tracks = confirmed
-    else:
-        logger.warning(
-            "No xtags-confirmed tracks for lang=%s — using language-field matches only (%d)",
-            target_lang,
-            len(lang_tracks),
+    lang_tracks = [t for t in soft if _track_confirms_target_lang(t, target_lang)]
+    if not lang_tracks:
+        raise RuntimeError(
+            "NO_LANGUAGE_TRACK: "
+            + _no_language_track_error(target_lang, found_langs)
+            + "\n（言語メタ／xtags が一致する確定トラックがありません。他言語への切り替えは行いません。）"
         )
 
     lang_tracks = _prefer_dub_language_tracks(
@@ -1168,9 +1278,8 @@ def download_youtube_audio_by_language(
     preferred_ip = str(lang_tracks[0].get("sourceIpFamily") or "ipv6")
     preferred_cookies = bool(lang_tracks[0].get("sourceUseCookies"))
 
-    code = _normalize_lang_code(target_lang)
-    # ONLY exact probed format IDs for this language — never bare "140" or loose
-    # ba[language^=…] selectors (those can resolve to a different dubbed language).
+    # ONLY exact confirmed format IDs — never bare "140" or ba[language^=…]
+    # (those can resolve to a different dubbed language).
     format_attempts: list[str] = []
     for t in lang_tracks:
         fid = str(t.get("formatId") or "").strip()
@@ -1178,8 +1287,6 @@ def download_youtube_audio_by_language(
             format_attempts.append(fid)
     if not format_attempts:
         raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
-    # Last-resort selector still pinned to language code (better than silent bestaudio).
-    format_attempts.append(f"ba[language^={code}]/bestaudio[language^={code}]")
 
     client_attempts: list[list[str]] = [preferred_clients]
     if preferred_clients != ["tv_downgraded"]:
@@ -1191,7 +1298,6 @@ def download_youtube_audio_by_language(
         ip_attempts.append("auto")
 
     # CRITICAL: download with the same cookie mode that exposed the language track.
-    # Preferring stale cookies when probe used cookies=False → bot check / format loss.
     cookie_modes: list[bool] = [preferred_cookies]
     alt = not preferred_cookies
     if alt is True and not _resolve_yt_cookiefile():
@@ -1199,7 +1305,6 @@ def download_youtube_audio_by_language(
     if alt != preferred_cookies and alt not in cookie_modes:
         cookie_modes.append(alt)
     if preferred_cookies is False and True not in cookie_modes and _resolve_yt_cookiefile():
-        # Last resort only — stale cookies often make things worse.
         cookie_modes.append(True)
 
     path = ""
@@ -1211,14 +1316,16 @@ def download_youtube_audio_by_language(
     )
     selected_attempt: str | None = None
 
-    # Prefer probe-minted googlevideo URL — skips a second player extract that
-    # frequently trips "Sign in to confirm you're not a bot" after probing.
+    # Prefer probe-minted googlevideo URL — skips a second player extract.
     for t in lang_tracks:
-        if not _track_confirms_target_lang(t, target_lang) and _track_xtags_lang(t):
+        if not _track_confirms_target_lang(t, target_lang):
+            continue
+        xt_lang = _track_xtags_lang(t)
+        if xt_lang and _normalize_lang_code(xt_lang) != _normalize_lang_code(target_lang):
             logger.warning(
                 "skip track format=%s — xtags lang=%s != target=%s",
                 t.get("formatId"),
-                _track_xtags_lang(t),
+                xt_lang,
                 target_lang,
             )
             continue
@@ -1308,8 +1415,6 @@ def download_youtube_audio_by_language(
                         msg = str(exc)
                         is_bot = "Sign in to confirm" in msg or "not a bot" in msg.lower()
                         if is_bot:
-                            # Bot on this cookie mode: try the alternate mode once,
-                            # then give up (hammering makes YouTube stricter).
                             logger.warning(
                                 "YouTube bot check cookies=%s — switching cookie mode / aborting",
                                 use_cookies,
@@ -1333,18 +1438,26 @@ def download_youtube_audio_by_language(
                 break
         if path:
             break
-        # If every cookie mode hit bot / format failure, stop after the loop.
+
     if not path:
         detail = _friendly_yt_extract_error(
             str(last_err).strip() if last_err else "yt-dlp produced no output file"
         )
-        if "invalid format" in detail.lower() or "unexpected (" in detail.lower():
-            raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
-        raise RuntimeError(f"FETCH_FAILED: {detail}")
+        raise RuntimeError(
+            "NO_LANGUAGE_TRACK: "
+            + _language_download_failed_error(
+                target_lang,
+                format_ids=format_attempts,
+                found_langs=found_langs,
+                detail=detail,
+            )
+        )
+
+    selected = _assert_selected_format_is_target_lang(tracks, selected_attempt or fmt_id, target_lang)
 
     actual = probe_media_duration_sec(path)
     if _is_audio_truncated(actual, expected):
-        retry_fmt = selected_attempt or fmt_id or f"ba[language^={code}]"
+        retry_fmt = selected
         out_tmpl = os.path.join(out_dir, "out.%(ext)s")
         clear_download_proxies()
         _clear_out_files(out_dir)
@@ -1377,13 +1490,13 @@ def download_youtube_audio_by_language(
             raise RuntimeError("yt-dlp produced no output file")
         path = files[0]
         actual = probe_media_duration_sec(path)
+        selected = _assert_selected_format_is_target_lang(tracks, selected, target_lang)
     if _is_audio_truncated(actual, expected):
         raise RuntimeError(
             "YouTube 音声が動画より短く切れています"
             f"（取得 {actual:.0f}秒 / 動画 {expected:.0f}秒）。"
             " 音声ファイルを直接アップロードするか、再度お試しください。"
         )
-    selected = selected_attempt or fmt_id or f"ba[language^={code}]"
     return path, actual, expected, selected
 
 
@@ -1791,6 +1904,15 @@ def extract():
                 {
                     "ok": False,
                     "errorCode": "NO_LANGUAGE_TRACK",
+                    "error": detail.split(":", 1)[1].strip(),
+                    "targetLang": target_lang or None,
+                }
+            ), 422
+        if detail.startswith("WRONG_LANGUAGE_TRACK:"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "errorCode": "WRONG_LANGUAGE_TRACK",
                     "error": detail.split(":", 1)[1].strip(),
                     "targetLang": target_lang or None,
                 }
