@@ -33,6 +33,19 @@ from urllib.parse import urlparse
 from flask import Flask, Response, abort, jsonify, request
 import yt_dlp
 
+from lang_tracks import (
+    assert_selected_format as _lt_assert_selected_format,
+    catalog_strong_langs,
+    exclusive_target_format_ids,
+    format_id_is_exclusive_target,
+    format_id_strong_signals,
+    normalize_lang_code as _normalize_lang_code,
+    resolve_target_tracks,
+    strong_lang_signals as _track_strong_lang_signals,
+    xtags_from_url as _xtags_from_url,
+    xtags_lang as _xtags_lang_from_url,
+)
+
 app = Flask(__name__)
 logger = logging.getLogger("wavrick.yt_audio")
 logging.basicConfig(level=logging.INFO)
@@ -52,7 +65,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 15
+_EXTRACT_BUILD = 16
 
 # v3 ADR: language-specific dubbed track extraction
 _LANG_DISPLAY = {
@@ -649,10 +662,6 @@ def download_youtube_audio(
     return files[0]
 
 
-def _normalize_lang_code(raw: str | None) -> str:
-    return (raw or "").strip().lower().split("-")[0]
-
-
 def _language_format_selector(target_lang: str, *, prefer_dub: bool = True) -> str:
     """
     yt-dlp format selector for a specific language audio track.
@@ -734,6 +743,7 @@ def _audio_tracks_from_info(info: dict) -> list[dict]:
                 "formatId": fmt_id,
                 "language": lang,
                 "formatNote": note,
+                "format": fmt_str,
                 "abr": fmt.get("abr"),
                 "ext": fmt.get("ext") or "m4a",
                 "isAudioOnly": vcodec in (None, "none"),
@@ -741,6 +751,7 @@ def _audio_tracks_from_info(info: dict) -> list[dict]:
                 "downloadUrl": direct_url or None,
                 "manifestUrl": manifest_url or None,
                 "httpHeaders": {str(k): str(v) for k, v in http_headers.items()},
+                "xtags": _xtags_from_url(direct_url) if direct_url else "",
             }
         )
     return tracks
@@ -767,82 +778,8 @@ def _merge_audio_tracks(*track_lists: list[dict]) -> list[dict]:
 
 
 def _track_lang_signals(track: dict) -> set[str]:
-    """Collect all language codes hinted by metadata (field, note, xtags)."""
-    signals: set[str] = set()
-    raw = str(track.get("language") or "").strip().lower()
-    if raw and re.fullmatch(r"[a-z]{2,3}([_-][a-z0-9]+)?", raw):
-        signals.add(_normalize_lang_code(raw))
-    note = str(track.get("formatNote") or "").lower()
-    bracket = re.search(r"\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]", note)
-    if bracket:
-        signals.add(_normalize_lang_code(bracket.group(1)))
-    name_map = {
-        "japanese": "ja",
-        "日本語": "ja",
-        "korean": "ko",
-        "한국어": "ko",
-        "english": "en",
-        "spanish": "es",
-        "chinese": "zh",
-        "mandarin": "zh",
-        "arabic": "ar",
-        "french": "fr",
-        "german": "de",
-        "hindi": "hi",
-        "indonesian": "id",
-        "italian": "it",
-        "portuguese": "pt",
-        "russian": "ru",
-    }
-    for name, code in name_map.items():
-        if name in note:
-            signals.add(code)
-    xt = _track_xtags_lang(track)
-    if xt:
-        xt_code = _normalize_lang_code(xt)
-        if xt_code:
-            signals.add(xt_code)
-    signals.discard("")
-    return signals
-
-
-def _track_declared_lang_code(track: dict) -> str:
-    """
-    Best language code for a track.
-
-    Prefer format_note markers ([ko] Korean, …) over the `language` field when
-    they disagree — some yt-dlp clients mis-tag the default dub language onto
-    every 140-* variant (which caused ko-as-ja downloads).
-    """
-    note = str(track.get("formatNote") or "").lower()
-    bracket = re.search(r"\[([a-z]{2,3}(?:-[a-z0-9]+)?)\]", note)
-    if bracket:
-        return _normalize_lang_code(bracket.group(1))
-    name_map = (
-        ("japanese", "ja"),
-        ("日本語", "ja"),
-        ("korean", "ko"),
-        ("한국어", "ko"),
-        ("english", "en"),
-        ("spanish", "es"),
-        ("chinese", "zh"),
-        ("mandarin", "zh"),
-        ("arabic", "ar"),
-        ("french", "fr"),
-        ("german", "de"),
-        ("hindi", "hi"),
-        ("indonesian", "id"),
-        ("italian", "it"),
-        ("portuguese", "pt"),
-        ("russian", "ru"),
-    )
-    for name, code in name_map:
-        if name in note:
-            return code
-    raw = str(track.get("language") or "").strip().lower()
-    if raw and re.fullmatch(r"[a-z]{2,3}([_-][a-z0-9]+)?", raw):
-        return _normalize_lang_code(raw)
-    return ""
+    """Strong language evidence only (note/[lang]/xtags). Bare language field ignored."""
+    return _track_strong_lang_signals(track)
 
 
 def _track_matches_language(track: dict, target_lang: str) -> bool:
@@ -850,12 +787,7 @@ def _track_matches_language(track: dict, target_lang: str) -> bool:
     if not code:
         return False
     signals = _track_lang_signals(track)
-    if not signals:
-        return False
-    # Any conflicting signal → not a match (never treat ko note as ja).
-    if any(s != code for s in signals):
-        return False
-    return code in signals
+    return signals == {code}
 
 
 def _format_id_lang_signals(tracks: list[dict], format_id: str) -> set[str]:
@@ -931,13 +863,10 @@ def _tracks_for_target_lang(tracks: list[dict], target_lang: str) -> list[dict]:
 
 
 def _select_language_format_id(tracks: list[dict], target_lang: str) -> str | None:
-    pool_src = _tracks_for_target_lang(tracks, target_lang)
-    if not pool_src:
+    resolved = resolve_target_tracks(tracks, target_lang, require_dubbed=False)
+    if not resolved:
         return None
-    with_url = [t for t in pool_src if t.get("hasUrl")]
-    pool = with_url or pool_src
-    best = max(pool, key=_score_language_track)
-    return str(best.get("formatId") or "") or None
+    return str(resolved[0].get("formatId") or "") or None
 
 
 def _lang_display_name(target_lang: str) -> str:
@@ -1020,33 +949,19 @@ def _is_original_language_track(track: dict) -> bool:
     return "original" in note
 
 
-def _track_xtags(track: dict) -> str:
-    """Return googlevideo xtags query value when present (e.g. acont=dubbed-auto:lang=ja)."""
-    du = str(track.get("downloadUrl") or "").strip()
-    if not du.startswith("http"):
-        return ""
-    try:
-        from urllib.parse import parse_qs, urlparse
-
-        q = parse_qs(urlparse(du).query)
-        vals = q.get("xtags") or q.get("xtag") or []
-        return str(vals[0] if vals else "").lower()
-    except Exception:
-        return ""
+def _track_xtags(track) -> str:
+    """Return googlevideo xtags from a track dict or raw URL."""
+    if isinstance(track, str):
+        return _xtags_from_url(track)
+    return _xtags_from_url(str((track or {}).get("downloadUrl") or (track or {}).get("xtags") or ""))
 
 
-def _track_xtags_lang(track: dict) -> str:
-    xt = _track_xtags(track)
-    if not xt:
-        return ""
-    # acont=dubbed-auto:lang=ja  or lang=ja:acont=...
-    for part in xt.replace("%3a", ":").replace("%3A", ":").split(":"):
-        part = part.strip()
-        if part.startswith("lang="):
-            return part.split("=", 1)[1].strip().lower()
-    if "lang=" in xt:
-        return xt.split("lang=", 1)[1].split(":")[0].strip().lower()
-    return ""
+def _track_xtags_lang(track) -> str:
+    if isinstance(track, str):
+        return _xtags_lang_from_url(track)
+    return _xtags_lang_from_url(
+        str((track or {}).get("downloadUrl") or (track or {}).get("xtags") or "")
+    )
 
 
 def _track_confirms_target_lang(track: dict, target_lang: str) -> bool:
@@ -1235,36 +1150,28 @@ def probe_youtube_audio_tracks(
                     )
                     merged = _merge_audio_tracks(merged, tracks)
 
-                    has_langs = any(t.get("language") for t in tracks)
-                    # Only early-stop on a STRONG target match (note/[lang] evidence).
-                    # Weak language=ja tagging on Korean 140-9 caused wrong downloads
-                    # when we stopped probing before a correctly labeled client appeared.
-                    has_target_strong = bool(
-                        want
-                        and any(
-                            _track_matches_language(t, want) and _track_has_strong_lang_label(t)
-                            for t in merged
-                        )
-                    )
-                    # When multiple 140-* dubs exist, wait until we know ≥2 languages
-                    # so a single mis-tagged row cannot win alone.
-                    family_langs = {
-                        s
-                        for t in merged
-                        if str(t.get("formatId") or "").startswith("140")
-                        for s in _track_lang_signals(t)
-                    }
-                    multi_dub_ok = (not want) or len(family_langs) >= 2 or not any(
+                    strong_langs = catalog_strong_langs(merged)
+                    exclusive = exclusive_target_format_ids(merged, want) if want else []
+                    # Early-stop ONLY when we have exclusive strong evidence for target
+                    # AND at least two strong languages overall (or no 140-* multi-dub family).
+                    has_140_family = any(
                         str(t.get("formatId") or "").startswith("140") for t in merged
                     )
-                    if has_target_strong and multi_dub_ok:
+                    multi_ok = (not has_140_family) or len(strong_langs) >= 2
+                    if want and exclusive and multi_ok:
+                        logger.info(
+                            "probe early-stop target=%s exclusive=%s strong_langs=%s",
+                            want,
+                            exclusive[:8],
+                            strong_langs,
+                        )
                         return best_info, merged, None
-                    if has_langs and len(langs) >= 2 and not want:
+                    if not want and len(strong_langs) >= 2:
                         return best_info, merged, None
-                    if has_langs and not want:
+                    if not want and strong_langs:
                         return best_info, merged, None
-                    # Found langs but not a strong target — keep probing other clients.
-                    if has_langs:
+                    # Keep probing other clients until exclusive target evidence exists.
+                    if strong_langs or langs:
                         break  # move to next client; don't thrash IP families
                 except Exception as exc:
                     last_err = exc
@@ -1292,10 +1199,12 @@ def probe_youtube_audio_tracks_for_lang(
     Returns (info, tracks, err, languages_found).
     """
     info, tracks, err = probe_youtube_audio_tracks(url, target_lang=target_lang)
-    langs = sorted({str(t.get("language") or "") for t in tracks if t.get("language")})
-    if target_lang and tracks and not any(_track_matches_language(t, target_lang) for t in tracks):
+    langs = catalog_strong_langs(tracks) or sorted(
+        {str(t.get("language") or "") for t in tracks if t.get("language")}
+    )
+    if target_lang and tracks and not exclusive_target_format_ids(tracks, target_lang):
         logger.warning(
-            "targetLang=%s not in probed langs=%s (tracks=%d)",
+            "targetLang=%s has no exclusive strong format (strong_langs=%s tracks=%d)",
             target_lang,
             langs,
             len(tracks),
@@ -1386,12 +1295,10 @@ def download_youtube_audio_by_language(
     require_dubbed: bool = False,
 ) -> tuple[str, float, float, str | None]:
     """
-    Download language-specific audio track.
-    Returns (path, audio_duration_sec, video_duration_sec, selected_format_id).
-    Raises RuntimeError with user-facing message on failure.
+    Download language-specific audio track with ZERO cross-language fallback.
 
-    Never falls back to a different language. If the target language track cannot
-    be downloaded, raises NO_LANGUAGE_TRACK / FETCH_FAILED / WRONG_LANGUAGE_TRACK.
+    Accepts only format_ids whose strong evidence (note/[lang]/xtags) uniquely
+    identifies target_lang. Raises NO_LANGUAGE_TRACK / WRONG_LANGUAGE_TRACK / FETCH_FAILED.
     """
     info, tracks, probe_err, found_langs = probe_youtube_audio_tracks_for_lang(url, target_lang)
     expected = max(0.0, float((info or {}).get("duration") or 0))
@@ -1399,27 +1306,30 @@ def download_youtube_audio_by_language(
         detail = _friendly_yt_extract_error(str(probe_err).strip() or probe_err.__class__.__name__)
         raise RuntimeError(f"FETCH_FAILED: {detail}")
 
-    # Exclusive format_id match across all probe clients (rejects mis-tagged rows
-    # when another client correctly labels the same format_id as a different lang).
-    lang_tracks = _tracks_for_target_lang(tracks, target_lang)
-    # Prefer rows with explicit note/[lang] evidence.
-    strong = [t for t in lang_tracks if _track_has_strong_lang_label(t)]
-    if strong:
-        lang_tracks = strong
+    strong_found = catalog_strong_langs(tracks)
+    lang_tracks = resolve_target_tracks(
+        tracks, target_lang, require_dubbed=require_dubbed
+    )
     if not lang_tracks:
+        # Distinguish "no strong evidence at all" vs "only original for this lang"
+        exclusive = exclusive_target_format_ids(tracks, target_lang)
+        if not exclusive:
+            raise RuntimeError(
+                "NO_LANGUAGE_TRACK: "
+                + _no_language_track_error(target_lang, strong_found or found_langs)
+                + "\n（note/[lang]/xtags で確定できる対象言語トラックがありません。"
+                + " 他言語トラックへのフォールバックは行いません。）"
+            )
+        if require_dubbed:
+            raise RuntimeError(
+                "NO_LANGUAGE_TRACK: "
+                + _no_dub_track_error(target_lang, strong_found or found_langs)
+            )
         raise RuntimeError(
-            f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}"
-            + "\n（確定できる対象言語 format がありません。他言語への切り替えは行いません。）"
+            "NO_LANGUAGE_TRACK: "
+            + _no_language_track_error(target_lang, strong_found or found_langs)
         )
 
-    lang_tracks = _prefer_dub_language_tracks(
-        lang_tracks,
-        require_dubbed=require_dubbed,
-        target_lang=target_lang,
-        found_langs=found_langs,
-    )
-
-    # Prefer higher ABR + hasUrl, then score; keep source metadata for download.
     lang_tracks = sorted(lang_tracks, key=_score_language_track, reverse=True)
     fmt_id = str(lang_tracks[0].get("formatId") or "") or None
     preferred_clients = [
@@ -1430,26 +1340,30 @@ def download_youtube_audio_by_language(
     preferred_ip = str(lang_tracks[0].get("sourceIpFamily") or "ipv6")
     preferred_cookies = bool(lang_tracks[0].get("sourceUseCookies"))
 
-    # ONLY exact confirmed format IDs — never bare "140" or ba[language^=…]
-    # (those can resolve to a different dubbed language).
+    # ONLY exact exclusive format IDs — never ba[language^=] / bare "140".
     format_attempts: list[str] = []
     for t in lang_tracks:
         fid = str(t.get("formatId") or "").strip()
-        if fid and fid not in format_attempts:
-            format_attempts.append(fid)
+        if not fid or fid in format_attempts:
+            continue
+        if not format_id_is_exclusive_target(tracks, fid, target_lang):
+            logger.warning("skip non-exclusive format_id=%s", fid)
+            continue
+        format_attempts.append(fid)
     if not format_attempts:
-        raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
+        raise RuntimeError(
+            "NO_LANGUAGE_TRACK: "
+            + _no_language_track_error(target_lang, strong_found or found_langs)
+        )
 
     client_attempts: list[list[str]] = [preferred_clients]
     if preferred_clients != ["tv_downgraded"]:
         client_attempts.append(["tv_downgraded"])
 
-    # Stick to probe IP first; only one alternate (IPv4 after IPv6 often 403s dubbed CDN).
     ip_attempts = [preferred_ip]
     if preferred_ip != "auto":
         ip_attempts.append("auto")
 
-    # CRITICAL: download with the same cookie mode that exposed the language track.
     cookie_modes: list[bool] = [preferred_cookies]
     alt = not preferred_cookies
     if alt is True and not _resolve_yt_cookiefile():
@@ -1468,15 +1382,15 @@ def download_youtube_audio_by_language(
     )
     selected_attempt: str | None = None
 
-    # Prefer probe-minted googlevideo URL — skips a second player extract.
     for t in lang_tracks:
-        if not _track_confirms_target_lang(t, target_lang):
+        fid = str(t.get("formatId") or "").strip()
+        if not fid or not format_id_is_exclusive_target(tracks, fid, target_lang):
             continue
-        xt_lang = _track_xtags_lang(t)
-        if xt_lang and _normalize_lang_code(xt_lang) != _normalize_lang_code(target_lang):
+        xt_lang = _track_xtags_lang(str(t.get("downloadUrl") or ""))
+        if xt_lang and xt_lang != _normalize_lang_code(target_lang):
             logger.warning(
                 "skip track format=%s — xtags lang=%s != target=%s",
-                t.get("formatId"),
+                fid,
                 xt_lang,
                 target_lang,
             )
@@ -1492,21 +1406,22 @@ def download_youtube_audio_by_language(
                 ext_hint=str(t.get("ext") or "webm"),
                 http_headers=t.get("httpHeaders") if isinstance(t.get("httpHeaders"), dict) else None,
             )
-            selected_attempt = str(t.get("formatId") or "") or None
+            selected_attempt = fid
             success_ctx = (preferred_cookies, preferred_clients, preferred_ip)
             logger.warning(
-                "language audio direct URL succeeded lang=%s format=%s xtags_lang=%s size=%s",
+                "language audio direct URL succeeded lang=%s format=%s xtags_lang=%s size=%s strong=%s",
                 target_lang,
                 selected_attempt,
-                _track_xtags_lang(t) or "?",
+                xt_lang or "?",
                 os.path.getsize(path),
+                sorted(format_id_strong_signals(tracks, fid)),
             )
             break
         except Exception as exc:
             last_err = exc
             logger.warning(
                 "language direct URL failed format=%s (%s) — trying next / yt-dlp",
-                t.get("formatId"),
+                fid,
                 exc,
             )
             path = ""
@@ -1600,12 +1515,22 @@ def download_youtube_audio_by_language(
             + _language_download_failed_error(
                 target_lang,
                 format_ids=format_attempts,
-                found_langs=found_langs,
+                found_langs=strong_found or found_langs,
                 detail=detail,
             )
         )
 
-    selected = _assert_selected_format_is_target_lang(tracks, selected_attempt or fmt_id, target_lang)
+    try:
+        selected = _lt_assert_selected_format(tracks, selected_attempt or fmt_id, target_lang)
+    except ValueError as exc:
+        raise RuntimeError(
+            "WRONG_LANGUAGE_TRACK: "
+            + _wrong_language_track_error(
+                target_lang,
+                format_id=str(selected_attempt or fmt_id or ""),
+            )
+            + f"\n詳細: {exc}"
+        ) from exc
 
     actual = probe_media_duration_sec(path)
     if _is_audio_truncated(actual, expected):
@@ -1642,7 +1567,14 @@ def download_youtube_audio_by_language(
             raise RuntimeError("yt-dlp produced no output file")
         path = files[0]
         actual = probe_media_duration_sec(path)
-        selected = _assert_selected_format_is_target_lang(tracks, selected, target_lang)
+        try:
+            selected = _lt_assert_selected_format(tracks, selected, target_lang)
+        except ValueError as exc:
+            raise RuntimeError(
+                "WRONG_LANGUAGE_TRACK: "
+                + _wrong_language_track_error(target_lang, format_id=selected)
+                + f"\n詳細: {exc}"
+            ) from exc
     if _is_audio_truncated(actual, expected):
         raise RuntimeError(
             "YouTube 音声が動画より短く切れています"
@@ -2043,6 +1975,9 @@ def extract():
                     "byteLength": file_size,
                     "targetLang": target_lang or None,
                     "selectedFormatId": selected_format_id,
+                    "selectedLang": target_lang or None,
+                    "langConfirmed": bool(target_lang and selected_format_id),
+                    "extractBuild": _EXTRACT_BUILD,
                 }
             )
 
@@ -2093,8 +2028,10 @@ def extract():
     resp.headers["X-Wavrick-Audio-Stem"] = "vocals" if separated else "mix"
     if target_lang:
         resp.headers["X-Wavrick-Target-Lang"] = target_lang
+        resp.headers["X-Wavrick-Lang-Confirmed"] = "1" if selected_format_id else "0"
     if selected_format_id:
         resp.headers["X-Wavrick-Selected-Format"] = selected_format_id
+    resp.headers["X-Wavrick-Extract-Build"] = str(_EXTRACT_BUILD)
     if audio_dur > 0:
         resp.headers["X-Wavrick-Audio-Duration-Sec"] = f"{audio_dur:.2f}"
     if video_dur > 0:

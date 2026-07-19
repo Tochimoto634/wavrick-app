@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements-railway.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py cors_utils.py rate_limit.py run_demucs.py ./
+COPY app.py cors_utils.py rate_limit.py run_demucs.py lang_tracks.py ./
 
 ENV WAVRICK_VOCAL_SEPARATION=0
 
