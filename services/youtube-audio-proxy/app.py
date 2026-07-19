@@ -51,7 +51,16 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 3
+_EXTRACT_BUILD = 12
+
+# v3 ADR: language-specific dubbed track extraction
+_LANG_DISPLAY = {
+    "ja": "日本語",
+    "en": "英語",
+    "es": "スペイン語",
+    "ko": "韓国語",
+    "zh": "中国語",
+}
 # 動画長の何割未満なら「途中切断」とみなすか
 _MIN_DURATION_RATIO = float(os.environ.get("WAVRICK_AUDIO_MIN_DURATION_RATIO", "0.88"))
 
@@ -87,7 +96,7 @@ def _yt_proxy() -> str:
 
 
 def _resolve_yt_cookiefile() -> str | None:
-    """ファイルパス / 環境変数テキスト / Base64 から yt-dlp 用 cookies.txt を用意。"""
+    """ファイルパス / 環境変数テキスト / Base64 / .local cookies から yt-dlp 用 cookies.txt を用意。"""
     global _COOKIE_CACHE_PATH
 
     path = os.environ.get("WAVRICK_YT_COOKIES", "").strip()
@@ -95,6 +104,16 @@ def _resolve_yt_cookiefile() -> str | None:
         return path
     if _COOKIE_CACHE_PATH and os.path.isfile(_COOKIE_CACHE_PATH):
         return _COOKIE_CACHE_PATH
+
+    # Local defaults (repo .local is gitignored)
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    for candidate in (
+        os.path.join(root, ".local", "youtube-cookies-filtered.txt"),
+        os.path.join(root, ".local", "youtube-cookies.txt"),
+    ):
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 32:
+            logger.info("YouTube cookies loaded from %s", candidate)
+            return candidate
 
     text = os.environ.get("WAVRICK_YT_COOKIES_TEXT", "").strip()
     if not text:
@@ -120,14 +139,18 @@ def _resolve_yt_cookiefile() -> str | None:
 def _friendly_yt_extract_error(detail: str) -> str:
     if "Sign in to confirm" in detail or "not a bot" in detail.lower():
         return (
-            "YouTube がボット判定しています（Railway の IP がブロックされています）。"
-            " 対処: ①依頼フォームで音声ファイルを直接アップロード ② Railway に YouTube ログイン済み cookies を設定"
-            "（WAVRICK_YT_COOKIES_B64・YouTube 用に絞り込み済み）。./scripts/export-youtube-cookies-for-railway.sh を参照。"
+            "YouTube がボット判定しています。"
+            " 対処: ① ブラウザから新しい cookies を書き出す（./scripts/export-youtube-cookies-for-railway.sh）"
+            " ② 数分待って再試行 ③ 音声ファイルを直接アップロード。"
+            f" 詳細: {detail[:240]}"
         )
     if "403" in detail or "Forbidden" in detail:
         return (
             "YouTube から音声を取得できませんでした（403）。"
-            " しばらくして再試行するか、音声ファイルを直接アップロードしてください。"
+            " Railway 等のデータセンター IP が弾かれていることが多いです。"
+            " 対処: ① ./scripts/export-youtube-cookies-for-railway.sh で新しい cookies を Railway の WAVRICK_YT_COOKIES_B64 に設定"
+            " ② 必要なら WAVRICK_YT_PROXY（住宅系プロキシ）を設定"
+            " ③ しばらくして再試行、または音声ファイルを直接アップロード。"
             f" 詳細: {detail[:240]}"
         )
     if "requested format is not available" in detail.lower() or "no video formats found" in detail.lower():
@@ -165,7 +188,10 @@ def _normalize_player_clients(clients: list[str], *, use_cookies: bool) -> list[
 
 
 def _player_client_attempts(*, use_cookies: bool = True) -> list[list[str]]:
-    """Railway + Cookie では tv DRM / SABR で bestaudio が空になることがある。"""
+    """
+    Railway + Cookie では tv DRM / SABR で bestaudio が空になることがある。
+    複数言語吹替トラックは web_safari / tv_downgraded でないと見えないことが多い。
+    """
     raw = os.environ.get("WAVRICK_YT_PLAYER_CLIENT", "").strip()
     primary = _normalize_player_clients(
         [c.strip() for c in raw.split(",") if c.strip()],
@@ -173,6 +199,8 @@ def _player_client_attempts(*, use_cookies: bool = True) -> list[list[str]]:
     )
     if use_cookies and _resolve_yt_cookiefile():
         defaults: list[list[str]] = [
+            ["web_safari", "web"],
+            ["tv_downgraded", "web"],
             ["web", "tv", "tv_embedded"],
             ["tv", "tv_embedded", "web"],
             ["web"],
@@ -181,6 +209,8 @@ def _player_client_attempts(*, use_cookies: bool = True) -> list[list[str]]:
         ]
     else:
         defaults = [
+            ["web_safari", "android", "web"],
+            ["tv_downgraded", "web"],
             ["android", "web"],
             ["tv", "tv_embedded", "android", "web"],
             ["web"],
@@ -192,25 +222,78 @@ def _player_client_attempts(*, use_cookies: bool = True) -> list[list[str]]:
     return defaults
 
 
+def _language_probe_client_attempts(*, use_cookies: bool = True) -> list[list[str]]:
+    """Clients that are most likely to expose multi-language / dubbed audio tracks."""
+    raw = os.environ.get("WAVRICK_YT_LANG_PLAYER_CLIENT", "").strip()
+    if raw:
+        primary = _normalize_player_clients(
+            [c.strip() for c in raw.split(",") if c.strip()],
+            use_cookies=use_cookies,
+        )
+        if primary:
+            return [primary]
+    # tv_downgraded is currently the most reliable for AI/multi-language audio.
+    preferred = [
+        ["tv_downgraded"],
+        ["web_safari"],
+        ["web"],
+        ["mweb"],
+        ["android"],
+        ["ios"],
+    ]
+    return [
+        _normalize_player_clients(clients, use_cookies=use_cookies) or clients
+        for clients in preferred
+    ]
+
+
 def _youtube_extractor_args(player_clients: list[str] | None = None) -> dict:
     clients = player_clients or _player_client_attempts(use_cookies=True)[0]
     return {
         "youtube": {
             "player_client": clients,
-            "player_skip": ["webpage"],
+            # Keep webpage enabled for lang probe-friendly clients when possible;
+            # skip only when using cookie challenge-prone paths via env override.
+            "player_skip": (
+                []
+                if os.environ.get("WAVRICK_YT_KEEP_WEBPAGE", "").strip().lower()
+                in ("1", "true", "yes", "on")
+                else ["webpage"]
+            ),
             "player_js_version": ["actual"],
         }
     }
 
 
-def _base_ydl_opts(*, use_cookies: bool = True, player_clients: list[str] | None = None, **extra) -> dict:
+def _base_ydl_opts(
+    *,
+    use_cookies: bool = True,
+    player_clients: list[str] | None = None,
+    force_ipv4: bool | None = None,
+    force_ipv6: bool | None = None,
+    **extra,
+) -> dict:
+    # Default force_ipv4 helps some Railway/CDN cases, but language-dub tracks
+    # frequently mint googlevideo URLs bound to the probe IP family. Forcing
+    # IPv4 after an IPv6-bound URL → HTTP 403. Callers can override.
+    if force_ipv4 is None:
+        env = os.environ.get("WAVRICK_YT_FORCE_IPV4", "").strip().lower()
+        if env in ("0", "false", "no", "off"):
+            force_ipv4 = False
+        elif env in ("1", "true", "yes", "on"):
+            force_ipv4 = True
+        else:
+            force_ipv4 = True
     opts: dict = {
         "quiet": True,
         "noplaylist": True,
         "proxy": _yt_proxy(),
-        "force_ipv4": True,
         "extractor_args": _youtube_extractor_args(player_clients),
     }
+    if force_ipv4:
+        opts["force_ipv4"] = True
+    if force_ipv6:
+        opts["force_ipv6"] = True
     if use_cookies:
         cookiefile = _resolve_yt_cookiefile()
         if cookiefile:
@@ -565,6 +648,745 @@ def download_youtube_audio(
     return files[0]
 
 
+def _normalize_lang_code(raw: str | None) -> str:
+    return (raw or "").strip().lower().split("-")[0]
+
+
+def _language_format_selector(target_lang: str, *, prefer_dub: bool = True) -> str:
+    """
+    yt-dlp format selector for a specific language audio track.
+
+    Avoid `:not(...)` — older yt-dlp (and some builds) raise
+    "Invalid format specification: Unexpected '('".
+    Prefer probe-selected format_id when available; these selectors are fallbacks.
+    """
+    code = _normalize_lang_code(target_lang)
+    if not code:
+        return _AUDIO_FORMAT
+    # Prefer dubbed / AI dub notes first, then any matching language audio.
+    if prefer_dub:
+        return (
+            f"ba[language^={code}][format_note*=dub]/"
+            f"ba[language^={code}][format_note*=Dub]/"
+            f"bestaudio[language^={code}][format_note*=dub]/"
+            f"ba[language^={code}]/"
+            f"bestaudio[language^={code}]"
+        )
+    return f"ba[language^={code}]/bestaudio[language^={code}]"
+
+
+def _audio_tracks_from_info(info: dict) -> list[dict]:
+    """Enumerate audio-capable formats with language metadata."""
+    formats = info.get("formats") or []
+    tracks: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for fmt in formats:
+        acodec = fmt.get("acodec")
+        if acodec in (None, "none"):
+            continue
+        vcodec = fmt.get("vcodec")
+        lang = str(fmt.get("language") or fmt.get("language_preference") or "").lower()
+        # Some clients put language only in format_note / format / audio_track
+        note = str(fmt.get("format_note") or "")
+        fmt_str = str(fmt.get("format") or "")
+        audio_track = str(fmt.get("audio_track") or "")
+        if not lang:
+            blob = f"{note} {fmt_str} {audio_track}".lower()
+            for code in ("ja", "en", "es", "ko", "zh", "fr", "de", "pt", "it", "ru", "hi", "id", "th", "vi"):
+                if (
+                    f"[{code}]" in blob
+                    or f"({code})" in blob
+                    or f" {code} " in f" {blob} "
+                    or blob.startswith(f"{code} ")
+                    or blob.endswith(f" {code}")
+                    or f"language={code}" in blob
+                    or f"lang={code}" in blob
+                ):
+                    lang = code
+                    break
+            # Human-readable names from YouTube UI style notes
+            name_map = {
+                "japanese": "ja",
+                "日本語": "ja",
+                "english": "en",
+                "spanish": "es",
+                "korean": "ko",
+                "중국어": "zh",
+                "chinese": "zh",
+                "mandarin": "zh",
+            }
+            if not lang:
+                for name, code in name_map.items():
+                    if name in blob:
+                        lang = code
+                        break
+        fmt_id = str(fmt.get("format_id") or "")
+        key = (lang, fmt_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        direct_url = str(fmt.get("url") or "").strip()
+        manifest_url = str(fmt.get("manifest_url") or "").strip()
+        http_headers = fmt.get("http_headers") if isinstance(fmt.get("http_headers"), dict) else {}
+        tracks.append(
+            {
+                "formatId": fmt_id,
+                "language": lang,
+                "formatNote": note,
+                "abr": fmt.get("abr"),
+                "ext": fmt.get("ext") or "m4a",
+                "isAudioOnly": vcodec in (None, "none"),
+                "hasUrl": bool(direct_url or manifest_url),
+                "downloadUrl": direct_url or None,
+                "manifestUrl": manifest_url or None,
+                "httpHeaders": {str(k): str(v) for k, v in http_headers.items()},
+            }
+        )
+    return tracks
+
+
+def _merge_audio_tracks(*track_lists: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for tracks in track_lists:
+        for t in tracks:
+            key = (str(t.get("language") or ""), str(t.get("formatId") or ""))
+            if key in seen:
+                # Prefer entries that have URL / richer note
+                existing = next(
+                    (x for x in merged if (str(x.get("language") or ""), str(x.get("formatId") or "")) == key),
+                    None,
+                )
+                if existing and not existing.get("hasUrl") and t.get("hasUrl"):
+                    existing.update(t)
+                continue
+            seen.add(key)
+            merged.append(dict(t))
+    return merged
+
+
+def _track_matches_language(track: dict, target_lang: str) -> bool:
+    code = _normalize_lang_code(target_lang)
+    if not code:
+        return False
+    lang = str(track.get("language") or "").lower()
+    if lang == code or lang.startswith(f"{code}-") or lang.startswith(f"{code}_"):
+        return True
+    note = str(track.get("formatNote") or "").lower()
+    if f"[{code}]" in note or note.startswith(f"{code},") or f",{code}" in note:
+        return True
+    if code == "ja" and any(x in note for x in ("japanese", "日本語", "ja-jp", "ja_jp")):
+        return True
+    return False
+
+
+def _select_language_format_id(tracks: list[dict], target_lang: str) -> str | None:
+    matches = [
+        t
+        for t in tracks
+        if _track_confirms_target_lang(t, target_lang) or _track_matches_language(t, target_lang)
+    ]
+    # Prefer confirmed (xtags-consistent) matches when available
+    confirmed = [t for t in matches if _track_confirms_target_lang(t, target_lang)]
+    pool_src = confirmed or matches
+    if not pool_src:
+        return None
+    # Prefer tracks that still have a downloadable URL after SABR filtering.
+    with_url = [t for t in pool_src if t.get("hasUrl")]
+    pool = with_url or pool_src
+    best = max(pool, key=_score_language_track)
+    return str(best.get("formatId") or "") or None
+
+
+def _lang_display_name(target_lang: str) -> str:
+    code = _normalize_lang_code(target_lang)
+    return _LANG_DISPLAY.get(code, code or "指定言語")
+
+
+def _no_language_track_error(target_lang: str, found_langs: list[str] | None = None) -> str:
+    name = _lang_display_name(target_lang)
+    msg = (
+        f"この動画には{name}の音声トラックが見つかりませんでした。\n"
+        f"YouTube Studio の「言語」で{name}の音声トラックを追加・公開してから再度お試しください。"
+    )
+    langs = [x for x in (found_langs or []) if x]
+    if langs:
+        msg += f"\n（yt-dlp が見つけた言語: {', '.join(langs)}）"
+    else:
+        msg += (
+            "\n（注意: プレイヤーでは見えても、yt-dlp のプレイヤークライアントによっては"
+            "言語トラック一覧が取れないことがあります。cookies / web_safari 設定を確認してください。）"
+        )
+    return msg
+
+
+def _no_dub_track_error(target_lang: str, found_langs: list[str] | None = None) -> str:
+    name = _lang_display_name(target_lang)
+    msg = (
+        f"この動画には{name}の吹替（非オリジナル）音声トラックが見つかりませんでした。\n"
+        f"見つかったのは原盤言語トラックのみです。"
+        f" YouTube Studio で{name}の AI 吹替／追加音声トラックを公開してから再度お試しください。"
+    )
+    langs = [x for x in (found_langs or []) if x]
+    if langs:
+        msg += f"\n（yt-dlp が見つけた言語: {', '.join(langs)}）"
+    return msg
+
+
+def _is_original_language_track(track: dict) -> bool:
+    note = str(track.get("formatNote") or "").lower()
+    return "original" in note
+
+
+def _track_xtags(track: dict) -> str:
+    """Return googlevideo xtags query value when present (e.g. acont=dubbed-auto:lang=ja)."""
+    du = str(track.get("downloadUrl") or "").strip()
+    if not du.startswith("http"):
+        return ""
+    try:
+        from urllib.parse import parse_qs, urlparse
+
+        q = parse_qs(urlparse(du).query)
+        vals = q.get("xtags") or q.get("xtag") or []
+        return str(vals[0] if vals else "").lower()
+    except Exception:
+        return ""
+
+
+def _track_xtags_lang(track: dict) -> str:
+    xt = _track_xtags(track)
+    if not xt:
+        return ""
+    # acont=dubbed-auto:lang=ja  or lang=ja:acont=...
+    for part in xt.replace("%3a", ":").replace("%3A", ":").split(":"):
+        part = part.strip()
+        if part.startswith("lang="):
+            return part.split("=", 1)[1].strip().lower()
+    if "lang=" in xt:
+        return xt.split("lang=", 1)[1].split(":")[0].strip().lower()
+    return ""
+
+
+def _track_confirms_target_lang(track: dict, target_lang: str) -> bool:
+    """True only when metadata (and xtags when present) agree with target language."""
+    code = _normalize_lang_code(target_lang)
+    if not code:
+        return False
+    if not _track_matches_language(track, code):
+        return False
+    xt_lang = _track_xtags_lang(track)
+    if xt_lang:
+        xt_code = _normalize_lang_code(xt_lang)
+        if xt_code and xt_code != code:
+            return False
+    return True
+
+
+def _prefer_dub_language_tracks(
+    lang_tracks: list[dict],
+    *,
+    require_dubbed: bool,
+    target_lang: str,
+    found_langs: list[str] | None,
+) -> list[dict]:
+    """Prefer non-original (dubbed) tracks; optionally hard-fail if only original exists."""
+    if not lang_tracks:
+        return lang_tracks
+    # Prefer URL-marked AI dubs, then notes without "original"
+    dubbed_xtags = [t for t in lang_tracks if "dubbed" in _track_xtags(t)]
+    if dubbed_xtags:
+        return dubbed_xtags
+    dubbed = [t for t in lang_tracks if not _is_original_language_track(t)]
+    if dubbed:
+        return dubbed
+    if require_dubbed:
+        raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_dub_track_error(target_lang, found_langs)}")
+    return lang_tracks
+
+
+def _score_language_track(track: dict) -> float:
+    note = str(track.get("formatNote") or "").lower()
+    xt = _track_xtags(track)
+    score = 0.0
+    if track.get("isAudioOnly"):
+        score += 10.0
+    if track.get("hasUrl"):
+        score += 5.0
+    if "dub" in note or "dubbed" in xt:
+        score += 20.0
+    if "original" in note or "acont=original" in xt:
+        score -= 15.0
+    score += float(track.get("abr") or 0) / 128.0
+    return score
+
+
+def probe_youtube_audio_tracks(
+    url: str,
+    *,
+    target_lang: str | None = None,
+) -> tuple[dict | None, list[dict], BaseException | None]:
+    """
+    Probe available audio tracks via yt-dlp across multiple player clients.
+
+    Stops early once a client/IP combo exposes language-tagged tracks
+    (and preferably the requested target_lang). Exhaustive probing is too slow
+    for interactive extract requests.
+    """
+    clear_download_proxies()
+    last_err: BaseException | None = None
+    best_info: dict | None = None
+    merged: list[dict] = []
+    want = _normalize_lang_code(target_lang)
+    # Language-dub listing is often more reliable without cookies on tv_downgraded.
+    # Prefer no-cookie first; stale cookies frequently cause bot challenges on download.
+    if _resolve_yt_cookiefile():
+        cookie_modes = (False, True) if want else (True, False)
+    else:
+        cookie_modes = (False,)
+
+    # Try IPv6 first: dubbed-track googlevideo URLs minted on dual-stack Macs
+    # are often IPv6-bound and 403 when force_ipv4 remaps the download.
+    ip_modes: list[tuple[bool | None, bool | None, str]] = [
+        (False, True, "ipv6"),
+        (False, False, "auto"),
+        (True, False, "ipv4"),
+    ]
+
+    for use_cookies in cookie_modes:
+        for clients in _language_probe_client_attempts(use_cookies=use_cookies):
+            for force_v4, force_v6, ip_label in ip_modes:
+                try:
+                    opts = _base_ydl_opts(
+                        skip_download=True,
+                        use_cookies=use_cookies,
+                        player_clients=clients,
+                        force_ipv4=force_v4,
+                        force_ipv6=force_v6,
+                        # Weak clients may only expose thumbnails; don't raise
+                        # "Requested format is not available" during probe.
+                        ignore_no_formats_error=True,
+                        format="ba/bestaudio/best/worst",
+                    )
+                    if any(c in ("web_safari", "tv_downgraded", "web") for c in clients):
+                        ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
+                        ya["player_skip"] = []
+                        opts["extractor_args"] = {"youtube": ya}
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                    if not info:
+                        continue
+                    if best_info is None:
+                        best_info = info
+                    tracks = _audio_tracks_from_info(info)
+                    for t in tracks:
+                        t["sourceClient"] = ",".join(clients)
+                        t["sourceIpFamily"] = ip_label
+                        t["sourceUseCookies"] = bool(use_cookies)
+                    langs = sorted({str(t.get("language") or "") for t in tracks if t.get("language")})
+                    logger.info(
+                        "track probe clients=%s cookies=%s ip=%s formats=%d langs=%s",
+                        clients,
+                        use_cookies,
+                        ip_label,
+                        len(tracks),
+                        langs[:12],
+                    )
+                    merged = _merge_audio_tracks(merged, tracks)
+
+                    has_langs = any(t.get("language") for t in tracks)
+                    has_target = bool(
+                        want and any(_track_matches_language(t, want) for t in tracks)
+                    )
+                    # Good enough: found requested language, or multi-language listing.
+                    if has_target or (has_langs and len(langs) >= 2 and not want):
+                        return best_info, merged, None
+                    if has_langs and not want:
+                        return best_info, merged, None
+                    # Found langs but not target — keep probing other clients.
+                    if has_langs:
+                        break  # move to next client; don't thrash IP families
+                except Exception as exc:
+                    last_err = exc
+                    if _is_format_or_challenge_error(exc):
+                        logger.warning(
+                            "track probe failed (%s) clients=%s cookies=%s ip=%s",
+                            exc,
+                            clients,
+                            use_cookies,
+                            ip_label,
+                        )
+                        continue
+                    raise
+
+    if best_info is not None:
+        return best_info, merged, None
+    return None, [], last_err
+
+
+def probe_youtube_audio_tracks_for_lang(
+    url: str, target_lang: str
+) -> tuple[dict | None, list[dict], BaseException | None, list[str]]:
+    """
+    Probe and prefer client that exposes the requested language.
+    Returns (info, tracks, err, languages_found).
+    """
+    info, tracks, err = probe_youtube_audio_tracks(url, target_lang=target_lang)
+    langs = sorted({str(t.get("language") or "") for t in tracks if t.get("language")})
+    if target_lang and tracks and not any(_track_matches_language(t, target_lang) for t in tracks):
+        logger.warning(
+            "targetLang=%s not in probed langs=%s (tracks=%d)",
+            target_lang,
+            langs,
+            len(tracks),
+        )
+    return info, tracks, err, langs
+
+
+def _download_ip_kwargs(ip_family: str | None) -> dict:
+    fam = (ip_family or "auto").lower()
+    if fam == "ipv6":
+        return {"force_ipv4": False, "force_ipv6": True}
+    if fam == "ipv4":
+        return {"force_ipv4": True, "force_ipv6": False}
+    return {"force_ipv4": False, "force_ipv6": False}
+
+
+def _download_direct_media_url(
+    media_url: str,
+    out_dir: str,
+    *,
+    ext_hint: str | None = None,
+    http_headers: dict | None = None,
+) -> str:
+    """
+    Download a googlevideo / CDN URL minted by probe without re-hitting YouTube
+    player APIs (avoids a second extract that often triggers bot challenges).
+    """
+    clear_download_proxies()
+    ext = (ext_hint or "webm").lstrip(".") or "webm"
+    raw_path = os.path.join(out_dir, f"direct.{ext}")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+    }
+    if http_headers:
+        for k, v in http_headers.items():
+            if v:
+                headers[str(k)] = str(v)
+    req = urllib.request.Request(media_url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        with open(raw_path, "wb") as fh:
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                fh.write(chunk)
+    if not os.path.isfile(raw_path) or os.path.getsize(raw_path) < 256:
+        raise RuntimeError("direct URL download produced empty file")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return raw_path
+    mp3_path = os.path.join(out_dir, "out.mp3")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        raw_path,
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-b:a",
+        "128k",
+        mp3_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.isfile(mp3_path):
+        logger.warning("ffmpeg remux failed; returning raw direct download: %s", proc.stderr[-400:])
+        return raw_path
+    try:
+        os.remove(raw_path)
+    except OSError:
+        pass
+    return mp3_path
+
+
+def download_youtube_audio_by_language(
+    url: str,
+    out_dir: str,
+    target_lang: str,
+    *,
+    require_dubbed: bool = False,
+) -> tuple[str, float, float, str | None]:
+    """
+    Download language-specific audio track.
+    Returns (path, audio_duration_sec, video_duration_sec, selected_format_id).
+    Raises RuntimeError with user-facing message on failure.
+    """
+    info, tracks, probe_err, found_langs = probe_youtube_audio_tracks_for_lang(url, target_lang)
+    expected = max(0.0, float((info or {}).get("duration") or 0))
+    if probe_err and not tracks:
+        detail = _friendly_yt_extract_error(str(probe_err).strip() or probe_err.__class__.__name__)
+        raise RuntimeError(f"FETCH_FAILED: {detail}")
+
+    lang_tracks = [t for t in tracks if _track_matches_language(t, target_lang)]
+    if not lang_tracks:
+        raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
+
+    # Drop tracks whose CDN xtags disagree (prevents downloading ko/en when requesting ja).
+    confirmed = [t for t in lang_tracks if _track_confirms_target_lang(t, target_lang)]
+    if confirmed:
+        lang_tracks = confirmed
+    else:
+        logger.warning(
+            "No xtags-confirmed tracks for lang=%s — using language-field matches only (%d)",
+            target_lang,
+            len(lang_tracks),
+        )
+
+    lang_tracks = _prefer_dub_language_tracks(
+        lang_tracks,
+        require_dubbed=require_dubbed,
+        target_lang=target_lang,
+        found_langs=found_langs,
+    )
+
+    # Prefer higher ABR + hasUrl, then score; keep source metadata for download.
+    lang_tracks = sorted(lang_tracks, key=_score_language_track, reverse=True)
+    fmt_id = str(lang_tracks[0].get("formatId") or "") or None
+    preferred_clients = [
+        c.strip()
+        for c in str(lang_tracks[0].get("sourceClient") or "tv_downgraded").split(",")
+        if c.strip()
+    ] or ["tv_downgraded"]
+    preferred_ip = str(lang_tracks[0].get("sourceIpFamily") or "ipv6")
+    preferred_cookies = bool(lang_tracks[0].get("sourceUseCookies"))
+
+    code = _normalize_lang_code(target_lang)
+    # ONLY exact probed format IDs for this language — never bare "140" or loose
+    # ba[language^=…] selectors (those can resolve to a different dubbed language).
+    format_attempts: list[str] = []
+    for t in lang_tracks:
+        fid = str(t.get("formatId") or "").strip()
+        if fid and fid not in format_attempts:
+            format_attempts.append(fid)
+    if not format_attempts:
+        raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
+    # Last-resort selector still pinned to language code (better than silent bestaudio).
+    format_attempts.append(f"ba[language^={code}]/bestaudio[language^={code}]")
+
+    client_attempts: list[list[str]] = [preferred_clients]
+    if preferred_clients != ["tv_downgraded"]:
+        client_attempts.append(["tv_downgraded"])
+
+    # Stick to probe IP first; only one alternate (IPv4 after IPv6 often 403s dubbed CDN).
+    ip_attempts = [preferred_ip]
+    if preferred_ip != "auto":
+        ip_attempts.append("auto")
+
+    # CRITICAL: download with the same cookie mode that exposed the language track.
+    # Preferring stale cookies when probe used cookies=False → bot check / format loss.
+    cookie_modes: list[bool] = [preferred_cookies]
+    alt = not preferred_cookies
+    if alt is True and not _resolve_yt_cookiefile():
+        alt = False
+    if alt != preferred_cookies and alt not in cookie_modes:
+        cookie_modes.append(alt)
+    if preferred_cookies is False and True not in cookie_modes and _resolve_yt_cookiefile():
+        # Last resort only — stale cookies often make things worse.
+        cookie_modes.append(True)
+
+    path = ""
+    last_err: BaseException | None = None
+    success_ctx: tuple[bool, list[str] | None, str] = (
+        bool(cookie_modes[0]),
+        preferred_clients,
+        preferred_ip,
+    )
+    selected_attempt: str | None = None
+
+    # Prefer probe-minted googlevideo URL — skips a second player extract that
+    # frequently trips "Sign in to confirm you're not a bot" after probing.
+    for t in lang_tracks:
+        if not _track_confirms_target_lang(t, target_lang) and _track_xtags_lang(t):
+            logger.warning(
+                "skip track format=%s — xtags lang=%s != target=%s",
+                t.get("formatId"),
+                _track_xtags_lang(t),
+                target_lang,
+            )
+            continue
+        direct = str(t.get("downloadUrl") or "").strip()
+        if not direct.startswith("http"):
+            continue
+        try:
+            _clear_out_files(out_dir)
+            path = _download_direct_media_url(
+                direct,
+                out_dir,
+                ext_hint=str(t.get("ext") or "webm"),
+                http_headers=t.get("httpHeaders") if isinstance(t.get("httpHeaders"), dict) else None,
+            )
+            selected_attempt = str(t.get("formatId") or "") or None
+            success_ctx = (preferred_cookies, preferred_clients, preferred_ip)
+            logger.warning(
+                "language audio direct URL succeeded lang=%s format=%s xtags_lang=%s size=%s",
+                target_lang,
+                selected_attempt,
+                _track_xtags_lang(t) or "?",
+                os.path.getsize(path),
+            )
+            break
+        except Exception as exc:
+            last_err = exc
+            logger.warning(
+                "language direct URL failed format=%s (%s) — trying next / yt-dlp",
+                t.get("formatId"),
+                exc,
+            )
+            path = ""
+
+    for use_cookies in cookie_modes:
+        if path:
+            break
+        drop_this_cookie_mode = False
+        for clients in client_attempts:
+            for ip_label in ip_attempts:
+                ip_kw = _download_ip_kwargs(ip_label)
+                for fmt in format_attempts:
+                    try:
+                        out_tmpl = os.path.join(out_dir, "out.%(ext)s")
+                        clear_download_proxies()
+                        _clear_out_files(out_dir)
+                        ydl_opts = _base_ydl_opts(
+                            use_cookies=use_cookies,
+                            player_clients=clients,
+                            force_ipv4=ip_kw["force_ipv4"],
+                            force_ipv6=ip_kw["force_ipv6"],
+                            format=fmt,
+                            outtmpl=out_tmpl,
+                            no_warnings=False,
+                            socket_timeout=300,
+                            nopart=True,
+                            retries=2,
+                            fragment_retries=3,
+                        )
+                        if shutil.which("ffmpeg"):
+                            ydl_opts["postprocessors"] = [
+                                {
+                                    "key": "FFmpegExtractAudio",
+                                    "preferredcodec": "mp3",
+                                    "preferredquality": "128",
+                                }
+                            ]
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([url])
+                        files = glob.glob(os.path.join(out_dir, "out.*"))
+                        if not files:
+                            raise RuntimeError("yt-dlp produced no output file")
+                        path = files[0]
+                        last_err = None
+                        success_ctx = (use_cookies, clients, ip_label)
+                        selected_attempt = fmt
+                        logger.warning(
+                            "language audio download succeeded lang=%s format=%s clients=%s ip=%s cookies=%s",
+                            target_lang,
+                            fmt,
+                            clients,
+                            ip_label,
+                            use_cookies,
+                        )
+                        break
+                    except Exception as exc:
+                        last_err = exc
+                        msg = str(exc)
+                        is_bot = "Sign in to confirm" in msg or "not a bot" in msg.lower()
+                        if is_bot:
+                            # Bot on this cookie mode: try the alternate mode once,
+                            # then give up (hammering makes YouTube stricter).
+                            logger.warning(
+                                "YouTube bot check cookies=%s — switching cookie mode / aborting",
+                                use_cookies,
+                            )
+                            drop_this_cookie_mode = True
+                            break
+                        if _is_format_or_challenge_error(exc):
+                            logger.warning(
+                                "language download retry (%s) format=%s clients=%s ip=%s cookies=%s",
+                                exc,
+                                fmt,
+                                clients,
+                                ip_label,
+                                use_cookies,
+                            )
+                            continue
+                        raise
+                if path or drop_this_cookie_mode:
+                    break
+            if path or drop_this_cookie_mode:
+                break
+        if path:
+            break
+        # If every cookie mode hit bot / format failure, stop after the loop.
+    if not path:
+        detail = _friendly_yt_extract_error(
+            str(last_err).strip() if last_err else "yt-dlp produced no output file"
+        )
+        if "invalid format" in detail.lower() or "unexpected (" in detail.lower():
+            raise RuntimeError(f"NO_LANGUAGE_TRACK: {_no_language_track_error(target_lang, found_langs)}")
+        raise RuntimeError(f"FETCH_FAILED: {detail}")
+
+    actual = probe_media_duration_sec(path)
+    if _is_audio_truncated(actual, expected):
+        retry_fmt = selected_attempt or fmt_id or f"ba[language^={code}]"
+        out_tmpl = os.path.join(out_dir, "out.%(ext)s")
+        clear_download_proxies()
+        _clear_out_files(out_dir)
+        ip_kw = _download_ip_kwargs(success_ctx[2])
+        ydl_opts = _base_ydl_opts(
+            use_cookies=success_ctx[0],
+            player_clients=success_ctx[1],
+            force_ipv4=ip_kw["force_ipv4"],
+            force_ipv6=ip_kw["force_ipv6"],
+            format=retry_fmt,
+            outtmpl=out_tmpl,
+            no_warnings=False,
+            socket_timeout=300,
+            nopart=True,
+            retries=5,
+            fragment_retries=10,
+        )
+        if shutil.which("ffmpeg"):
+            ydl_opts["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "128",
+                }
+            ]
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        files = glob.glob(os.path.join(out_dir, "out.*"))
+        if not files:
+            raise RuntimeError("yt-dlp produced no output file")
+        path = files[0]
+        actual = probe_media_duration_sec(path)
+    if _is_audio_truncated(actual, expected):
+        raise RuntimeError(
+            "YouTube 音声が動画より短く切れています"
+            f"（取得 {actual:.0f}秒 / 動画 {expected:.0f}秒）。"
+            " 音声ファイルを直接アップロードするか、再度お試しください。"
+        )
+    selected = selected_attempt or fmt_id or f"ba[language^={code}]"
+    return path, actual, expected, selected
+
+
 def _pick_downloadable_format_id(info: dict) -> str | None:
     """利用可能な形式一覧から実際に URL のある音声（なければ動画+音声）を選ぶ。"""
     formats = info.get("formats") or []
@@ -638,6 +1460,10 @@ def _is_format_or_challenge_error(exc: BaseException) -> bool:
         for token in (
             "no video formats found",
             "requested format is not available",
+            "invalid format specification",
+            "unexpected (",
+            "http error 403",
+            "forbidden",
             "sign in to confirm",
             "not a bot",
             "challenge solving failed",
@@ -803,6 +1629,64 @@ def upload_to_supabase_storage(local_path: str, storage_path: str, content_type:
     return supabase_storage_public_url(object_path)
 
 
+@app.route("/probe-tracks", methods=["OPTIONS"])
+def probe_tracks_options():
+    return Response("", status=204)
+
+
+@app.post("/probe-tracks")
+def probe_tracks():
+    secret = os.environ.get("PROXY_SECRET", "").strip()
+    if secret:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {secret}":
+            abort(401)
+
+    allowed, retry_after = check_video_meta_limit()
+    if not allowed:
+        return (
+            jsonify({"ok": False, "error": "リクエスト制限に達しました。しばらくして再試行してください。"}),
+            429,
+            {"Retry-After": str(retry_after)},
+        )
+
+    payload = request.get_json(silent=True) or {}
+    url = (payload.get("videoUrl") or payload.get("url") or "").strip()
+    target_lang = _normalize_lang_code(payload.get("targetLang") or payload.get("language") or "")
+    if not url or not host_allowed(url):
+        abort(400)
+
+    try:
+        info, tracks, probe_err = probe_youtube_audio_tracks(url)
+    except Exception as exc:
+        logger.exception("probe-tracks failed for %s", url)
+        detail = _friendly_yt_extract_error(str(exc).strip() or exc.__class__.__name__)
+        return jsonify({"ok": False, "errorCode": "FETCH_FAILED", "error": detail}), 502
+
+    if probe_err and not tracks:
+        detail = _friendly_yt_extract_error(str(probe_err).strip() or probe_err.__class__.__name__)
+        return jsonify({"ok": False, "errorCode": "FETCH_FAILED", "error": detail}), 502
+
+    langs = sorted({str(t.get("language") or "") for t in tracks if t.get("language")})
+    matched = [t for t in tracks if _track_matches_language(t, target_lang)] if target_lang else []
+    selected_format_id = _select_language_format_id(tracks, target_lang) if target_lang else None
+
+    resp = {
+        "ok": True,
+        "videoId": str((info or {}).get("id") or ""),
+        "durationSec": max(0.0, float((info or {}).get("duration") or 0)),
+        "tracks": tracks,
+        "languages": langs,
+        "targetLang": target_lang or None,
+        "matchedCount": len(matched),
+        "selectedFormatId": selected_format_id,
+    }
+    if target_lang and not matched:
+        resp["errorCode"] = "NO_LANGUAGE_TRACK"
+        resp["error"] = _no_language_track_error(target_lang, langs)
+    return jsonify(resp)
+
+
 @app.route("/extract", methods=["OPTIONS"])
 def extract_options():
     return Response("", status=204)
@@ -829,7 +1713,15 @@ def extract():
     if not url or not host_allowed(url):
         abort(400)
 
-    vocal_requested = payload.get("vocalSeparate", payload.get("vocalOnly", True))
+    target_lang = _normalize_lang_code(payload.get("targetLang") or payload.get("language") or "")
+    require_dub_raw = payload.get("requireDubTrack", payload.get("requireDubbed", False))
+    if isinstance(require_dub_raw, str):
+        require_dubbed = require_dub_raw.strip().lower() not in ("0", "false", "no", "off", "")
+    else:
+        require_dubbed = bool(require_dub_raw)
+    vocal_requested = payload.get("vocalSeparate", payload.get("vocalOnly", None))
+    if vocal_requested is None:
+        vocal_requested = not bool(target_lang)
     if isinstance(vocal_requested, str):
         vocal_requested = vocal_requested.strip().lower() not in ("0", "false", "no", "off")
     else:
@@ -839,8 +1731,14 @@ def extract():
     separated = False
     audio_dur = 0.0
     video_dur = 0.0
+    selected_format_id: str | None = None
     try:
-        path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
+        if target_lang:
+            path, audio_dur, video_dur, selected_format_id = download_youtube_audio_by_language(
+                url, out_dir, target_lang, require_dubbed=require_dubbed
+            )
+        else:
+            path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
         if vocal_requested and _VOCAL_SEPARATION:
             path, separated = apply_vocal_separation(path, out_dir)
             audio_dur = probe_media_duration_sec(path) or audio_dur
@@ -878,6 +1776,8 @@ def extract():
                     "videoDurationSec": video_dur,
                     "mime": mime,
                     "byteLength": file_size,
+                    "targetLang": target_lang or None,
+                    "selectedFormatId": selected_format_id,
                 }
             )
 
@@ -885,8 +1785,27 @@ def extract():
     except Exception as exc:
         logger.exception("extract failed for %s", url)
         shutil.rmtree(out_dir, ignore_errors=True)
-        detail = _friendly_yt_extract_error(str(exc).strip() or exc.__class__.__name__)
-        return jsonify({"ok": False, "error": detail}), 502
+        detail = str(exc).strip() or exc.__class__.__name__
+        if detail.startswith("NO_LANGUAGE_TRACK:"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "errorCode": "NO_LANGUAGE_TRACK",
+                    "error": detail.split(":", 1)[1].strip(),
+                    "targetLang": target_lang or None,
+                }
+            ), 422
+        if detail.startswith("FETCH_FAILED:"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "errorCode": "FETCH_FAILED",
+                    "error": detail.split(":", 1)[1].strip(),
+                    "targetLang": target_lang or None,
+                }
+            ), 502
+        friendly = _friendly_yt_extract_error(detail)
+        return jsonify({"ok": False, "errorCode": "FETCH_FAILED", "error": friendly}), 502
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -898,6 +1817,10 @@ def extract():
     resp = Response(data, mimetype=mime)
     resp.headers["X-Wavrick-Vocal-Separated"] = "1" if separated else "0"
     resp.headers["X-Wavrick-Audio-Stem"] = "vocals" if separated else "mix"
+    if target_lang:
+        resp.headers["X-Wavrick-Target-Lang"] = target_lang
+    if selected_format_id:
+        resp.headers["X-Wavrick-Selected-Format"] = selected_format_id
     if audio_dur > 0:
         resp.headers["X-Wavrick-Audio-Duration-Sec"] = f"{audio_dur:.2f}"
     if video_dur > 0:
@@ -990,6 +1913,7 @@ def health():
             "nodePath": shutil.which("node"),
             "denoPath": shutil.which("deno"),
             "extractBuild": _EXTRACT_BUILD,
+            "features": ["language_tracks", "probe-tracks", "vocal_separation"],
         }
     )
 
