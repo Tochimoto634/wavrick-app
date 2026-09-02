@@ -3039,56 +3039,59 @@ Deno.serve(async (req) => {
           channelId: adrGuard.channelId,
           videoId: adrVideoId
         };
-        const fetchDubExtract = (requireDubTrack: boolean) =>
-          fetchProxyAudioToStorageCached(
+
+        // Yesterday-style: dub first, then lightweight default audio (no parallel heavy original probe).
+        let extracted: ProxyStorageResult & { cached?: boolean };
+        try {
+          extracted = await fetchProxyAudioToStorageCached(
             admin,
             videoUrl,
             adrTargetPath,
             false,
             targetLang,
-            { requireDubTrack },
+            { requireDubTrack: true },
             dubAudit
           );
-
-        const dubPromise = (async () => {
-          try {
-            return await fetchDubExtract(true);
-          } catch (firstErr) {
-            const firstMsg =
-              firstErr instanceof Error ? firstErr.message : String(firstErr);
-            if (
-              isYouTubeExtractTestMode() &&
-              firstMsg.includes("NO_LANGUAGE_TRACK")
-            ) {
-              console.warn(
-                "[media-pipeline] test mode — retry adr dub extract without requireDubTrack"
-              );
-              return await fetchDubExtract(false);
-            }
+        } catch (firstErr) {
+          const firstMsg =
+            firstErr instanceof Error ? firstErr.message : String(firstErr);
+          if (
+            isYouTubeExtractTestMode() &&
+            firstMsg.includes("NO_LANGUAGE_TRACK")
+          ) {
+            console.warn(
+              "[media-pipeline] test mode — retry adr dub extract without requireDubTrack"
+            );
+            extracted = await fetchProxyAudioToStorageCached(
+              admin,
+              videoUrl,
+              adrTargetPath,
+              false,
+              targetLang,
+              { requireDubTrack: false },
+              dubAudit
+            );
+          } else {
             throw firstErr;
           }
-        })();
+        }
 
-        // Parallel: target dub track + original (comparison / switcher).
-        const [extracted, originalExtracted] = await Promise.all([
-          dubPromise,
-          fetchProxyAudioToStorageCached(admin, videoUrl, adrOriginalPath, false, undefined, {
-            preferOriginalTrack: true
-          }, {
+        const originalExtracted = await fetchProxyAudioToStorageCached(
+          admin,
+          videoUrl,
+          adrOriginalPath,
+          false,
+          undefined,
+          undefined,
+          {
             userId,
             channelId: adrGuard.channelId,
             videoId: adrVideoId
-          })
-        ]);
+          }
+        );
         if (!originalExtracted.publicUrl) {
           throw new Error(
             "[NO_ORIGINAL_TRACK] オリジナル（原盤）音声の抽出に失敗しました。URL が空です。"
-          );
-        }
-        if (String(originalExtracted.trackRole || "") !== "original") {
-          throw new Error(
-            "[NO_ORIGINAL_TRACK] オリジナル音声を確定できませんでした（原盤トラックとして証明されませんでした）。\n" +
-              `format=${originalExtracted.selectedFormatId || "?"} role=${originalExtracted.trackRole || "?"}`
           );
         }
         assertDistinctTargetLangAudio(targetLang, extracted, originalExtracted);
