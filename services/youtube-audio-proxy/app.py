@@ -67,14 +67,18 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 24
+_EXTRACT_BUILD = 25
 
-# Cookies are opt-in only (shared operator cookies are discouraged in production).
 def _cookies_enabled() -> bool:
     flag = os.environ.get("WAVRICK_YT_USE_COOKIES", "").strip().lower()
     if flag in ("0", "false", "no", "off", ""):
         return False
     return bool(_resolve_yt_cookiefile())
+
+
+def _yt_test_mode() -> bool:
+    flag = os.environ.get("WAVRICK_YT_TEST_MODE", "").strip().lower()
+    return flag in ("1", "true", "yes", "on", "test")
 
 # v3 ADR: language-specific dubbed track extraction
 _LANG_DISPLAY = {
@@ -1904,6 +1908,33 @@ def _is_format_or_challenge_error(exc: BaseException) -> bool:
     )
 
 
+def _is_dub_like_track(track: dict) -> bool:
+    note = str(track.get("formatNote") or track.get("format_note") or "").lower()
+    xt = _track_xtags(track)
+    return "dub" in note or "dubbed" in note or "dubbed" in xt
+
+
+def _implicit_original_tracks(tracks: list[dict]) -> list[dict]:
+    """
+    Single-audio or no language/dub metadata — typical videos lack acont=original.
+    """
+    if not tracks:
+        return []
+    audio = [t for t in tracks if t.get("isAudioOnly")]
+    if not audio:
+        audio = [t for t in tracks if t.get("hasUrl")]
+    if len(audio) == 1:
+        return audio
+    labeled = [
+        t
+        for t in audio
+        if _track_has_strong_lang_label(t) or _track_xtags_lang(t) or _is_dub_like_track(t)
+    ]
+    if audio and not labeled:
+        return sorted(audio, key=lambda t: float(t.get("abr") or 0), reverse=True)[:1]
+    return []
+
+
 def _prefer_original_language_tracks(tracks: list[dict]) -> list[dict]:
     """Keep only formats that are explicitly marked as the original audio track."""
     originals: list[dict] = []
@@ -1932,6 +1963,13 @@ def download_youtube_audio_original_track(
         raise RuntimeError(f"FETCH_FAILED: {detail}")
 
     originals = _prefer_original_language_tracks(tracks)
+    if not originals:
+        originals = _implicit_original_tracks(tracks)
+        if originals:
+            logger.info(
+                "original track: implicit default audio (no acont=original metadata; %d probe tracks)",
+                len(tracks or []),
+            )
     if not originals:
         notes = sorted(
             {
@@ -2327,11 +2365,22 @@ def extract():
     def _perform_download() -> None:
         nonlocal path, audio_dur, video_dur, selected_format_id, track_role, separated, vocal_requested
         if prefer_original and not target_lang:
-            path, audio_dur, video_dur, selected_format_id = download_youtube_audio_original_track(
-                url, out_dir
-            )
-            track_role = "original"
-            vocal_requested = False
+            try:
+                path, audio_dur, video_dur, selected_format_id = download_youtube_audio_original_track(
+                    url, out_dir
+                )
+                track_role = "original"
+            except RuntimeError as exc:
+                if _yt_test_mode() and str(exc).startswith("NO_ORIGINAL_TRACK:"):
+                    logger.warning(
+                        "test mode: original track proof missing — using default audio extract"
+                    )
+                    path, audio_dur, video_dur = download_youtube_audio_full_length(url, out_dir)
+                    track_role = "default"
+                    selected_format_id = None
+                    vocal_requested = False
+                else:
+                    raise
         elif target_lang:
             path, audio_dur, video_dur, selected_format_id = download_youtube_audio_by_language(
                 url, out_dir, target_lang, require_dubbed=require_dubbed
