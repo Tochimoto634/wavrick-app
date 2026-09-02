@@ -70,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 28
+_EXTRACT_BUILD = 29
 
 def _cookies_enabled() -> bool:
     flag = os.environ.get("WAVRICK_YT_USE_COOKIES", "").strip().lower()
@@ -983,6 +983,15 @@ def _lang_display_name(target_lang: str) -> str:
     return _LANG_DISPLAY.get(code, code or "指定言語")
 
 
+def _empty_audio_probe_error() -> str:
+    return (
+        "YouTube から音声形式一覧を取得できませんでした（0 tracks）。\n"
+        "プレイヤーに音声トラックが見えても、yt-dlp のプレイヤークライアント／cookies 状態によって"
+        "一覧が空になることがあります。\n"
+        "Railway の cookies を再 export するか、しばらく待ってから再度お試しください。"
+    )
+
+
 def _no_language_track_error(target_lang: str, found_langs: list[str] | None = None) -> str:
     name = _lang_display_name(target_lang)
     msg = (
@@ -1269,10 +1278,9 @@ def probe_youtube_audio_tracks(
                         player_clients=clients,
                         force_ipv4=force_v4,
                         force_ipv6=force_v6,
-                        # Weak clients may only expose thumbnails; don't raise
-                        # "Requested format is not available" during probe.
+                        # Do not set format= during probe — ba/bestaudio filters out
+                        # multi-audio language tracks and often leaves only thumbnails.
                         ignore_no_formats_error=True,
-                        format="ba/bestaudio/best/worst",
                     )
                     if any(c in ("web_safari", "tv_downgraded", "web") for c in clients):
                         ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
@@ -1498,7 +1506,6 @@ def _probe_tracks_single_context(
         force_ipv4=ip_kw["force_ipv4"],
         force_ipv6=ip_kw["force_ipv6"],
         ignore_no_formats_error=True,
-        format="ba/bestaudio/best/worst",
     )
     if any(c in ("web_safari", "tv_downgraded", "web") for c in player_clients):
         ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
@@ -1531,6 +1538,8 @@ def _download_youtube_audio_by_language_legacy(
         raise RuntimeError(f"FETCH_FAILED: {detail}")
     if _is_yt_rate_limit_error(str(probe_err or "")):
         raise RuntimeError(f"FETCH_FAILED: {_friendly_yt_extract_error(str(probe_err))}")
+    if not tracks:
+        raise RuntimeError(f"FETCH_FAILED: {_empty_audio_probe_error()}")
 
     soft = [t for t in tracks if _track_matches_language(t, target_lang)]
     if not soft:
