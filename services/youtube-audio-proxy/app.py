@@ -70,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 29
+_EXTRACT_BUILD = 30
 
 def _cookies_enabled() -> bool:
     flag = os.environ.get("WAVRICK_YT_USE_COOKIES", "").strip().lower()
@@ -92,10 +92,10 @@ def _legacy_lightweight_extract() -> bool:
 
 def _probe_max_attempts() -> int:
     try:
-        v = int(os.environ.get("WAVRICK_YT_PROBE_MAX", "5").strip())
+        v = int(os.environ.get("WAVRICK_YT_PROBE_MAX", "7").strip())
         return max(1, min(v, 12))
     except (TypeError, ValueError):
-        return 5
+        return 7
 
 
 def _is_yt_rate_limit_error(msg: str) -> bool:
@@ -287,10 +287,14 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
         if primary:
             return [primary]
     if _legacy_lightweight_extract():
+        # web_embedded exposes multi-audio when web_safari hits SABR-only (0 audio).
+        preferred = [
+            ["web_embedded"],
+            ["web_safari"],
+            ["android"],
+        ]
         if use_cookies and _cookies_enabled():
-            preferred = [["web_safari", "web"], ["tv_downgraded"]]
-        else:
-            preferred = [["web_safari"]]
+            preferred.extend([["web_safari", "web"], ["tv_downgraded"]])
     elif use_cookies and _cookies_enabled():
         preferred = [
             ["tv", "web"],
@@ -309,6 +313,13 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
         _normalize_player_clients(clients, use_cookies=use_cookies) or clients
         for clients in preferred
     ]
+
+
+def _needs_full_player_response(clients: list[str]) -> bool:
+    return any(
+        c in ("web_safari", "tv_downgraded", "web", "web_embedded", "tv")
+        for c in clients
+    )
 
 
 def _youtube_extractor_args(
@@ -1282,7 +1293,7 @@ def probe_youtube_audio_tracks(
                         # multi-audio language tracks and often leaves only thumbnails.
                         ignore_no_formats_error=True,
                     )
-                    if any(c in ("web_safari", "tv_downgraded", "web") for c in clients):
+                    if _needs_full_player_response(clients):
                         ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
                         ya["player_skip"] = []
                         opts["extractor_args"] = {"youtube": ya}
@@ -1507,7 +1518,7 @@ def _probe_tracks_single_context(
         force_ipv6=ip_kw["force_ipv6"],
         ignore_no_formats_error=True,
     )
-    if any(c in ("web_safari", "tv_downgraded", "web") for c in player_clients):
+    if _needs_full_player_response(player_clients):
         ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
         ya["player_skip"] = []
         opts["extractor_args"] = {"youtube": ya}
@@ -1738,6 +1749,8 @@ def download_youtube_audio_by_language(
     if probe_err and not tracks:
         detail = _friendly_yt_extract_error(str(probe_err).strip() or probe_err.__class__.__name__)
         raise RuntimeError(f"FETCH_FAILED: {detail}")
+    if not tracks:
+        raise RuntimeError(f"FETCH_FAILED: {_empty_audio_probe_error()}")
 
     strong_found = catalog_strong_langs(tracks)
     lang_tracks = resolve_target_tracks(
