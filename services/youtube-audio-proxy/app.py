@@ -70,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 32
+_EXTRACT_BUILD = 33
 
 def _pot_provider_enabled() -> bool:
     env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
@@ -275,7 +275,12 @@ def _remote_components() -> list[str]:
 
 def _js_runtimes() -> dict:
     runtimes: dict = {}
-    node = shutil.which("node")
+    candidates = [
+        os.environ.get("WAVRICK_NODE_PATH", "").strip(),
+        "/usr/local/bin/node",
+        shutil.which("node") or "",
+    ]
+    node = next((p for p in candidates if p and os.path.isfile(p)), "")
     if node:
         runtimes["node"] = {"path": node}
     deno = shutil.which("deno")
@@ -3101,6 +3106,23 @@ def health():
             "potProviderEnabled": _pot_provider_enabled(),
             "potProviderReady": _pot_server_ok(),
             "potProviderBaseUrl": _pot_base_url() if _pot_provider_enabled() else None,
+            "potScriptHome": (
+                os.environ.get("WAVRICK_YT_POT_SERVER_HOME", "/opt/bgutil/server").strip()
+                if _pot_provider_enabled()
+                else None
+            ),
+            "potScriptReady": (
+                os.path.isfile(
+                    os.path.join(
+                        os.environ.get("WAVRICK_YT_POT_SERVER_HOME", "/opt/bgutil/server").strip(),
+                        "build",
+                        "main.js",
+                    )
+                )
+                if _pot_provider_enabled()
+                else False
+            ),
+            "nodeRuntime": (_js_runtimes().get("node") or {}).get("path"),
             "features": ["language_tracks", "probe-tracks", "vocal_separation", "pot_provider"],
             "supabaseStorageConfigured": bool(sb_base and sb_key),
             "supabaseHost": sb_host or None,
