@@ -70,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 35
+_EXTRACT_BUILD = 36
 
 def _pot_provider_enabled() -> bool:
     env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
@@ -108,15 +108,18 @@ def _merge_extractor_args(*parts: dict) -> dict:
     return merged
 
 
-def _pot_extractor_args() -> dict:
+def _pot_script_ready() -> bool:
     if not _pot_provider_enabled():
-        return {}
-    if _pot_server_ok():
-        return {"youtubepot-bgutilhttp": {"base_url": _pot_base_url()}}
+        return False
     home = os.environ.get("WAVRICK_YT_POT_SERVER_HOME", "/opt/bgutil/server").strip()
-    if os.path.isdir(home):
-        return {"youtubepot-bgutilscript": {"server_home": home}}
-    return {}
+    return os.path.isfile(os.path.join(home, "build", "main.js"))
+
+
+def _pot_extractor_args(*, force: bool = False) -> dict:
+    if not force or not _pot_provider_enabled() or not _pot_script_ready():
+        return {}
+    home = os.environ.get("WAVRICK_YT_POT_SERVER_HOME", "/opt/bgutil/server").strip()
+    return {"youtubepot-bgutilscript": {"server_home": home}}
 
 
 def _cookies_enabled() -> bool:
@@ -379,6 +382,7 @@ def _youtube_extractor_args(
     player_clients: list[str] | None = None,
     *,
     use_cookies: bool = False,
+    use_pot: bool = False,
 ) -> dict:
     clients = player_clients or _player_client_attempts(use_cookies=use_cookies)[0]
     keep_env = os.environ.get("WAVRICK_YT_KEEP_WEBPAGE", "").strip().lower()
@@ -398,7 +402,7 @@ def _youtube_extractor_args(
                 "player_js_version": ["actual"],
             }
         },
-        _pot_extractor_args(),
+        _pot_extractor_args(force=use_pot),
     )
 
 
@@ -408,6 +412,7 @@ def _base_ydl_opts(
     player_clients: list[str] | None = None,
     force_ipv4: bool | None = None,
     force_ipv6: bool | None = None,
+    use_pot: bool = False,
     **extra,
 ) -> dict:
     # Default force_ipv4 helps some Railway/CDN cases, but language-dub tracks
@@ -425,7 +430,9 @@ def _base_ydl_opts(
         "quiet": True,
         "noplaylist": True,
         "proxy": _yt_proxy(),
-        "extractor_args": _youtube_extractor_args(player_clients, use_cookies=use_cookies),
+        "extractor_args": _youtube_extractor_args(
+            player_clients, use_cookies=use_cookies, use_pot=use_pot
+        ),
     }
     if force_ipv4:
         opts["force_ipv4"] = True
@@ -1455,6 +1462,65 @@ def probe_youtube_audio_tracks(
                         continue
                     raise
 
+    if not merged and _pot_script_ready():
+        for use_cookies in cookie_modes:
+            for clients in (["web_embedded"], ["mweb"], ["web_safari"]):
+                try:
+                    logger.info(
+                        "probe POT fallback clients=%s cookies=%s",
+                        clients,
+                        use_cookies,
+                    )
+                    opts = _base_ydl_opts(
+                        skip_download=True,
+                        use_cookies=use_cookies,
+                        player_clients=clients,
+                        ignore_no_formats_error=True,
+                        use_pot=True,
+                    )
+                    if _needs_full_player_response(clients):
+                        ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
+                        ya["player_skip"] = []
+                        opts["extractor_args"] = _merge_extractor_args(
+                            opts.get("extractor_args", {}),
+                            {"youtube": ya},
+                        )
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                    if not info:
+                        continue
+                    if best_info is None:
+                        best_info = info
+                    tracks = _audio_tracks_from_info(info)
+                    for t in tracks:
+                        t["sourceClient"] = ",".join(clients)
+                        t["sourceIpFamily"] = "auto"
+                        t["sourceUseCookies"] = bool(use_cookies)
+                        t["sourceUsePot"] = True
+                    langs = sorted({str(t.get("language") or "") for t in tracks if t.get("language")})
+                    logger.info(
+                        "track probe POT clients=%s cookies=%s formats=%d langs=%s",
+                        clients,
+                        use_cookies,
+                        len(tracks),
+                        langs[:12],
+                    )
+                    merged = _merge_audio_tracks(merged, tracks)
+                    if not tracks:
+                        continue
+                    if want and any(_track_matches_language(t, want) for t in tracks):
+                        return best_info, merged, None
+                    if not want:
+                        return best_info, merged, None
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning("POT probe failed (%s) clients=%s", exc, clients)
+                    if _is_yt_rate_limit_error(str(exc)):
+                        break
+                    continue
+            if merged:
+                break
+
     if best_info is not None:
         return best_info, merged, None
     return None, [], last_err
@@ -1641,6 +1707,7 @@ def _download_youtube_audio_by_language_legacy(
     ] or ["web_safari"]
     preferred_ip = str(lang_tracks[0].get("sourceIpFamily") or "auto")
     preferred_cookies = bool(lang_tracks[0].get("sourceUseCookies"))
+    preferred_use_pot = bool(lang_tracks[0].get("sourceUsePot"))
 
     format_attempts: list[str] = []
     for t in lang_tracks:
@@ -1717,6 +1784,7 @@ def _download_youtube_audio_by_language_legacy(
                             player_clients=clients,
                             force_ipv4=ip_kw["force_ipv4"],
                             force_ipv6=ip_kw["force_ipv6"],
+                            use_pot=preferred_use_pot,
                             format=fmt,
                             outtmpl=out_tmpl,
                             no_warnings=False,
@@ -3111,17 +3179,7 @@ def health():
                 if _pot_provider_enabled()
                 else None
             ),
-            "potScriptReady": (
-                os.path.isfile(
-                    os.path.join(
-                        os.environ.get("WAVRICK_YT_POT_SERVER_HOME", "/opt/bgutil/server").strip(),
-                        "build",
-                        "main.js",
-                    )
-                )
-                if _pot_provider_enabled()
-                else False
-            ),
+            "potScriptReady": _pot_script_ready(),
             "nodeRuntime": (_js_runtimes().get("node") or {}).get("path"),
             "features": ["language_tracks", "probe-tracks", "vocal_separation", "pot_provider"],
             "supabaseStorageConfigured": bool(sb_base and sb_key),
