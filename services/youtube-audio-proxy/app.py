@@ -70,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 31
+_EXTRACT_BUILD = 32
 
 def _pot_provider_enabled() -> bool:
     env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
@@ -111,7 +111,12 @@ def _merge_extractor_args(*parts: dict) -> dict:
 def _pot_extractor_args() -> dict:
     if not _pot_provider_enabled():
         return {}
-    return {"youtubepot-bgutilhttp": {"base_url": _pot_base_url()}}
+    if _pot_server_ok():
+        return {"youtubepot-bgutilhttp": {"base_url": _pot_base_url()}}
+    home = os.environ.get("WAVRICK_YT_POT_SERVER_HOME", "/opt/bgutil/server").strip()
+    if os.path.isdir(home):
+        return {"youtubepot-bgutilscript": {"server_home": home}}
+    return {}
 
 
 def _cookies_enabled() -> bool:
@@ -360,7 +365,7 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
 
 def _needs_full_player_response(clients: list[str]) -> bool:
     return any(
-        c in ("web_safari", "tv_downgraded", "web", "web_embedded", "tv")
+        c in ("web_safari", "tv_downgraded", "web", "web_embedded", "tv", "mweb")
         for c in clients
     )
 

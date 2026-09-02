@@ -14,7 +14,7 @@ RUN git clone --depth 1 --branch "${BGUTIL_VERSION}" \
 FROM python:3.12-slim-bookworm
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl libvips42 \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
@@ -31,5 +31,6 @@ RUN chmod +x /start-railway.sh
 ENV WAVRICK_VOCAL_SEPARATION=0
 ENV WAVRICK_YT_POT_ENABLED=1
 ENV WAVRICK_YT_POT_PORT=4416
+ENV WAVRICK_YT_POT_SERVER_HOME=/opt/bgutil/server
 
 CMD ["/start-railway.sh"]
