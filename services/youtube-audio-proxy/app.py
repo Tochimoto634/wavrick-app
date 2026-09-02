@@ -67,7 +67,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 23
+_EXTRACT_BUILD = 24
 
 # Cookies are opt-in only (shared operator cookies are discouraged in production).
 def _cookies_enabled() -> bool:
@@ -222,10 +222,12 @@ def _player_client_attempts(*, use_cookies: bool = False) -> list[list[str]]:
     cookies_on = use_cookies and _cookies_enabled()
     if cookies_on:
         defaults: list[list[str]] = [
+            ["tv", "web"],
             ["web_safari", "web"],
             ["tv_downgraded", "web"],
             ["web"],
             ["mweb", "web"],
+            ["ios", "web"],
         ]
     else:
         defaults = [
@@ -266,19 +268,25 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
     ]
 
 
-def _youtube_extractor_args(player_clients: list[str] | None = None) -> dict:
-    clients = player_clients or _player_client_attempts(use_cookies=False)[0]
+def _youtube_extractor_args(
+    player_clients: list[str] | None = None,
+    *,
+    use_cookies: bool = False,
+) -> dict:
+    clients = player_clients or _player_client_attempts(use_cookies=use_cookies)[0]
+    keep_env = os.environ.get("WAVRICK_YT_KEEP_WEBPAGE", "").strip().lower()
+    if keep_env in ("1", "true", "yes", "on"):
+        player_skip: list[str] = []
+    elif keep_env in ("0", "false", "no", "off"):
+        player_skip = ["webpage"]
+    elif use_cookies and _cookies_enabled():
+        player_skip = []
+    else:
+        player_skip = ["webpage"]
     return {
         "youtube": {
             "player_client": clients,
-            # Keep webpage enabled for lang probe-friendly clients when possible;
-            # skip only when using cookie challenge-prone paths via env override.
-            "player_skip": (
-                []
-                if os.environ.get("WAVRICK_YT_KEEP_WEBPAGE", "").strip().lower()
-                in ("1", "true", "yes", "on")
-                else ["webpage"]
-            ),
+            "player_skip": player_skip,
             "player_js_version": ["actual"],
         }
     }
@@ -307,7 +315,7 @@ def _base_ydl_opts(
         "quiet": True,
         "noplaylist": True,
         "proxy": _yt_proxy(),
-        "extractor_args": _youtube_extractor_args(player_clients),
+        "extractor_args": _youtube_extractor_args(player_clients, use_cookies=use_cookies),
     }
     if force_ipv4:
         opts["force_ipv4"] = True
@@ -494,6 +502,10 @@ def _probe_video_info(url: str) -> dict:
                     use_cookies=use_cookies,
                     player_clients=clients,
                 )
+                if use_cookies:
+                    ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
+                    ya["player_skip"] = []
+                    opts["extractor_args"] = {"youtube": ya}
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 if info:
@@ -1114,8 +1126,9 @@ def probe_youtube_audio_tracks(
     merged: list[dict] = []
     want = _normalize_lang_code(target_lang)
     # No cookies by default; opt-in via WAVRICK_YT_USE_COOKIES=1.
+    # Cookies first when enabled — no-cookie attempts often trigger bot checks on cloud IPs.
     if _cookies_enabled():
-        cookie_modes = (False, True) if want else (False, True)
+        cookie_modes = (True, False)
     else:
         cookie_modes = (False,)
 
