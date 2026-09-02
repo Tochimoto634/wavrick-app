@@ -42,8 +42,11 @@ from lang_tracks import (
     format_id_is_exclusive_target,
     format_id_strong_signals,
     normalize_lang_code as _normalize_lang_code,
+    probe_track_debug_lines,
     resolve_target_tracks,
+    resolve_target_tracks_weak_fallback,
     strong_lang_signals as _track_strong_lang_signals,
+    weak_lang_signal,
     xtags_from_url as _xtags_from_url,
     xtags_lang as _xtags_lang_from_url,
 )
@@ -67,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 25
+_EXTRACT_BUILD = 27
 
 def _cookies_enabled() -> bool:
     flag = os.environ.get("WAVRICK_YT_USE_COOKIES", "").strip().lower()
@@ -257,9 +260,12 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
             return [primary]
     if use_cookies and _cookies_enabled():
         preferred = [
+            ["tv", "web"],
             ["tv_downgraded"],
-            ["web_safari"],
+            ["web_safari", "web"],
             ["web"],
+            ["mweb", "web"],
+            ["ios", "web"],
         ]
     else:
         # No cookies: minimize probe churn (P4).
@@ -1130,9 +1136,10 @@ def probe_youtube_audio_tracks(
     merged: list[dict] = []
     want = _normalize_lang_code(target_lang)
     # No cookies by default; opt-in via WAVRICK_YT_USE_COOKIES=1.
-    # Cookies first when enabled — no-cookie attempts often trigger bot checks on cloud IPs.
+    # Lang probe: try no-cookie web_safari first — stale/shared cookies often hide
+    # multi-audio (format 18 only, "page needs reload"). Bot checks still retry with cookies.
     if _cookies_enabled():
-        cookie_modes = (True, False)
+        cookie_modes = (False, True) if want else (True, False)
     else:
         cookie_modes = (False,)
 
@@ -1220,7 +1227,7 @@ def probe_youtube_audio_tracks(
                     if not want and strong_langs:
                         return best_info, merged, None
                     # Keep probing other clients until exclusive target evidence exists.
-                    if strong_langs or langs:
+                    if not want and (strong_langs or langs):
                         break  # move to next client; don't thrash IP families
                 except Exception as exc:
                     last_err = exc
@@ -1396,7 +1403,21 @@ def download_youtube_audio_by_language(
     lang_tracks = resolve_target_tracks(
         tracks, target_lang, require_dubbed=require_dubbed
     )
+    used_weak_fallback = False
+    if not lang_tracks and _yt_test_mode():
+        lang_tracks = resolve_target_tracks_weak_fallback(
+            tracks, target_lang, require_dubbed=require_dubbed
+        )
+        if lang_tracks:
+            used_weak_fallback = True
+            logger.warning(
+                "test mode: weak language fallback for target=%s tracks=%d require_dub=%s",
+                target_lang,
+                len(tracks or []),
+                require_dubbed,
+            )
     if not lang_tracks:
+        debug = "\n".join(probe_track_debug_lines(tracks, 10))
         exclusive = exclusive_target_format_ids(tracks, target_lang)
         if not exclusive:
             raise RuntimeError(
@@ -1404,6 +1425,7 @@ def download_youtube_audio_by_language(
                 + _no_language_track_error(target_lang, strong_found or found_langs)
                 + "\n（note/[lang]/xtags で確定できる対象言語トラックがありません。"
                 + " 他言語トラックへのフォールバックは行いません。）"
+                + (f"\n[probe debug]\n{debug}" if debug else "")
             )
         if require_dubbed:
             raise RuntimeError(
@@ -1416,6 +1438,7 @@ def download_youtube_audio_by_language(
         )
 
     lang_tracks = sorted(lang_tracks, key=_score_language_track, reverse=True)
+    allow_weak_lang = used_weak_fallback
     preferred_clients = [
         c.strip()
         for c in str(lang_tracks[0].get("sourceClient") or "tv_downgraded").split(",")
@@ -1437,12 +1460,17 @@ def download_youtube_audio_by_language(
     # --- Path A: direct CDN URL only when xtags lang matches target ---
     for t in lang_tracks:
         fid = str(t.get("formatId") or "").strip()
-        if not fid or not format_id_is_exclusive_target(tracks, fid, target_lang):
+        if not fid:
+            continue
+        if not allow_weak_lang and not format_id_is_exclusive_target(tracks, fid, target_lang):
             continue
         xt_lang = _track_xtags_lang(str(t.get("downloadUrl") or "")) or _track_xtags_lang(
             str(t.get("xtags") or "")
         )
-        if xt_lang != want:
+        if allow_weak_lang:
+            if weak_lang_signal(t) != want and xt_lang != want:
+                continue
+        elif xt_lang != want:
             logger.warning(
                 "skip direct URL format=%s — xtags lang=%s != target=%s (require CDN proof)",
                 fid,
@@ -1550,18 +1578,32 @@ def download_youtube_audio_by_language(
                 ctx_resolved = resolve_target_tracks(
                     ctx_tracks, target_lang, require_dubbed=require_dubbed
                 )
+                if not ctx_resolved and _yt_test_mode():
+                    ctx_resolved = resolve_target_tracks_weak_fallback(
+                        ctx_tracks, target_lang, require_dubbed=require_dubbed
+                    )
+                    if ctx_resolved:
+                        allow_weak_lang = True
+                        logger.warning(
+                            "test mode: weak language fallback in re-probe context lang=%s",
+                            target_lang,
+                        )
                 ctx_formats: list[str] = []
                 for t in ctx_resolved:
                     fid = str(t.get("formatId") or "").strip()
                     if not fid or fid in ctx_formats:
                         continue
-                    if not format_id_is_exclusive_target(ctx_tracks, fid, target_lang):
+                    if not allow_weak_lang and not format_id_is_exclusive_target(
+                        ctx_tracks, fid, target_lang
+                    ):
                         continue
-                    # Prefer formats whose xtags in THIS context match target.
                     xt = _track_xtags_lang(str(t.get("downloadUrl") or "")) or _track_xtags_lang(
                         str(t.get("xtags") or "")
                     )
-                    if xt and xt != want:
+                    if allow_weak_lang:
+                        if weak_lang_signal(t) != want and xt != want:
+                            continue
+                    elif xt and xt != want:
                         continue
                     ctx_formats.append(fid)
 
@@ -1593,7 +1635,10 @@ def download_youtube_audio_by_language(
                     if fid not in ctx_formats:
                         continue
                     xt = _track_xtags_lang(str(t.get("downloadUrl") or ""))
-                    if xt != want:
+                    if allow_weak_lang:
+                        if weak_lang_signal(t) != want and xt != want:
+                            continue
+                    elif xt != want:
                         continue
                     direct = str(t.get("downloadUrl") or "").strip()
                     if not direct.startswith("http"):
@@ -1714,9 +1759,14 @@ def download_youtube_audio_by_language(
         )
 
     try:
-        selected = _lt_assert_selected_format(
-            assert_tracks, selected_attempt, target_lang
-        )
+        if allow_weak_lang:
+            selected = str(selected_attempt or "").strip()
+            if not selected:
+                raise ValueError("missing format id after weak language fallback")
+        else:
+            selected = _lt_assert_selected_format(
+                assert_tracks, selected_attempt, target_lang
+            )
     except ValueError as exc:
         raise RuntimeError(
             "WRONG_LANGUAGE_TRACK: "
@@ -1737,7 +1787,7 @@ def download_youtube_audio_by_language(
         )
         if sel_xt:
             break
-    if sel_xt and sel_xt != want:
+    if not allow_weak_lang and sel_xt and sel_xt != want:
         raise RuntimeError(
             "WRONG_LANGUAGE_TRACK: "
             + _wrong_language_track_error(target_lang, format_id=selected)
@@ -2625,6 +2675,7 @@ def health():
             "rateLimit": rate_limit_config(),
             "youtubeCookiesLoaded": bool(cookie_path),
             "youtubeCookiesEnabled": _cookies_enabled(),
+            "ytTestMode": _yt_test_mode(),
             "maxConcurrentExtract": _MAX_CONCURRENT_EXTRACT,
             "remoteComponents": _remote_components(),
             "ytDlpVersion": yt_dlp.version.__version__,

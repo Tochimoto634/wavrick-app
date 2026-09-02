@@ -11,7 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
   && pip install --no-cache-dir -r requirements.txt
 
-COPY app.py cors_utils.py rate_limit.py run_demucs.py ./
+COPY app.py cors_utils.py rate_limit.py run_demucs.py lang_tracks.py ./
 
 ENV PORT=8080
 ENV WAVRICK_VOCAL_SEPARATION=1

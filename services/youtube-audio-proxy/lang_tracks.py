@@ -6,6 +6,8 @@ Policy (ADR / targetLang extract):
   or googlevideo xtags lang=) uniquely identifies the target language.
 - Never trust the bare yt-dlp `language` field alone (clients mis-tag default dubs).
 - Never fall back to another language. If the target cannot be proven, callers must error.
+
+Test mode may call resolve_target_tracks_weak_fallback() when strong proof is missing.
 """
 
 from __future__ import annotations
@@ -103,7 +105,6 @@ def strong_lang_signals(track: dict[str, Any]) -> set[str]:
     xt_lang = xtags_lang(
         str(track.get("downloadUrl") or track.get("xtags") or "")
     ) or xtags_lang(str(track.get("xtags") or ""))
-    # Also parse xtags stored separately
     if track.get("xtags"):
         xt_lang = xt_lang or xtags_lang(str(track.get("xtags")))
     if not xt_lang:
@@ -148,13 +149,6 @@ def format_id_weak_signals(tracks: list[dict[str, Any]], format_id: str) -> set[
 def format_id_is_exclusive_target(
     tracks: list[dict[str, Any]], format_id: str, target_lang: str
 ) -> bool:
-    """
-    True only when:
-    - strong evidence exists for target_lang on this format_id
-    - no strong evidence for any other language
-    - weak fields, if present, do not contradict target (optional soft check:
-      weak contradictions alone do not accept; strong other-lang rejects)
-    """
     code = normalize_lang_code(target_lang)
     if not code:
         return False
@@ -164,8 +158,6 @@ def format_id_is_exclusive_target(
     if strong != {code}:
         return False
     weak = format_id_weak_signals(tracks, format_id)
-    # If any weak tag points elsewhere while strong says target, still reject —
-    # safer when clients disagree.
     if weak and any(w != code for w in weak):
         return False
     return True
@@ -227,10 +219,6 @@ def resolve_target_tracks(
     *,
     require_dubbed: bool = False,
 ) -> list[dict[str, Any]]:
-    """
-    Return one representative track dict per exclusive target format_id,
-    sorted best-first. Empty list means caller must error (no fallback).
-    """
     code = normalize_lang_code(target_lang)
     fids = exclusive_target_format_ids(tracks, code)
     resolved: list[dict[str, Any]] = []
@@ -242,12 +230,10 @@ def resolve_target_tracks(
             note = str(t.get("formatNote") or "").lower()
             xt = xtags_from_url(str(t.get("downloadUrl") or ""))
             if "original" in note or "acont=original" in xt:
-                # Keep looking — maybe another exclusive fid is dubbed.
                 continue
         resolved.append(t)
 
     if require_dubbed and not resolved:
-        # All exclusive targets were original-only.
         return []
 
     def score(t: dict[str, Any]) -> float:
@@ -265,6 +251,72 @@ def resolve_target_tracks(
 
     resolved.sort(key=score, reverse=True)
     return resolved
+
+
+def resolve_target_tracks_weak_fallback(
+    tracks: list[dict[str, Any]],
+    target_lang: str,
+    *,
+    require_dubbed: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Test / last resort when yt-dlp omits note/[lang]/xtags but sets language=ja etc.
+    Requires at least two audio-capable formats when require_dubbed (original + dub).
+    """
+    code = normalize_lang_code(target_lang)
+    if not code:
+        return []
+    audio = [t for t in tracks if t.get("isAudioOnly") or t.get("hasUrl")]
+    if require_dubbed and len(audio) < 2:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    seen_fid: set[str] = set()
+    for t in audio:
+        if weak_lang_signal(t) != code:
+            continue
+        note = str(t.get("formatNote") or "").lower()
+        xt = xtags_from_url(str(t.get("downloadUrl") or ""))
+        if require_dubbed and ("original" in note or "acont=original" in xt):
+            continue
+        fid = str(t.get("formatId") or "").strip()
+        if fid and fid in seen_fid:
+            continue
+        if fid:
+            seen_fid.add(fid)
+        candidates.append(t)
+
+    def score(t: dict[str, Any]) -> float:
+        note = str(t.get("formatNote") or "").lower()
+        xt = xtags_from_url(str(t.get("downloadUrl") or ""))
+        s = 0.0
+        if t.get("hasUrl"):
+            s += 5.0
+        if "dub" in note or "dubbed" in xt:
+            s += 25.0
+        if "original" in note or "acont=original" in xt:
+            s -= 20.0
+        s += float(t.get("abr") or 0) / 128.0
+        return s
+
+    candidates.sort(key=score, reverse=True)
+    return candidates
+
+
+def probe_track_debug_lines(tracks: list[dict[str, Any]], limit: int = 10) -> list[str]:
+    lines: list[str] = []
+    for t in (tracks or [])[:limit]:
+        fid = str(t.get("formatId") or "?")
+        note = str(t.get("formatNote") or "")[:72]
+        weak = weak_lang_signal(t) or "-"
+        strong = ",".join(sorted(strong_lang_signals(t))) or "-"
+        xt = xtags_lang(str(t.get("downloadUrl") or t.get("xtags") or "")) or "-"
+        client = str(t.get("sourceClient") or "")
+        lines.append(
+            f"format={fid} weak={weak} strong={strong} xtags={xt} "
+            f"note={note!r} cookies={t.get('sourceUseCookies')} client={client}"
+        )
+    return lines
 
 
 def catalog_strong_langs(tracks: list[dict[str, Any]]) -> list[str]:
