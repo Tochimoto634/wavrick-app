@@ -70,7 +70,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 34
+_EXTRACT_BUILD = 35
 
 def _pot_provider_enabled() -> bool:
     env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
