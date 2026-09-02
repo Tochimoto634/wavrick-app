@@ -67,7 +67,7 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 22
+_EXTRACT_BUILD = 23
 
 # Cookies are opt-in only (shared operator cookies are discouraged in production).
 def _cookies_enabled() -> bool:
@@ -482,8 +482,8 @@ def probe_media_duration_sec(path: str) -> float:
         return 0.0
 
 
-def youtube_video_duration_sec(url: str) -> float:
-    """yt-dlp で動画メタの長さ（秒）。失敗時は 0（ダウンロード側で再判定）。"""
+def _probe_video_info(url: str) -> dict:
+    """yt-dlp で動画メタを取得。cookies / player_client を順に試行。"""
     clear_download_proxies()
     last_err: BaseException | None = None
     for use_cookies in (True, False) if _cookies_enabled() else (False,):
@@ -496,17 +496,26 @@ def youtube_video_duration_sec(url: str) -> float:
                 )
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
-                if not info:
-                    continue
-                return max(0.0, float(info.get("duration") or 0))
+                if info:
+                    return info
             except Exception as exc:
                 last_err = exc
                 if not _is_format_or_challenge_error(exc):
-                    logger.warning("video duration probe failed (%s)", exc)
+                    logger.warning("video info probe failed (%s)", exc)
                 continue
     if last_err:
-        logger.warning("video duration unavailable for %s: %s", url, last_err)
-    return 0.0
+        raise last_err
+    raise RuntimeError("動画情報を取得できませんでした。")
+
+
+def youtube_video_duration_sec(url: str) -> float:
+    """yt-dlp で動画メタの長さ（秒）。失敗時は 0（ダウンロード側で再判定）。"""
+    try:
+        info = _probe_video_info(url)
+        return max(0.0, float(info.get("duration") or 0))
+    except Exception as exc:
+        logger.warning("video duration unavailable for %s: %s", url, exc)
+        return 0.0
 
 
 def _is_audio_truncated(actual_sec: float, expected_sec: float) -> bool:
@@ -2493,10 +2502,8 @@ def video_meta():
     if not url or not host_allowed(url):
         abort(400)
 
-    clear_download_proxies()
     try:
-        with yt_dlp.YoutubeDL(_base_ydl_opts(skip_download=True)) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _probe_video_info(url)
     except Exception as exc:
         logger.exception("video-meta failed for %s", url)
         return jsonify({"ok": False, "error": str(exc)}), 422
