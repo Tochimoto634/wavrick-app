@@ -70,7 +70,49 @@ _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 30
+_EXTRACT_BUILD = 31
+
+def _pot_provider_enabled() -> bool:
+    env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
+    return env not in ("0", "false", "no", "off")
+
+
+def _pot_base_url() -> str:
+    raw = os.environ.get("WAVRICK_YT_POT_BASE_URL", "").strip()
+    if raw:
+        return raw.rstrip("/")
+    port = os.environ.get("WAVRICK_YT_POT_PORT", "4416").strip() or "4416"
+    return f"http://127.0.0.1:{port}"
+
+
+def _pot_server_ok() -> bool:
+    if not _pot_provider_enabled():
+        return False
+    try:
+        req = urllib.request.Request(f"{_pot_base_url()}/ping")
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            return 200 <= int(resp.status) < 300
+    except Exception:
+        return False
+
+
+def _merge_extractor_args(*parts: dict) -> dict:
+    merged: dict = {}
+    for part in parts:
+        for ns, values in (part or {}).items():
+            bucket = merged.setdefault(ns, {})
+            if isinstance(values, dict):
+                bucket.update(values)
+            else:
+                merged[ns] = values
+    return merged
+
+
+def _pot_extractor_args() -> dict:
+    if not _pot_provider_enabled():
+        return {}
+    return {"youtubepot-bgutilhttp": {"base_url": _pot_base_url()}}
+
 
 def _cookies_enabled() -> bool:
     flag = os.environ.get("WAVRICK_YT_USE_COOKIES", "").strip().lower()
@@ -290,6 +332,7 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
         # web_embedded exposes multi-audio when web_safari hits SABR-only (0 audio).
         preferred = [
             ["web_embedded"],
+            ["mweb"],
             ["web_safari"],
             ["android"],
         ]
@@ -337,13 +380,16 @@ def _youtube_extractor_args(
         player_skip = []
     else:
         player_skip = ["webpage"]
-    return {
-        "youtube": {
-            "player_client": clients,
-            "player_skip": player_skip,
-            "player_js_version": ["actual"],
-        }
-    }
+    return _merge_extractor_args(
+        {
+            "youtube": {
+                "player_client": clients,
+                "player_skip": player_skip,
+                "player_js_version": ["actual"],
+            }
+        },
+        _pot_extractor_args(),
+    )
 
 
 def _base_ydl_opts(
@@ -1296,7 +1342,10 @@ def probe_youtube_audio_tracks(
                     if _needs_full_player_response(clients):
                         ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
                         ya["player_skip"] = []
-                        opts["extractor_args"] = {"youtube": ya}
+                        opts["extractor_args"] = _merge_extractor_args(
+                            opts.get("extractor_args", {}),
+                            {"youtube": ya},
+                        )
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                     if not info:
@@ -1521,7 +1570,10 @@ def _probe_tracks_single_context(
     if _needs_full_player_response(player_clients):
         ya = dict(opts.get("extractor_args", {}).get("youtube", {}))
         ya["player_skip"] = []
-        opts["extractor_args"] = {"youtube": ya}
+        opts["extractor_args"] = _merge_extractor_args(
+            opts.get("extractor_args", {}),
+            {"youtube": ya},
+        )
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not info:
@@ -3041,7 +3093,10 @@ def health():
             "nodePath": shutil.which("node"),
             "denoPath": shutil.which("deno"),
             "extractBuild": _EXTRACT_BUILD,
-            "features": ["language_tracks", "probe-tracks", "vocal_separation"],
+            "potProviderEnabled": _pot_provider_enabled(),
+            "potProviderReady": _pot_server_ok(),
+            "potProviderBaseUrl": _pot_base_url() if _pot_provider_enabled() else None,
+            "features": ["language_tracks", "probe-tracks", "vocal_separation", "pot_provider"],
             "supabaseStorageConfigured": bool(sb_base and sb_key),
             "supabaseHost": sb_host or None,
         }
