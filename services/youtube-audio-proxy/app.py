@@ -57,6 +57,8 @@ logging.basicConfig(level=logging.INFO)
 
 # 返却する音声の上限（Whisper 投入用 MP3 想定）。128kbps なら約 50 分弱まで。
 MAX_BYTES = int(os.environ.get("WAVRICK_MAX_AUDIO_BYTES", str(48 * 1024 * 1024)))
+# DAW 用リファレンス動画（720p）。Storage 配送前提で音声より大きく取る。
+MAX_VIDEO_BYTES = int(os.environ.get("WAVRICK_MAX_VIDEO_BYTES", str(512 * 1024 * 1024)))
 
 # 高ビットレート単体ストリームは途中で切れることがあるため abr 上限付きで「動画全长」を優先
 _AUDIO_FORMAT = (
@@ -69,8 +71,16 @@ _AUDIO_FORMAT_LAST_RESORT = "bestaudio/best"
 _AUDIO_FORMAT_ANY = "ba/b/w"
 _AUDIO_FORMAT_MUX = "b/w"
 _AUDIO_FORMAT_BEST = "best"
+# 720p 以下の MP4（映像+音声）。DAW リファレンス用。
+_VIDEO_FORMAT_720P = (
+    "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
+    "b[height<=720][ext=mp4]/"
+    "bv*[height<=720]+ba/"
+    "b[height<=720]"
+)
+_VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 36
+_EXTRACT_BUILD = 37
 
 def _pot_provider_enabled() -> bool:
     env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
@@ -179,8 +189,15 @@ _MAX_CONCURRENT_EXTRACT = max(1, int(os.environ.get("WAVRICK_YT_MAX_CONCURRENT_E
 _extract_semaphore = threading.Semaphore(_MAX_CONCURRENT_EXTRACT)
 
 
-def _guess_mimetype(path: str) -> str:
+def _guess_mimetype(path: str, *, as_video: bool = False) -> str:
     ext = os.path.splitext(path)[1].lower()
+    if as_video:
+        return {
+            ".mp4": "video/mp4",
+            ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime",
+            ".webm": "video/webm",
+        }.get(ext, "video/mp4")
     return {
         ".m4a": "audio/mp4",
         ".mp4": "audio/mp4",
@@ -190,6 +207,10 @@ def _guess_mimetype(path: str) -> str:
         ".ogg": "audio/ogg",
         ".opus": "audio/ogg",
     }.get(ext, "application/octet-stream")
+
+
+def _guess_video_mimetype(path: str) -> str:
+    return _guess_mimetype(path, as_video=True)
 
 
 _COOKIE_CACHE_PATH: str | None = None
@@ -803,6 +824,97 @@ def download_youtube_audio(
     if not files:
         raise RuntimeError("yt-dlp produced no output file")
     return files[0]
+
+
+def _ydl_options_video(
+    out_tmpl: str,
+    *,
+    format_selector: str | None = None,
+    use_cookies: bool = False,
+    player_clients: list[str] | None = None,
+) -> dict:
+    """Video download — do NOT run FFmpegExtractAudio."""
+    opts = _base_ydl_opts(
+        use_cookies=use_cookies,
+        player_clients=player_clients,
+        format=format_selector or _VIDEO_FORMAT_720P,
+        outtmpl=out_tmpl,
+        no_warnings=False,
+        socket_timeout=300,
+        nopart=True,
+        retries=5,
+        fragment_retries=10,
+        merge_output_format="mp4",
+    )
+    return opts
+
+
+def download_youtube_video_720p(
+    url: str,
+    out_dir: str,
+    *,
+    use_cookies: bool = False,
+    player_clients: list[str] | None = None,
+) -> tuple[str, float]:
+    """
+    Download reference video at max 720p (mp4 when possible).
+    Returns (path, duration_sec).
+    """
+    out_tmpl = os.path.join(out_dir, "video.%(ext)s")
+    clear_download_proxies()
+    _clear_out_files(out_dir)
+    last_err: BaseException | None = None
+    path = ""
+    formats = (_VIDEO_FORMAT_720P, _VIDEO_FORMAT_720P_FALLBACK)
+    cookie_modes = (True, False) if (use_cookies and _cookies_enabled()) else (False,)
+    client_attempts = (
+        [player_clients]
+        if player_clients
+        else _player_client_attempts(use_cookies=bool(use_cookies and _cookies_enabled()))
+    )
+    for cookies_on in cookie_modes:
+        for clients in client_attempts:
+            for fmt in formats:
+                try:
+                    _clear_out_files(out_dir)
+                    ydl_opts = _ydl_options_video(
+                        out_tmpl,
+                        format_selector=fmt,
+                        use_cookies=cookies_on,
+                        player_clients=clients,
+                    )
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+                    files = sorted(
+                        glob.glob(os.path.join(out_dir, "video.*")),
+                        key=lambda p: os.path.getsize(p),
+                        reverse=True,
+                    )
+                    # Prefer mp4 container
+                    mp4s = [p for p in files if p.lower().endswith(".mp4")]
+                    path = (mp4s or files)[0] if (mp4s or files) else ""
+                    if path:
+                        last_err = None
+                        break
+                except Exception as exc:
+                    last_err = exc
+                    logger.warning(
+                        "video 720p download failed fmt=%s clients=%s cookies=%s: %s",
+                        fmt,
+                        clients,
+                        cookies_on,
+                        exc,
+                    )
+                    continue
+            if path:
+                break
+        if path:
+            break
+    if not path:
+        detail = str(last_err).strip() if last_err else "yt-dlp produced no video file"
+        raise RuntimeError(f"FETCH_FAILED: {detail}")
+    dur = probe_media_duration_sec(path) or youtube_video_duration_sec(url) or 0.0
+    return path, float(dur)
 
 
 def _language_format_selector(target_lang: str, *, prefer_dub: bool = True) -> str:
@@ -1463,7 +1575,8 @@ def probe_youtube_audio_tracks(
                     raise
 
     if not merged and _pot_script_ready():
-        for use_cookies in cookie_modes:
+        # Stale Railway cookies often break POT + web_embedded; try without cookies first.
+        for use_cookies in (False,):
             for clients in (["web_embedded"], ["mweb"], ["web_safari"]):
                 try:
                     logger.info(
@@ -3080,6 +3193,120 @@ def extract():
     return resp
 
 
+@app.route("/extract-video", methods=["OPTIONS"])
+def extract_video_options():
+    return Response("", status=204)
+
+
+@app.post("/extract-video")
+def extract_video():
+    """Download reference video (max 720p) for talent DAW packs. Prefer delivery=storage."""
+    secret = os.environ.get("PROXY_SECRET", "").strip()
+    if secret:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {secret}":
+            abort(401)
+
+    allowed, retry_after = check_extract_limit()
+    if not allowed:
+        return (
+            jsonify({"ok": False, "error": "リクエスト制限に達しました。しばらくして再試行してください。"}),
+            429,
+            {"Retry-After": str(retry_after)},
+        )
+
+    payload = request.get_json(silent=True) or {}
+    url = (payload.get("videoUrl") or payload.get("url") or "").strip()
+    if not url or not host_allowed(url):
+        abort(400)
+
+    out_dir = tempfile.mkdtemp(prefix="wavrick_yt_vid_")
+    if not _extract_semaphore.acquire(timeout=300):
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "errorCode": "BUSY",
+                    "error": "YouTube 取得が混雑しています。しばらく待ってから再試行してください。",
+                }
+            ),
+            503,
+        )
+    try:
+        path = ""
+        video_dur = 0.0
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                path, video_dur = download_youtube_video_720p(url, out_dir)
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                detail = str(exc).strip() or exc.__class__.__name__
+                if attempt == 0 and _is_bot_or_block_error(detail):
+                    logger.warning("extract-video bot/block — retry after backoff (%s)", detail[:120])
+                    time.sleep(2.0)
+                    continue
+                raise
+        if last_err:
+            raise last_err
+
+        mime = _guess_video_mimetype(path)
+        file_size = os.path.getsize(path)
+        video_dur = probe_media_duration_sec(path) or video_dur
+
+        delivery = (payload.get("delivery") or "storage").strip().lower()
+        storage_path = (payload.get("storagePath") or "").strip()
+        if delivery == "storage":
+            if not storage_path:
+                abort(400, description="storagePath is required when delivery=storage")
+            if file_size > MAX_VIDEO_BYTES:
+                abort(413)
+            if file_size < 1024:
+                abort(502)
+            public_url = upload_to_supabase_storage(path, storage_path, mime)
+            return jsonify(
+                {
+                    "ok": True,
+                    "videoUrl": public_url,
+                    "audioUrl": public_url,
+                    "publicUrl": public_url,
+                    "videoDurationSec": video_dur,
+                    "mime": mime,
+                    "byteLength": file_size,
+                    "heightMax": 720,
+                    "extractBuild": _EXTRACT_BUILD,
+                }
+            )
+
+        if file_size > MAX_VIDEO_BYTES:
+            abort(413)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if len(data) < 1024:
+            abort(502)
+        resp = Response(data, mimetype=mime)
+        resp.headers["X-Wavrick-Extract-Build"] = str(_EXTRACT_BUILD)
+        if video_dur > 0:
+            resp.headers["X-Wavrick-Video-Duration-Sec"] = f"{video_dur:.2f}"
+        return resp
+    except Exception as exc:
+        logger.exception("extract-video failed for %s", url)
+        detail = str(exc).strip() or exc.__class__.__name__
+        if detail.startswith("FETCH_FAILED:"):
+            friendly = detail.split(":", 1)[1].strip()
+            code = _extract_error_code(detail)
+            return jsonify({"ok": False, "errorCode": code, "error": friendly}), 502
+        friendly = _friendly_yt_extract_error(detail)
+        code = _extract_error_code(detail)
+        return jsonify({"ok": False, "errorCode": code, "error": friendly}), 502
+    finally:
+        _extract_semaphore.release()
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 @app.post("/video-meta")
 def video_meta():
     secret = os.environ.get("PROXY_SECRET", "").strip()
@@ -3181,7 +3408,14 @@ def health():
             ),
             "potScriptReady": _pot_script_ready(),
             "nodeRuntime": (_js_runtimes().get("node") or {}).get("path"),
-            "features": ["language_tracks", "probe-tracks", "vocal_separation", "pot_provider"],
+            "features": [
+                "language_tracks",
+                "probe-tracks",
+                "vocal_separation",
+                "pot_provider",
+                "extract-video-720p",
+            ],
+            "maxVideoBytes": MAX_VIDEO_BYTES,
             "supabaseStorageConfigured": bool(sb_base and sb_key),
             "supabaseHost": sb_host or None,
         }
