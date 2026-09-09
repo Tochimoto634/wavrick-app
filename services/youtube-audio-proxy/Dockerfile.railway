@@ -1,12 +1,21 @@
+# NOT the production build. The repo-root railway.toml pins the handsome-warmth
+# service to /Dockerfile.railway-audio-proxy, which wins over the Railway UI.
+# This file only builds when the service Root Directory is set to this folder.
+# It previously drifted (no deno, no remote components) and would silently ship
+# a weaker extractor, so keep it byte-for-byte equivalent to the root one.
 FROM node:20-bookworm-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     python3 python3-pip \
-    ffmpeg ca-certificates curl git \
+    ffmpeg ca-certificates curl git unzip \
     python3 make g++ pkg-config libvips-dev \
     libvips42 libcairo2 libpango-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 \
+  && curl -fsSL https://deno.land/install.sh | sh \
   && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.deno/bin:/usr/local/bin:${PATH}"
+ENV WAVRICK_YT_REMOTE_COMPONENTS=ejs:github
 
 ARG BGUTIL_VERSION=1.3.2
 RUN git clone --depth 1 --branch "${BGUTIL_VERSION}" \
@@ -30,5 +39,7 @@ ENV WAVRICK_YT_POT_ENABLED=1
 ENV WAVRICK_YT_POT_PORT=4416
 ENV WAVRICK_YT_POT_SERVER_HOME=/opt/bgutil/server
 ENV WAVRICK_NODE_PATH=/usr/local/bin/node
+
+RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_AT
 
 CMD ["/start-railway.sh"]

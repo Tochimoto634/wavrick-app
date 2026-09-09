@@ -8,7 +8,8 @@ Railway（または同等のコンテナホスト）で `services/youtube-audio-
 |------|------|
 | ビルド | `services/youtube-audio-proxy/Dockerfile.railway`（Root Directory 設定時） |
 | ビルド（Root Directory なし） | リポジトリ直下 `Dockerfile.railway-audio-proxy` |
-| プロセス | `gunicorn --bind 0.0.0.0:$PORT --timeout 300 app:app` |
+| プロセス | `gunicorn --worker-class gthread --workers 1 --threads 4 --timeout 240 app:app` |
+| yt-dlp | Railway は **pre-release 固定**（`requirements-railway.txt`）。`Failed to extract any player response` は版が古いサイン → pin を上げて再デプロイ |
 | ヘルスチェック | `GET /health`（Railway `healthcheckPath` 済み） |
 | ボーカル分離 | 本番 Railway は **OFF**（`WAVRICK_VOCAL_SEPARATION=0`）。CPU/メモリ節約 |
 
@@ -30,50 +31,160 @@ SUPABASE_SERVICE_ROLE_KEY=（Supabase Dashboard → Settings → API → service
 ```env
 WAVRICK_RL_EXTRACT_PER_MIN=6
 WAVRICK_RL_VIDEO_META_PER_MIN=30
+WAVRICK_YT_MAX_CONCURRENT_EXTRACT=2
+WAVRICK_YT_BUSY_WAIT_SEC=2
+WAVRICK_GUNICORN_THREADS=4
+WAVRICK_GUNICORN_TIMEOUT=240
+WAVRICK_YT_SOCKET_TIMEOUT=90
 ```
 
-YouTube が Railway のデータセンター IP を拒否する場合（502 / 403）:
+Edge `media-pipeline` の fetch 打ち切りは **250 秒**（gunicorn 240 秒より長い）。混雑時はキューで待たせず 503 BUSY。
 
-```env
-WAVRICK_YT_PROXY=socks5h://user:pass@proxy.example.com:7000
-WAVRICK_YT_PLAYER_CLIENT=android,web
-```
+## 2-b. YouTube のボット判定（datacenter IP）
 
-住宅系プロキシが必要なケースがあります。
+`Sign in to confirm you're not a bot` / `Failed to extract any player response` /
+`0 tracks` は、ほぼ全て **Railway が datacenter IP である** ことが原因です。
+cookies も POT も yt-dlp の版も**アプリケーション層**の対策で、YouTube の IP
+レピュテーション判定はそれより手前で走るため、これらでは解決しません。
 
-**ボット判定**（`Sign in to confirm you're not a bot`）が出たら、ログイン済み cookies を Railway に渡す:
+まず `/health` で application 層が揃っているか確認します:
 
 ```bash
-./scripts/export-youtube-cookies-for-railway.sh
+curl -sS --max-time 10 "https://handsome-warmth-production-d61f.up.railway.app/health" \
+  | python3 -c 'import sys,json; h=json.load(sys.stdin); print({k:h.get(k) for k in ["extractBuild","ytDlpVersion","imageBuiltAt","potProviderReady","youtubeCookiesEnabled","ytProxyConfigured","ytProxy","ytProxyDirectDownload"]})'
 ```
 
-Railway Variables:
+`potProviderReady: true` かつ `ytDlpVersion` が nightly なのに 403 が出るなら、
+残っているのは IP 層だけです。
+
+### 住宅プロキシ（IP 層の唯一の直接対策）
 
 ```env
-WAVRICK_YT_COOKIES_B64=<スクリプトが出力した base64 1行>
+WAVRICK_YT_PROXY=http://USER:PASS@gate.example.com:7777
 ```
 
-（ローカルファイルマウント可能な環境のみ `WAVRICK_YT_COOKIES=/path/to/cookies.txt` も可。cookies は数週間で再設定が必要なことがあります。）
+コード側は配線済みなので、Railway に環境変数を入れて再デプロイするだけです。
 
-**重要:** 環境変数だけ追加では不十分です。**GitHub から Railway を再デプロイ**し、最新の `app.py`（cookies + `ejs:github` 対応）を反映してください。
+**スティッキーセッション必須。** googlevideo の URL は、それを発行した probe の
+出口 IP に紐づきます。リクエストごとに IP が変わるローテーティング型を使うと、
+probe と download で IP が食い違って必ず HTTP 403 になります。ジョブ単位で IP を
+固定できるプランを選んでください。
+
+**スキームは http / https を推奨。** 直 URL ダウンロード（probe が発行した
+googlevideo URL を yt-dlp を再度通さずに取る近道）は urllib で行うため、
+socks では同じプロキシを通せません。socks を指定した場合はこの近道を自動的に
+無効化し、yt-dlp 経由のダウンロードにフォールバックします（socks は yt-dlp が
+自前で扱えるため正しく動きますが、その分だけ遅くなります）。
+`/health` の `ytProxyDirectDownload` で今どちらかを確認できます。
+
+**帯域の目安。** 128kbps・10 分の動画で約 10MB。$3〜8/GB のプランなら 1 回あたり
+数円です。Supabase Storage へのアップロードはプロキシを通さない実装なので、
+課金対象は YouTube との通信だけです。
+
+### 併用する緩和策
+
+- **音声ファイルのアップロード:** 顧客は動画の所有者なので元マスターを持っています。
+  128kbps 再エンコードより音質が良く、文字起こし精度も上がります。
+- **キャッシュ:** 同一動画は Supabase `youtube_audio_cache` に 30 日残り、
+  ユーザー横断で再利用されます。キャッシュヒット時は YouTube に一切触りません。
+
+### Cookies（非推奨・任意）
+
+**本番では運営 Google アカウントの cookies 共有（`WAVRICK_YT_COOKIES_B64`）は使わないでください。**
+アカウント停止リスクがあり、media-pipeline 側でチャンネル所有者チェック＋キャッシュが主な対策です。
+
+ローカル検証のみ、明示的 opt-in:
+
+```env
+WAVRICK_YT_USE_COOKIES=1
+WAVRICK_YT_COOKIES_B64=<base64 1行>   # または WAVRICK_YT_COOKIES=/path/to/cookies.txt
+```
+
+`WAVRICK_YT_USE_COOKIES` 未設定（既定）では cookies は **一切** yt-dlp に渡りません。
+
+**重要:** 環境変数だけ追加では不十分です。**GitHub から Railway を再デプロイ**し、最新の `app.py` を反映してください。
 
 デプロイ後 `GET /health` で確認:
 
 ```json
-"youtubeCookiesLoaded": true,
+"youtubeCookiesEnabled": false,
+"youtubeCookiesLoaded": false,
+"maxConcurrentExtract": 2,
 "remoteComponents": ["ejs:github"]
 ```
 
-どちらかが `false` / 空なら設定ミスです。
+`youtubeCookiesEnabled: true` はローカル検証用のみ。本番は `false` が正常です。
 
 ## 3. Supabase secrets
 
 ```text
 YOUTUBE_AUDIO_PROXY_URL=https://<your-service>.up.railway.app/extract
 YOUTUBE_AUDIO_PROXY_SECRET=<PROXY_SECRET と同じ>
+YOUTUBE_DATA_API_KEY=<Google Cloud の YouTube Data API v3 キー>
 ```
 
 `youtube-video-meta` は URL 末尾の `/extract` を自動で除去して `/video-meta` を呼びます。
+
+### `YOUTUBE_DATA_API_KEY`（強く推奨）
+
+チャンネル所有者の判定に使います。設定すると、フロントの事前チェックと Edge の
+チャンネルガードが **yt-dlp を経由しなくなり**、ボット判定も 60 秒タイムアウトも
+受けません。1 動画あたり 1 unit（日次 10,000）で、実質無料です。
+
+Google Cloud コンソール → API とサービス → YouTube Data API v3 を有効化 → 認証情報で
+API キーを作成。キーの制限は「YouTube Data API v3」のみに絞ってください。
+
+未設定でも動作します（従来どおり yt-dlp `/video-meta` にフォールバック）が、
+1 リクエストあたりの yt-dlp セッションが 1 回から 3 回に戻ります。非公開動画は
+Data API では引けないため、その場合だけ自動的に yt-dlp 経路に落ちます。
+
+### media-pipeline 側（チャンネルガード・キャッシュ・レート制限）
+
+マイグレーション `202609021200_youtube_audio_cache.sql` 適用後:
+
+```bash
+./scripts/apply-supabase-migrations.sh
+supabase functions deploy media-pipeline youtube-video-meta
+```
+
+任意 Edge secrets:
+
+```text
+WAVRICK_RL_YT_EXTRACT_DAY=10
+WAVRICK_RL_YT_EXTRACT_HOUR=2
+WAVRICK_YT_CACHE_TTL_DAYS=30
+```
+
+- JWT 必須（未ログインは YouTube extract 不可）
+- 登録チャンネルと一致しない URL は **403**（proxy に到達しない）
+- 管理者のみバイパス（`admin_users_public`）
+
+### テスト段階（チャンネルガード・レート制限オフ）
+
+**本番公開前に必ず OFF に戻すこと。**
+
+Supabase Edge secrets:
+
+```text
+WAVRICK_YT_TEST_MODE=1
+```
+
+または `WAVRICK_YT_CHANNEL_GUARD=0`（同等: チャンネル一致チェック無効）。
+
+効果:
+
+- ログイン済みなら **任意の YouTube URL** で extract（チャンネル meta ゲートなし）
+- YouTube extract の **日次/時間レート制限スキップ**
+
+フロント（本番 Hostinger）:
+
+- 本番では `WAVRICK_YT_TEST_MODE` を **入れない**（チャンネル所有確認が無効になる）
+- ローカル開発のみ: 依頼画面 URL に `?yt_test=1`（`wavrick.com` では無効）
+
+```bash
+supabase secrets set WAVRICK_YT_TEST_MODE=1
+supabase functions deploy media-pipeline
+```
 
 ## 4. 本番確認スクリプト
 
@@ -88,15 +199,26 @@ export YOUTUBE_AUDIO_PROXY_SECRET=your-secret
 
 成功時: `ok: true`、ffmpeg パス、`rateLimit` オブジェクトが表示されます。
 
+チャンネルガード・キャッシュキーの単体テスト:
+
+```bash
+node scripts/test-youtube-channel-cache.mjs
+```
+
 ## 5. ログ・障害時
 
 | 症状 | 確認 |
 |------|------|
-| 502 / extract failed | Railway ログで yt-dlp 403。プロキシ無効化や音声ファイル直接アップロードを案内 |
-| 401 | `Authorization: Bearer` と `PROXY_SECRET` の不一致 |
-| 429 | レート制限。`Retry-After` 秒後に再試行 |
-| タイムアウト | gunicorn `--timeout 300`。長い動画は demucs OFF 推奨 |
-| 書き起こしが途中で終わる | 旧版は yt-dlp `max_filesize` で元音声が途中切断されていた（10分→約4〜5分）。`WAVRICK_MAX_AUDIO_BYTES`（既定48MB）は **変換後** の返却のみに適用（128kbps MP3 想定・約50分弱） |
+| 502 / `YT_EXTRACT_BLOCKED` | Railway ログで yt-dlp 403 / ボット判定。音声ファイル直接アップロードを案内 |
+| 502 / `FETCH_FAILED` + `player response` | yt-dlp が古い。`requirements-railway.txt` の pin を最新 `.dev0` に上げて Railway 再デプロイ。`/health` の `ytDlpVersion` を確認 |
+| 403 / `CHANNEL_MISMATCH` | 第三者チャンネル URL。登録チャンネルの動画のみ許可（正常動作） |
+| Storage upload HTML 400 | Railway の `SUPABASE_URL` が `https://<ref>.supabase.co` か、`SUPABASE_SERVICE_ROLE_KEY` が JWT（`eyJ…`）か確認 |
+| 401 / `AUTH_REQUIRED` | ログイン後に extract。Supabase JWT が media-pipeline に付与されているか |
+| 429 | レート制限（IP / ユーザー）。`Retry-After` 秒後に再試行 |
+| 503 / `BUSY` | 同時 extract 上限。2 秒待って空きがなければ即 503（`Retry-After: 8`）。Edge が最大 90 秒リトライ。`WAVRICK_YT_MAX_CONCURRENT_EXTRACT`（既定 2） |
+| タイムアウト | gunicorn `--timeout 240`。Edge の AbortSignal は **250 秒**（gunicorn より長くし、`Signal timed out` を出さない）。混雑は BUSY で返す |
+| `/health` が遅い | 旧 sync workers=1 だと extract 中にヘルスも止まる。gthread 再デプロイ後は extract 中でも `/health` が数秒で返る |
+| 2 回目以降が速い | `youtube_audio_cache` ヒット（YouTube 再アクセスなし） |
 
 ## 6. グレースフルシャットダウン
 
@@ -120,4 +242,6 @@ WAVRICK_RL_SCRIPT_HOUR=24
 WAVRICK_RL_FULL_HOUR=4
 WAVRICK_RL_BURST_PER_MIN=30
 WAVRICK_RL_VIDEO_META_PER_MIN=40
+WAVRICK_RL_YT_EXTRACT_DAY=10
+WAVRICK_RL_YT_EXTRACT_HOUR=2
 ```
