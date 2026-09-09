@@ -80,7 +80,7 @@ _VIDEO_FORMAT_720P = (
 )
 _VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 40
+_EXTRACT_BUILD = 41
 
 
 def _pot_provider_enabled() -> bool:

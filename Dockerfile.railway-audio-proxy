@@ -24,7 +24,7 @@ RUN git clone --depth 1 --branch "${BGUTIL_VERSION}" \
 
 WORKDIR /app
 COPY services/youtube-audio-proxy/requirements-railway.txt requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages --pre -r requirements.txt
 
 COPY services/youtube-audio-proxy/app.py \
     services/youtube-audio-proxy/cors_utils.py \
