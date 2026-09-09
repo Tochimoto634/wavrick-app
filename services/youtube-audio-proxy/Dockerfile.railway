@@ -18,7 +18,8 @@ RUN git clone --depth 1 --branch "${BGUTIL_VERSION}" \
 
 WORKDIR /app
 COPY requirements-railway.txt requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+# --pre so yt-dlp.dev0 (nightly channel) can install when pinned.
+RUN pip3 install --no-cache-dir --break-system-packages --pre -r requirements.txt
 
 COPY app.py cors_utils.py rate_limit.py run_demucs.py lang_tracks.py ./
 COPY start-railway.sh /start-railway.sh
