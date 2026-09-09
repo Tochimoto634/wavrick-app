@@ -26,7 +26,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,6 +49,7 @@ from lang_tracks import (
     xtags_from_url as _xtags_from_url,
     xtags_lang as _xtags_lang_from_url,
 )
+from extract_slot import ExtractGate, busy_wait_sec, ydl_socket_timeout
 
 app = Flask(__name__)
 logger = logging.getLogger("wavrick.yt_audio")
@@ -80,7 +80,8 @@ _VIDEO_FORMAT_720P = (
 )
 _VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 37
+_EXTRACT_BUILD = 40
+
 
 def _pot_provider_enabled() -> bool:
     env = os.environ.get("WAVRICK_YT_POT_ENABLED", "1").strip().lower()
@@ -186,7 +187,21 @@ _VOCAL_SEPARATION = os.environ.get("WAVRICK_VOCAL_SEPARATION", "1").strip().lowe
 _DEMUCS_MODEL = os.environ.get("WAVRICK_DEMUCS_MODEL", "htdemucs").strip() or "htdemucs"
 _DEMUCS_TIMEOUT_SEC = int(os.environ.get("WAVRICK_DEMUCS_TIMEOUT", "600"))
 _MAX_CONCURRENT_EXTRACT = max(1, int(os.environ.get("WAVRICK_YT_MAX_CONCURRENT_EXTRACT", "2")))
-_extract_semaphore = threading.Semaphore(_MAX_CONCURRENT_EXTRACT)
+_extract_gate = ExtractGate(_MAX_CONCURRENT_EXTRACT)
+
+
+def _busy_response(message: str):
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "errorCode": "BUSY",
+                "error": message,
+            }
+        ),
+        503,
+        {"Retry-After": "8"},
+    )
 
 
 def _guess_mimetype(path: str, *, as_video: bool = False) -> str:
@@ -287,6 +302,12 @@ def _friendly_yt_extract_error(detail: str) -> str:
             " 別の動画で試すか、mp3/m4a を直接アップロードしてください。"
             f" 詳細: {detail[:240]}"
         )
+    if "page needs to be reloaded" in detail.lower():
+        return (
+            "YouTube から再生可能な音声形式を取得できませんでした（player/cookies）。"
+            " しばらくして再試行するか、音声ファイルを直接アップロードしてください。"
+            f" 詳細: {detail[:240]}"
+        )
     return detail
 
 
@@ -332,17 +353,21 @@ def _player_client_attempts(*, use_cookies: bool = False) -> list[list[str]]:
     )
     cookies_on = use_cookies and _cookies_enabled()
     if cookies_on:
+        # Prefer web_embedded / web_safari first. tv_downgraded + cookies often
+        # yields yt-dlp "The page needs to be reloaded." (no formats / SABR).
         defaults: list[list[str]] = [
-            ["tv", "web"],
+            ["web_embedded", "web"],
             ["web_safari", "web"],
-            ["tv_downgraded", "web"],
             ["web"],
             ["mweb", "web"],
+            ["tv", "web"],
+            ["tv_downgraded", "web"],
             ["ios", "web"],
         ]
     else:
         defaults = [
             ["web_safari"],
+            ["web_embedded", "web"],
             ["web_safari", "android", "web"],
             ["android", "web"],
             ["web"],
@@ -451,6 +476,7 @@ def _base_ydl_opts(
         "quiet": True,
         "noplaylist": True,
         "proxy": _yt_proxy(),
+        "socket_timeout": ydl_socket_timeout(),
         "extractor_args": _youtube_extractor_args(
             player_clients, use_cookies=use_cookies, use_pot=use_pot
         ),
@@ -489,7 +515,6 @@ def _ydl_options(
         no_warnings=False,
         # max_filesize を付けると高ビットレートの元音声が途中で切れる（10分動画が約4〜5分で終わる等）。
         # サイズ制限は ffmpeg 後の返却バイト（read_audio_file 後）だけでかける。
-        socket_timeout=300,
         nopart=True,
         retries=5,
         fragment_retries=10,
@@ -669,9 +694,56 @@ def youtube_video_duration_sec(url: str) -> float:
 
 
 def _is_audio_truncated(actual_sec: float, expected_sec: float) -> bool:
+    # Playlist / non-media files probe as 0s — treat as truncated, not "unknown".
+    if expected_sec >= 30 and actual_sec <= 0:
+        return True
     if not (expected_sec >= 90 and actual_sec > 0):
         return False
     return actual_sec < expected_sec * _MIN_DURATION_RATIO
+
+
+def _format_id_is_hls(fmt_id: str) -> bool:
+    """YouTube HLS itags are typically 91–96, often with a track suffix (91-1)."""
+    head = str(fmt_id or "").strip().split("-", 1)[0]
+    if not head.isdigit():
+        return False
+    n = int(head)
+    return 91 <= n <= 96
+
+
+def _url_is_hls_or_playlist(url: str) -> bool:
+    u = str(url or "").lower()
+    if not u.startswith("http"):
+        return False
+    return (
+        ".m3u8" in u
+        or ".m3u?" in u
+        or u.endswith(".m3u")
+        or "/manifest" in u
+        or "playlist/index" in u
+        or "format=m3u8" in u
+        or "type/playlist" in u
+    )
+
+
+def _track_is_hls(track: dict) -> bool:
+    if _format_id_is_hls(str(track.get("formatId") or "")):
+        return True
+    if str(track.get("manifestUrl") or "").strip():
+        return True
+    ext = str(track.get("ext") or "").lower().lstrip(".")
+    if ext in ("m3u8", "m3u"):
+        return True
+    return _url_is_hls_or_playlist(str(track.get("downloadUrl") or ""))
+
+
+def _file_is_hls_playlist(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+    except OSError:
+        return False
+    return head.lstrip().startswith(b"#EXTM3U")
 
 
 def audio_to_wav(input_path: str, wav_path: str) -> None:
@@ -840,7 +912,6 @@ def _ydl_options_video(
         format=format_selector or _VIDEO_FORMAT_720P,
         outtmpl=out_tmpl,
         no_warnings=False,
-        socket_timeout=300,
         nopart=True,
         retries=5,
         fragment_retries=10,
@@ -1399,6 +1470,11 @@ def _score_language_track(track: dict) -> float:
         score += 10.0
     if track.get("hasUrl"):
         score += 5.0
+    if _track_is_hls(track):
+        # HLS (91-*) URLs are often m3u8 playlists, not audio bytes.
+        score -= 25.0
+    else:
+        score += 8.0
     if "dub" in note or "dubbed" in xt:
         score += 20.0
     if "original" in note or "acont=original" in xt:
@@ -1682,7 +1758,10 @@ def _download_direct_media_url(
     """
     Download a googlevideo / CDN URL minted by probe without re-hitting YouTube
     player APIs (avoids a second extract that often triggers bot challenges).
+    HLS/m3u8 URLs must not use this path — they are playlists, not audio.
     """
+    if _url_is_hls_or_playlist(media_url):
+        raise RuntimeError("INVALID_AUDIO: direct URL is an HLS playlist, not media")
     clear_download_proxies()
     ext = (ext_hint or "webm").lstrip(".") or "webm"
     raw_path = os.path.join(out_dir, f"direct.{ext}")
@@ -1701,7 +1780,7 @@ def _download_direct_media_url(
             if v:
                 headers[str(k)] = str(v)
     req = urllib.request.Request(media_url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    with urllib.request.urlopen(req, timeout=ydl_socket_timeout()) as resp:
         with open(raw_path, "wb") as fh:
             while True:
                 chunk = resp.read(1024 * 256)
@@ -1710,10 +1789,12 @@ def _download_direct_media_url(
                 fh.write(chunk)
     if not os.path.isfile(raw_path) or os.path.getsize(raw_path) < 256:
         raise RuntimeError("direct URL download produced empty file")
+    if _file_is_hls_playlist(raw_path):
+        raise RuntimeError("INVALID_AUDIO: direct download was an HLS playlist (#EXTM3U)")
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        return raw_path
+        raise RuntimeError("INVALID_AUDIO: ffmpeg is required to remux direct audio")
     mp3_path = os.path.join(out_dir, "out.mp3")
     cmd = [
         ffmpeg,
@@ -1728,13 +1809,20 @@ def _download_direct_media_url(
         mp3_path,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0 or not os.path.isfile(mp3_path):
-        logger.warning("ffmpeg remux failed; returning raw direct download: %s", proc.stderr[-400:])
-        return raw_path
+    if proc.returncode != 0 or not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) < 256:
+        raise RuntimeError(
+            "INVALID_AUDIO: ffmpeg remux failed for direct download "
+            f"({(proc.stderr or '')[-240:]})"
+        )
+    if _file_is_hls_playlist(mp3_path):
+        raise RuntimeError("INVALID_AUDIO: remuxed file is still an HLS playlist")
     try:
         os.remove(raw_path)
     except OSError:
         pass
+    dur = probe_media_duration_sec(mp3_path)
+    if dur <= 0:
+        raise RuntimeError("INVALID_AUDIO: remuxed audio has no playable duration")
     return mp3_path
 
 
@@ -1865,6 +1953,8 @@ def _download_youtube_audio_by_language_legacy(
         direct = str(t.get("downloadUrl") or "").strip()
         if not direct.startswith("http"):
             continue
+        if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
+            continue
         try:
             _clear_out_files(out_dir)
             path = _download_direct_media_url(
@@ -1901,7 +1991,7 @@ def _download_youtube_audio_by_language_legacy(
                             format=fmt,
                             outtmpl=out_tmpl,
                             no_warnings=False,
-                            socket_timeout=300,
+                            socket_timeout=ydl_socket_timeout(),
                             nopart=True,
                             retries=2,
                             fragment_retries=3,
@@ -2077,6 +2167,8 @@ def download_youtube_audio_by_language(
         direct = str(t.get("downloadUrl") or "").strip()
         if not direct.startswith("http"):
             continue
+        if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
+            continue
         try:
             _clear_out_files(out_dir)
             path = _download_direct_media_url(
@@ -2239,6 +2331,8 @@ def download_youtube_audio_by_language(
                     direct = str(t.get("downloadUrl") or "").strip()
                     if not direct.startswith("http"):
                         continue
+                    if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
+                        continue
                     try:
                         _clear_out_files(out_dir)
                         path = _download_direct_media_url(
@@ -2285,7 +2379,7 @@ def download_youtube_audio_by_language(
                             format=fmt,
                             outtmpl=out_tmpl,
                             no_warnings=False,
-                            socket_timeout=300,
+                            socket_timeout=ydl_socket_timeout(),
                             nopart=True,
                             retries=2,
                             fragment_retries=3,
@@ -2406,7 +2500,7 @@ def download_youtube_audio_by_language(
             format=retry_fmt,
             outtmpl=out_tmpl,
             no_warnings=False,
-            socket_timeout=300,
+            socket_timeout=ydl_socket_timeout(),
             nopart=True,
             retries=5,
             fragment_retries=10,
@@ -2532,12 +2626,15 @@ def _extract_error_code(detail: str) -> str:
         return "NO_ORIGINAL_TRACK"
     if detail.startswith("WRONG_LANGUAGE_TRACK:"):
         return "WRONG_LANGUAGE_TRACK"
+    if detail.startswith("INVALID_AUDIO:") or "hls playlist" in detail.lower() or "#extm3u" in detail.lower():
+        return "INVALID_AUDIO"
     if detail.startswith("FETCH_FAILED:") or _is_bot_or_block_error(detail):
         return "YT_EXTRACT_BLOCKED"
     return "FETCH_FAILED"
 
 
 def _is_format_or_challenge_error(exc: BaseException) -> bool:
+    """True when the next format / player_client / cookie mode should be tried."""
     msg = str(exc).lower()
     return any(
         token in msg
@@ -2554,6 +2651,11 @@ def _is_format_or_challenge_error(exc: BaseException) -> bool:
             "only images are available",
             "rate-limited",
             "try again later",
+            # yt-dlp raise_no_formats when SABR/cookies leave zero playable URLs
+            "page needs to be reloaded",
+            "the page needs to be reloaded",
+            "no formats are available",
+            "formats are missing a url",
         )
     )
 
@@ -2659,11 +2761,15 @@ def download_youtube_audio_original_track(
         fid = str(t.get("formatId") or "").strip()
         if not fid:
             continue
-        # Prefer direct CDN URL when available
+        # Prefer direct CDN URL when available (progressive audio only).
         direct = str(t.get("downloadUrl") or "").strip()
         try:
             _clear_out_files(out_dir)
-            if direct.startswith("http"):
+            if (
+                direct.startswith("http")
+                and not _track_is_hls(t)
+                and not _url_is_hls_or_playlist(direct)
+            ):
                 path = _download_direct_media_url(
                     direct,
                     out_dir,
@@ -2676,9 +2782,9 @@ def download_youtube_audio_original_track(
                 use_cookies = bool(t.get("sourceUseCookies"))
                 clients = [
                     c.strip()
-                    for c in str(t.get("sourceClient") or "tv_downgraded").split(",")
+                    for c in str(t.get("sourceClient") or "web_embedded").split(",")
                     if c.strip()
-                ] or ["tv_downgraded"]
+                ] or ["web_embedded", "web"]
                 path = download_youtube_audio(
                     url,
                     out_dir,
@@ -2730,7 +2836,9 @@ def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, flo
     path = ""
     last_err: BaseException | None = None
     success_ctx: tuple[bool, list[str] | None] = (True, None)
-    cookie_modes = (True, False) if _cookies_enabled() else (False,)
+    # No-cookie first when cookies are configured: stale/shared cookies commonly
+    # surface as "page needs to be reloaded" on default (no targetLang) extracts.
+    cookie_modes = (False, True) if _cookies_enabled() else (False,)
     for use_cookies in cookie_modes:
         for clients in _player_client_attempts(use_cookies=use_cookies):
             for idx, fmt in enumerate(format_attempts):
@@ -2888,7 +2996,7 @@ def upload_to_supabase_storage(local_path: str, storage_path: str, content_type:
     # YouTube 用プロキシ環境変数が残っていても Storage へは直結する
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(req, timeout=300) as resp:
+        with opener.open(req, timeout=ydl_socket_timeout()) as resp:
             if resp.status not in (200, 201):
                 body = resp.read(500)
                 raise RuntimeError(
@@ -3052,18 +3160,9 @@ def extract():
                 separated = False
 
     path = ""
-    if not _extract_semaphore.acquire(timeout=300):
+    if not _extract_gate.acquire():
         shutil.rmtree(out_dir, ignore_errors=True)
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "errorCode": "BUSY",
-                    "error": "YouTube 音声取得が混雑しています。しばらく待ってから再試行してください。",
-                }
-            ),
-            503,
-        )
+        return _busy_response("YouTube 音声取得が混雑しています。しばらく待ってから再試行してください。")
     try:
         last_dl_err: Exception | None = None
         for attempt in range(2):
@@ -3153,6 +3252,15 @@ def extract():
                     "targetLang": target_lang or None,
                 }
             ), 422
+        if detail.startswith("INVALID_AUDIO:"):
+            return jsonify(
+                {
+                    "ok": False,
+                    "errorCode": "INVALID_AUDIO",
+                    "error": detail.split(":", 1)[1].strip(),
+                    "targetLang": target_lang or None,
+                }
+            ), 422
         if detail.startswith("FETCH_FAILED:"):
             friendly = detail.split(":", 1)[1].strip()
             code = _extract_error_code(detail)
@@ -3168,7 +3276,7 @@ def extract():
         code = _extract_error_code(detail)
         return jsonify({"ok": False, "errorCode": code, "error": friendly}), 502
     finally:
-        _extract_semaphore.release()
+        _extract_gate.release()
         shutil.rmtree(out_dir, ignore_errors=True)
 
     if len(data) > MAX_BYTES:
@@ -3221,18 +3329,9 @@ def extract_video():
         abort(400)
 
     out_dir = tempfile.mkdtemp(prefix="wavrick_yt_vid_")
-    if not _extract_semaphore.acquire(timeout=300):
+    if not _extract_gate.acquire():
         shutil.rmtree(out_dir, ignore_errors=True)
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "errorCode": "BUSY",
-                    "error": "YouTube 取得が混雑しています。しばらく待ってから再試行してください。",
-                }
-            ),
-            503,
-        )
+        return _busy_response("YouTube 取得が混雑しています。しばらく待ってから再試行してください。")
     try:
         path = ""
         video_dur = 0.0
@@ -3303,7 +3402,7 @@ def extract_video():
         code = _extract_error_code(detail)
         return jsonify({"ok": False, "errorCode": code, "error": friendly}), 502
     finally:
-        _extract_semaphore.release()
+        _extract_gate.release()
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
@@ -3393,6 +3492,9 @@ def health():
             "legacyLightweightExtract": _legacy_lightweight_extract(),
             "probeMaxAttempts": _probe_max_attempts(),
             "maxConcurrentExtract": _MAX_CONCURRENT_EXTRACT,
+            "extractInFlight": _extract_gate.inflight,
+            "busyWaitSec": busy_wait_sec(),
+            "ydlSocketTimeout": ydl_socket_timeout(),
             "remoteComponents": _remote_components(),
             "ytDlpVersion": yt_dlp.version.__version__,
             "nodePath": shutil.which("node"),

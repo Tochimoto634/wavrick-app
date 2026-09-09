@@ -36,6 +36,7 @@ import {
   transcribeWithWhisperX,
   transcribeWithWhisperXFromUrl
 } from "../_shared/whisperx-client.ts";
+import { transcribeWithOpenAIWhisperFromUrl } from "../_shared/openai-whisper.ts";
 import {
   buildBracketTimelineFromTimelineSegments,
   collapseExcessiveTextRepetition,
@@ -75,8 +76,26 @@ import {
   clientIpFromRequest,
   enforceRateLimit,
   mediaPipelineLimits,
-  rateLimitResponseHeaders
+  rateLimitResponseHeaders,
+  youtubeExtractUserLimits
 } from "../_shared/rate-limit.ts";
+import {
+  assertYouTubeExtractAllowed,
+  classifyYouTubeMetaError,
+  isYouTubeExtractTestMode,
+  logYouTubeExtractEvent
+} from "../_shared/youtube-channel-guard.ts";
+import {
+  cacheStemFromOpts,
+  lookupYouTubeAudioCache,
+  saveYouTubeAudioCache,
+  youtubeCacheStoragePath,
+  type CacheStem
+} from "../_shared/youtube-audio-cache.ts";
+import {
+  fetchYoutubeProxy,
+  isAbortTimeoutError
+} from "../_shared/youtube-proxy-timeout.ts";
 import {
   buildAdrSpeakersAndCues,
   diarizeJsonResponseFromJob,
@@ -84,10 +103,16 @@ import {
   getRunpodDiarizeStatus,
   isDiarizeAsyncCapable,
   normalizeDiarizeResponse,
+  redactRunpodHtmlError,
+  resolveAdrDiarizeAudioUrl,
   submitRunpodDiarizeAsync,
   type DiarizeResponse,
   type DiarizeSegment
 } from "../_shared/diarize-client.ts";
+import {
+  notifyCaseRecipients,
+  resolveCustomerEmailForRequest
+} from "../_shared/case-notify.ts";
 
 /** 返却 MP3 想定。48MB ≒ 128kbps で約50分弱（従来24MBは yt-dlp 途中打切りで約4〜5分止まりの原因だった） */
 const MAX_WHISPER_BYTES = 48 * 1024 * 1024;
@@ -212,19 +237,13 @@ async function fetchAudioFromProxy(
   }
   let r: Response;
   try {
-    r = await fetch(proxyUrl, {
+    r = await fetchYoutubeProxy(proxyUrl, {
       method: "POST",
       headers: proxyAuthHeaders(),
       body: JSON.stringify({ videoUrl, vocalSeparate })
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (/dns|lookup|trycloudflare|Name or service not known/i.test(msg)) {
-      throw new Error(
-        "YouTube音声プロキシに接続できません。YOUTUBE_AUDIO_PROXY_URL が正しくありません。"
-      );
-    }
-    throw new Error(`音声プロキシへの接続に失敗しました: ${msg}`);
+    throw e instanceof Error ? e : new Error(String(e));
   }
   if (!r.ok) {
     const t = await r.text();
@@ -256,8 +275,8 @@ function pipelineRawAudioPath(
   videoId: string
 ): string {
   return userId
-    ? `${userId}/${videoId}_raw.mp3`
-    : `pipeline-temp/${jobId}_raw.mp3`;
+    ? `${userId}/${jobId}_${videoId}_raw.mp3`
+    : `pipeline-temp/${jobId}_${videoId}_raw.mp3`;
 }
 
 function assertAudioSizeWithinLimit(byteLength: number, label: string): void {
@@ -295,13 +314,17 @@ async function streamBodyToStorage(
   return data.publicUrl;
 }
 
+function isProxyStorageUploadFailure(err: string): boolean {
+  return /supabase storage upload|storage upload HTTP/i.test(err);
+}
+
 async function fetchProxyAudioToStorage(
   admin: ReturnType<typeof createClient>,
   videoUrl: string,
   storagePath: string,
   vocalSeparate = false,
   targetLang?: string,
-  opts?: { requireDubTrack?: boolean }
+  opts?: { requireDubTrack?: boolean; preferOriginalTrack?: boolean }
 ): Promise<{
   publicUrl: string;
   vocalSeparated: boolean;
@@ -309,31 +332,77 @@ async function fetchProxyAudioToStorage(
   byteLength?: number;
   selectedFormatId?: string | null;
   targetLang?: string | null;
+  selectedLang?: string | null;
+  langConfirmed?: boolean;
+  trackRole?: string | null;
 }> {
   const proxyUrl = Deno.env.get("YOUTUBE_AUDIO_PROXY_URL");
   if (!proxyUrl) {
     throw new Error("YOUTUBE_AUDIO_PROXY_URL が未設定です。");
   }
   const lang = (targetLang || "").trim() || undefined;
-  let r: Response;
-  try {
-    r = await fetch(proxyUrl, {
-      method: "POST",
-      headers: proxyAuthHeaders(),
-      body: JSON.stringify({
-        videoUrl,
-        vocalSeparate,
-        delivery: "storage",
-        storagePath,
-        targetLang: lang,
-        requireDubTrack: Boolean(opts?.requireDubTrack && lang)
-      })
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`音声プロキシへの接続に失敗しました: ${msg}`);
-  }
 
+  const callProxy = async (delivery: "storage" | "bytes"): Promise<Response> => {
+    const payload: Record<string, unknown> = {
+      videoUrl,
+      vocalSeparate: Boolean(vocalSeparate) && !opts?.preferOriginalTrack,
+      targetLang: lang,
+      requireDubTrack: Boolean(opts?.requireDubTrack && lang),
+      preferOriginalTrack: Boolean(opts?.preferOriginalTrack && !lang)
+    };
+    if (delivery === "storage") {
+      payload.delivery = "storage";
+      payload.storagePath = storagePath;
+    }
+    try {
+      // Gunicorn timeout is 240s; abort at 250s so the proxy can fail the HTTP
+      // request instead of Deno leaking "Signal timed out". 503 BUSY is retried
+      // inside fetchYoutubeProxy instead of queueing on a blocked worker.
+      return await fetchYoutubeProxy(proxyUrl, {
+        method: "POST",
+        headers: proxyAuthHeaders(),
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  };
+
+  const ingestProxyBytes = async (r: Response) => {
+    const contentType = (r.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+    if (!r.ok) {
+      const t = await r.text();
+      let detail = t.slice(0, 500);
+      try {
+        const parsed = JSON.parse(t) as { error?: string };
+        if (parsed?.error) detail = String(parsed.error);
+      } catch {
+        /* keep */
+      }
+      throw new Error(`音声プロキシが失敗しました (${r.status}): ${detail}`);
+    }
+    const contentLength = Number(r.headers.get("Content-Length") || "0");
+    if (contentLength > 0) assertAudioSizeWithinLimit(contentLength, "音声");
+    if (!r.body) throw new Error("音声プロキシの応答ボディが空です。");
+
+    const mime = contentType || "audio/mpeg";
+    const publicUrl = await streamBodyToStorage(admin, storagePath, r.body, mime);
+    if (!canPassthroughAudioUrlToWhisperx(publicUrl)) {
+      throw new Error("Storage URL を RunPod に渡せません。");
+    }
+    return {
+      publicUrl,
+      vocalSeparated: r.headers.get("X-Wavrick-Vocal-Separated") === "1",
+      byteLength: contentLength > 0 ? contentLength : undefined,
+      selectedFormatId: r.headers.get("X-Wavrick-Selected-Format") || null,
+      targetLang: r.headers.get("X-Wavrick-Target-Lang") || lang || null,
+      selectedLang: r.headers.get("X-Wavrick-Target-Lang") || lang || null,
+      langConfirmed: Boolean(lang && r.headers.get("X-Wavrick-Selected-Format")),
+      trackRole: r.headers.get("X-Wavrick-Track-Role") || null
+    };
+  };
+
+  let r = await callProxy("storage");
   const contentType = (r.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
   if (contentType.includes("application/json")) {
     const j = await r.json() as {
@@ -346,14 +415,35 @@ async function fetchProxyAudioToStorage(
       byteLength?: number;
       selectedFormatId?: string | null;
       targetLang?: string | null;
+      selectedLang?: string | null;
+      langConfirmed?: boolean | null;
+      trackRole?: string | null;
     };
     if (!r.ok || j.ok === false) {
       const code = String(j.errorCode || "").trim();
       const err = String(j.error || "unknown");
-      if (code === "NO_LANGUAGE_TRACK" || code === "SAME_AS_ORIGINAL" || code === "WRONG_LANGUAGE_TRACK") {
-        throw new Error(err);
+      if (
+        code === "NO_LANGUAGE_TRACK" ||
+        code === "NO_ORIGINAL_TRACK" ||
+        code === "SAME_AS_ORIGINAL" ||
+        code === "WRONG_LANGUAGE_TRACK" ||
+        code === "INVALID_AUDIO" ||
+        code === "YT_EXTRACT_BLOCKED"
+      ) {
+        throw new Error(`[${code}] ${err}`);
       }
-      throw new Error(`音声プロキシが失敗しました (${r.status}): ${err}`);
+      if (isProxyStorageUploadFailure(err)) {
+        console.warn(
+          "[media-pipeline] proxy delivery=storage failed; retrying as bytes:",
+          err.slice(0, 240)
+        );
+        return await ingestProxyBytes(await callProxy("bytes"));
+      }
+      throw new Error(
+        code
+          ? `音声プロキシが失敗しました (${r.status}/${code}): ${err}`
+          : `音声プロキシが失敗しました (${r.status}): ${err}`
+      );
     }
     const publicUrl = String(j.audioUrl || "").trim();
     if (!publicUrl) throw new Error("音声プロキシが audioUrl を返しませんでした。");
@@ -366,40 +456,227 @@ async function fetchProxyAudioToStorage(
       audioDurationSec: Number(j.audioDurationSec) > 0 ? Number(j.audioDurationSec) : undefined,
       byteLength: Number(j.byteLength) > 0 ? Number(j.byteLength) : undefined,
       selectedFormatId: j.selectedFormatId != null ? String(j.selectedFormatId) : null,
-      targetLang: j.targetLang != null ? String(j.targetLang) : lang || null
+      targetLang: j.targetLang != null ? String(j.targetLang) : lang || null,
+      selectedLang: j.selectedLang != null ? String(j.selectedLang) : (j.targetLang != null ? String(j.targetLang) : lang || null),
+      langConfirmed: j.langConfirmed == null ? Boolean(j.selectedFormatId && lang) : Boolean(j.langConfirmed),
+      trackRole: j.trackRole != null ? String(j.trackRole) : null
     };
   }
 
-  if (!r.ok) {
-    const t = await r.text();
-    let detail = t.slice(0, 500);
-    try {
-      const parsed = JSON.parse(t) as { error?: string };
-      if (parsed?.error) detail = String(parsed.error);
-    } catch {
-      /* keep */
-    }
-    throw new Error(
-      `音声プロキシが旧形式で音声バイト列を返しました (${r.status})。` +
-      " Railway の youtube-audio-proxy を最新にデプロイし、環境変数 SUPABASE_URL と SUPABASE_SERVICE_ROLE_KEY を設定してください。"
-    );
-  }
-  const contentLength = Number(r.headers.get("Content-Length") || "0");
-  if (contentLength > 0) assertAudioSizeWithinLimit(contentLength, "音声");
-  if (!r.body) throw new Error("音声プロキシの応答ボディが空です。");
+  // Proxy already fell back to raw bytes (or older build without delivery=storage JSON).
+  return await ingestProxyBytes(r);
+}
 
-  const mime = contentType || "audio/mpeg";
-  const publicUrl = await streamBodyToStorage(admin, storagePath, r.body, mime);
-  if (!canPassthroughAudioUrlToWhisperx(publicUrl)) {
-    throw new Error("Storage URL を RunPod に渡せません。");
+function classifyYouTubeExtractError(msg: string): string | undefined {
+  if (msg.includes("NO_LANGUAGE_TRACK")) return "NO_LANGUAGE_TRACK";
+  if (msg.includes("NO_ORIGINAL_TRACK")) return "NO_ORIGINAL_TRACK";
+  if (msg.includes("WRONG_LANGUAGE_TRACK")) return "WRONG_LANGUAGE_TRACK";
+  if (msg.includes("INVALID_AUDIO")) return "INVALID_AUDIO";
+  if (msg.includes("CHANNEL_MISMATCH")) return "CHANNEL_MISMATCH";
+  if (msg.includes("NO_REGISTERED_CHANNELS")) return "NO_REGISTERED_CHANNELS";
+  if (msg.includes("AUTH_REQUIRED")) return "AUTH_REQUIRED";
+  if (msg.includes("RATE_LIMIT")) return "RATE_LIMIT";
+  if (msg.includes("[BUSY]") || /\bBUSY\b/.test(msg)) return "BUSY";
+  if (/音声プロキシがタイムアウト/.test(msg) || isAbortTimeoutError(msg)) return "PROXY_TIMEOUT";
+  const classified = classifyYouTubeMetaError(msg);
+  return classified.errorCode;
+}
+
+async function enforceYouTubeExtractRateLimits(
+  admin: ReturnType<typeof createClient>,
+  userId: string | null
+): Promise<{ ok: true } | { ok: false; retryAfterSec: number }> {
+  if (!userId) return { ok: true };
+  const limits = youtubeExtractUserLimits();
+  const clientKey = `user:${userId}`;
+  for (const [label, cfg] of [
+    ["hour", limits.hour] as const,
+    ["day", limits.day] as const
+  ]) {
+    const rl = await enforceRateLimit({
+      admin,
+      bucketPrefix: `youtube-extract:${label}`,
+      clientKey,
+      limit: cfg.limit,
+      windowSec: cfg.windowSec
+    });
+    if (!rl.ok) return { ok: false, retryAfterSec: rl.retryAfterSec };
   }
-  return {
-    publicUrl,
-    vocalSeparated: r.headers.get("X-Wavrick-Vocal-Separated") === "1",
-    byteLength: contentLength > 0 ? contentLength : undefined,
-    selectedFormatId: r.headers.get("X-Wavrick-Selected-Format") || null,
-    targetLang: r.headers.get("X-Wavrick-Target-Lang") || lang || null
-  };
+  return { ok: true };
+}
+
+type ProxyStorageResult = Awaited<ReturnType<typeof fetchProxyAudioToStorage>>;
+
+async function fetchProxyAudioToStorageCached(
+  admin: ReturnType<typeof createClient>,
+  videoUrl: string,
+  storagePath: string,
+  vocalSeparate = false,
+  targetLang?: string,
+  opts?: { requireDubTrack?: boolean; preferOriginalTrack?: boolean },
+  audit?: {
+    userId?: string | null;
+    channelId?: string | null;
+    videoId?: string;
+  }
+): Promise<ProxyStorageResult & { cached?: boolean }> {
+  const videoId = audit?.videoId || extractYouTubeVideoId(videoUrl) || "";
+  const langKey = (targetLang || "").trim();
+  const stem: CacheStem = cacheStemFromOpts(opts);
+  const useCache = Boolean(videoId) && Deno.env.get("WAVRICK_YT_CACHE_DISABLE") !== "1";
+
+  if (useCache && videoId) {
+    const hit = await lookupYouTubeAudioCache(admin, videoId, langKey, stem);
+    if (hit) {
+      await logYouTubeExtractEvent(admin, {
+        userId: audit?.userId,
+        videoId,
+        channelId: hit.channelId || audit?.channelId,
+        targetLang: langKey,
+        stem,
+        success: true,
+        cached: true
+      });
+      return {
+        publicUrl: hit.publicUrl,
+        vocalSeparated: false,
+        audioDurationSec: hit.durationSec,
+        byteLength: hit.byteLength,
+        selectedFormatId: null,
+        targetLang: langKey || null,
+        selectedLang: langKey || null,
+        langConfirmed: Boolean(langKey),
+        trackRole: stem === "original" ? "original" : langKey ? "dub" : "default",
+        cached: true
+      };
+    }
+  }
+
+  const cachePath = videoId ? youtubeCacheStoragePath(videoId, langKey, stem) : storagePath;
+  const destPath = useCache && videoId ? cachePath : storagePath;
+
+  let lastErr: Error | null = null;
+  let result: ProxyStorageResult | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+    try {
+      result = await fetchProxyAudioToStorage(
+        admin,
+        videoUrl,
+        destPath,
+        vocalSeparate,
+        targetLang,
+        opts
+      );
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      const code = classifyYouTubeExtractError(lastErr.message);
+      const msg = lastErr.message.toLowerCase();
+      const retryable =
+        code === "YT_EXTRACT_BLOCKED" ||
+        code === "RATE_LIMIT" ||
+        code === "BUSY" ||
+        /page needs to be reloaded|fetch_failed|502/.test(msg);
+      if (retryable && attempt === 0) continue;
+      await logYouTubeExtractEvent(admin, {
+        userId: audit?.userId,
+        videoId,
+        channelId: audit?.channelId,
+        targetLang: langKey,
+        stem,
+        success: false,
+        errorCode: code || "FETCH_FAILED",
+        cached: false
+      });
+      throw lastErr;
+    }
+  }
+  if (!result) {
+    await logYouTubeExtractEvent(admin, {
+      userId: audit?.userId,
+      videoId,
+      channelId: audit?.channelId,
+      targetLang: langKey,
+      stem,
+      success: false,
+      errorCode: "FETCH_FAILED",
+      cached: false
+    });
+    throw lastErr || new Error("YouTube 音声の取得に失敗しました。");
+  }
+
+  if (useCache && videoId) {
+    await saveYouTubeAudioCache(admin, {
+      videoId,
+      targetLang: langKey,
+      stem,
+      storagePath: destPath,
+      byteLength: result.byteLength,
+      durationSec: result.audioDurationSec,
+      channelId: audit?.channelId || undefined
+    });
+  }
+
+  await logYouTubeExtractEvent(admin, {
+    userId: audit?.userId,
+    videoId,
+    channelId: audit?.channelId,
+    targetLang: langKey,
+    stem,
+    success: true,
+    cached: false
+  });
+
+  return { ...result, cached: false };
+}
+
+async function guardYouTubeVideoExtract(
+  req: Request,
+  admin: ReturnType<typeof createClient>,
+  videoUrl: string,
+  userId: string | null
+): Promise<
+  | { ok: true; channelId?: string }
+  | { ok: false; status: number; body: Record<string, unknown>; retryAfterSec?: number }
+> {
+  const guard = await assertYouTubeExtractAllowed(req, admin, videoUrl);
+  if (!guard.ok) {
+    await logYouTubeExtractEvent(admin, {
+      userId,
+      videoId: extractYouTubeVideoId(videoUrl) || "",
+      channelId: guard.channelId,
+      success: false,
+      errorCode: guard.errorCode
+    });
+    return {
+      ok: false,
+      status: guard.status,
+      body: { ok: false, error: guard.error, errorCode: guard.errorCode }
+    };
+  }
+
+  if (!isYouTubeExtractTestMode()) {
+    const ytRl = await enforceYouTubeExtractRateLimits(admin, userId);
+    if (!ytRl.ok) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSec: ytRl.retryAfterSec,
+        body: {
+          ok: false,
+          error: `YouTube 音声取得の利用上限に達しました。約${Math.max(1, Math.ceil(ytRl.retryAfterSec / 60))}分待ってから再試行してください。`,
+          errorCode: "RATE_LIMIT",
+          retryAfterSec: ytRl.retryAfterSec
+        }
+      };
+    }
+  }
+
+  return { ok: true, channelId: guard.channelId };
 }
 
 async function streamAudioUrlToStorage(
@@ -799,6 +1076,12 @@ async function finalizeRunpodTranscribeJob(params: {
         updated_at: new Date().toISOString()
       })
       .eq("id", params.job.id);
+    await notifyPipelineFailed({
+      admin: params.admin,
+      requestId: params.job.request_id,
+      jobId: params.job.id,
+      userId: params.job.user_id
+    });
     return { ok: false, jobId: params.job.id, status: "failed", error: msg };
   }
   if (st !== "COMPLETED" || !rp.output) {
@@ -907,7 +1190,60 @@ type ProxyExtractedAudio = {
   byteLength?: number;
   selectedFormatId?: string | null;
   targetLang?: string | null;
+  selectedLang?: string | null;
+  langConfirmed?: boolean | null;
+  /** True when served from youtube_audio_cache (no yt-dlp format id). */
+  cached?: boolean;
 };
+
+/**
+ * ADR: when a target language is requested, the proxy must return a locked
+ * format id that it confirmed as that language. Never proceed on missing proof.
+ * Exception: cache hits omit format ids by design; Whisper gate still verifies language.
+ */
+function assertTargetLangExtractProven(
+  targetLang: string,
+  extracted: ProxyExtractedAudio
+): void {
+  const name = targetLangDisplayName(targetLang);
+  const want = String(targetLang || "").trim().toLowerCase().split("-")[0];
+  const got = String(extracted.selectedLang || extracted.targetLang || "")
+    .trim()
+    .toLowerCase()
+    .split("-")[0];
+  const fmt = String(extracted.selectedFormatId || "").trim();
+  const langOk =
+    Boolean(want) &&
+    Boolean(got) &&
+    got === want &&
+    extracted.langConfirmed !== false;
+  if (!fmt || fmt.startsWith("ba[") || fmt.includes("/") || fmt === "140") {
+    if (extracted.cached && langOk) {
+      console.warn(
+        "[media-pipeline] ADR dub from cache without format id; Whisper language gate will verify",
+        { want, url: extracted.publicUrl?.slice(0, 80) }
+      );
+      return;
+    }
+    throw new Error(
+      `${name}の吹替トラックを確定できませんでした（format ID がありません）。\n` +
+        `他言語音声での続行はできません。YouTube 上で${name}トラックが公開されているか、` +
+        `音声プロキシ（extractBuild 19+）を確認して再試行してください。`
+    );
+  }
+  if (extracted.langConfirmed === false) {
+    throw new Error(
+      `${name}の吹替トラック言語を確定できませんでした。\n` +
+        `他言語音声での続行はできません。`
+    );
+  }
+  if (got && want && got !== want) {
+    throw new Error(
+      `指定した翻訳先は${name}ですが、取得結果の言語が「${got}」でした（format ${fmt}）。\n` +
+        `他言語音声での続行はできません。`
+    );
+  }
+}
 
 /**
  * ADR: 翻訳先吹替トラックは必ず原盤と別物でなければならない。
@@ -918,6 +1254,7 @@ function assertDistinctTargetLangAudio(
   extracted: ProxyExtractedAudio,
   original: ProxyExtractedAudio
 ): void {
+  assertTargetLangExtractProven(targetLang, extracted);
   const name = targetLangDisplayName(targetLang);
   if (!extracted.publicUrl) {
     throw new Error(
@@ -946,9 +1283,8 @@ function assertDistinctTargetLangAudio(
     throw new Error(
       `選択した翻訳先言語（${name}）の吹替トラックを正しく取得できませんでした。\n` +
         `抽出結果がオリジナル音声と同じでした。\n` +
-        `この動画に${name}トラックがある場合でも、音声プロキシ（yt-dlp / cookies）が吹替ストリームを取り違えることがあります。\n` +
-        `① YouTube Studio で${name}の AI 吹替トラックが公開されているか確認\n` +
-        `② 音声プロキシを最新に再デプロイし、YouTube cookies が有効か確認してから再度お試しください。`
+        `他言語／原盤での続行はできません。` +
+        ` YouTube Studio で${name}トラックの公開状態と、音声プロキシ cookies を確認して再試行してください。`
     );
   }
 }
@@ -989,6 +1325,168 @@ function originalAudioFromJobModels(models: unknown): string {
   return String(m.originalAudioUrl || m.original_audio_url || "").trim();
 }
 
+async function ensureAdrProjectStub(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string;
+  customerUserId: string | null;
+  customerEmail: string | null;
+  videoUrl: string;
+  targetLang: string;
+  audioUrl: string;
+  originalAudioUrl?: string | null;
+  extractMeta?: Record<string, unknown> | null;
+  audioDurationSec?: number | null;
+  pipelineJobId: string;
+}): Promise<void> {
+  const originalAudioUrl = String(params.originalAudioUrl || "").trim() || null;
+  const extractMeta = params.extractMeta || {
+    targetLang: params.targetLang,
+    targetAudioUrl: params.audioUrl,
+    originalAudioUrl,
+    audioDurationSec: params.audioDurationSec ?? null
+  };
+  const { error } = await params.admin.from("adr_projects").upsert(
+    {
+      request_id: params.requestId,
+      customer_user_id: params.customerUserId,
+      customer_email: params.customerEmail,
+      video_url: params.videoUrl,
+      target_lang: params.targetLang,
+      audio_url: params.audioUrl,
+      original_audio_url: originalAudioUrl,
+      extract_meta: extractMeta,
+      audio_duration_sec:
+        params.audioDurationSec != null && Number(params.audioDurationSec) > 0
+          ? Number(params.audioDurationSec)
+          : null,
+      pipeline_job_id: params.pipelineJobId,
+      speakers: [],
+      cues: [],
+      status: "processing",
+      whisper_status: "pending",
+      whisper_error: null,
+      updated_at: new Date().toISOString()
+    },
+    { onConflict: "request_id" }
+  );
+  if (error) {
+    console.error("[media-pipeline] adr_projects stub upsert failed", error.message);
+  }
+}
+
+async function persistAdrWhisper(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string;
+  status: "running" | "ready" | "failed";
+  transcript?: string | null;
+  segments?: { start: number; end: number; text: string }[] | null;
+  language?: string | null;
+  error?: string | null;
+}): Promise<void> {
+  const patch: Record<string, unknown> = {
+    whisper_status: params.status,
+    whisper_updated_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+  if (params.status === "ready") {
+    patch.whisper_transcript = String(params.transcript || "").trim() || null;
+    patch.whisper_segments = Array.isArray(params.segments) ? params.segments : [];
+    patch.whisper_language = params.language != null ? String(params.language) : null;
+    patch.whisper_error = null;
+  } else if (params.status === "failed") {
+    patch.whisper_error = String(params.error || "Whisper failed").slice(0, 800);
+  } else if (params.status === "running") {
+    patch.whisper_error = null;
+  }
+  const { error } = await params.admin
+    .from("adr_projects")
+    .update(patch)
+    .eq("request_id", params.requestId);
+  if (error) {
+    console.error("[media-pipeline] adr whisper persist failed", error.message);
+  }
+}
+
+async function failAdrProject(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string;
+  error: string;
+}): Promise<void> {
+  const requestId = String(params.requestId || "").trim();
+  if (!requestId) return;
+  const msg = redactRunpodHtmlError(String(params.error || "failed")).slice(0, 800);
+  const { error } = await params.admin
+    .from("adr_projects")
+    .update({
+      status: "failed",
+      whisper_status: "failed",
+      whisper_error: msg,
+      whisper_updated_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq("request_id", requestId);
+  if (error) {
+    console.error("[media-pipeline] adr_projects fail update failed", error.message);
+  }
+}
+
+/**
+ * Content-level language lock: Whisper auto-detect MUST match targetLang
+ * before diarize/editing. Metadata/format_id alone is not trusted.
+ * On success, captions are persisted (same Whisper call).
+ */
+async function gateAdrTargetAudioLanguage(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string;
+  audioUrl: string;
+  targetLang: string;
+  selectedFormatId?: string | null;
+}): Promise<void> {
+  const name = targetLangDisplayName(params.targetLang);
+  await persistAdrWhisper({
+    admin: params.admin,
+    requestId: params.requestId,
+    status: "running"
+  });
+  try {
+    const result = await transcribeWithOpenAIWhisperFromUrl(params.audioUrl, {
+      requireLanguage: params.targetLang || null
+    });
+    await persistAdrWhisper({
+      admin: params.admin,
+      requestId: params.requestId,
+      status: "ready",
+      transcript: result.text,
+      segments: result.segments,
+      language: result.language
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const fmt = String(params.selectedFormatId || "").trim();
+    const alreadyTyped =
+      msg.includes("WRONG_LANGUAGE_TRACK") ||
+      msg.includes("INVALID_AUDIO") ||
+      msg.includes("指定言語");
+    const enriched = alreadyTyped
+      ? msg
+      : `WRONG_LANGUAGE_TRACK: ${name}吹替として検証できませんでした` +
+        (fmt ? `（format ${fmt}）` : "") +
+        `。${msg}`;
+    await persistAdrWhisper({
+      admin: params.admin,
+      requestId: params.requestId,
+      status: "failed",
+      error: enriched
+    });
+    await failAdrProject({
+      admin: params.admin,
+      requestId: params.requestId,
+      error: enriched
+    });
+    throw new Error(enriched);
+  }
+}
+
 async function upsertAdrProject(params: {
   admin: ReturnType<typeof createClient>;
   requestId: string;
@@ -1011,6 +1509,7 @@ async function upsertAdrProject(params: {
     originalAudioUrl,
     audioDurationSec: params.audioDurationSec ?? null
   };
+  // Diarize fields only — do not wipe whisper_* written by the parallel job.
   const row = {
     request_id: params.requestId,
     customer_user_id: params.customerUserId,
@@ -1050,22 +1549,82 @@ async function notifyAdrReady(params: {
 }): Promise<void> {
   const email = (params.customerEmail || "").trim().toLowerCase();
   if (!email) return;
-  const langLabel = params.targetLang === "ja" ? "日本語" : params.targetLang;
   const editorUrl = `./adr-region-editor.html?requestId=${encodeURIComponent(params.requestId)}`;
   const notificationId = `ntf_adr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const storedText = `[notify:work.notify_adr_ready]\n${JSON.stringify({
+    lang: params.targetLang,
+    url: editorUrl
+  })}`;
   await params.admin.from("notifications_public").insert({
     id: notificationId,
-    requestId: params.requestId,
-    text: `${langLabel}吹替トラックの話者分離が完了しました。Region 編集画面で区間を確認・修正してください: ${editorUrl}`,
+    requestid: params.requestId,
+    text: storedText,
     kind: "system",
     target_role: "customer",
     target_emails: [email],
-    category: "request",
+    category: "case",
     target_mode: "users",
     admin_sent: false,
     read: false,
     created_at: new Date().toISOString()
   });
+}
+
+async function resolveEmailFromUserId(
+  admin: ReturnType<typeof createClient>,
+  userId: string | null | undefined
+): Promise<string> {
+  const id = String(userId || "").trim();
+  if (!id) return "";
+  try {
+    const { data, error } = await admin.auth.admin.getUserById(id);
+    if (error) {
+      console.warn("[media-pipeline] getUserById failed", id, error.message);
+      return "";
+    }
+    return String(data?.user?.email || "")
+      .trim()
+      .toLowerCase();
+  } catch (e) {
+    console.warn("[media-pipeline] getUserById threw", id, e);
+    return "";
+  }
+}
+
+async function notifyPipelineFailed(params: {
+  admin: ReturnType<typeof createClient>;
+  requestId: string | null | undefined;
+  customerEmail?: string | null | undefined;
+  jobId?: string | null;
+  userId?: string | null;
+}): Promise<void> {
+  const requestId = String(params.requestId || "").trim();
+  if (!requestId) return;
+  try {
+    let email = String(params.customerEmail || "")
+      .trim()
+      .toLowerCase();
+    if (!email) {
+      email = (await resolveCustomerEmailForRequest(params.admin, requestId)) || "";
+    }
+    if (!email) {
+      email = await resolveEmailFromUserId(params.admin, params.userId);
+    }
+    if (!email) {
+      console.warn("[media-pipeline] pipeline_failed skipped: no customer email", requestId);
+      return;
+    }
+    const jobKey = String(params.jobId || "job").trim() || "job";
+    await notifyCaseRecipients(params.admin, {
+      requestId,
+      messageKey: "pipeline_failed",
+      emails: [email],
+      targetRole: "customer",
+      batchPrefix: `pipeline_fail_${jobKey}`
+    });
+  } catch (e) {
+    console.warn("[media-pipeline] failure notify failed", e);
+  }
 }
 
 async function finalizeRunpodDiarizeJob(params: {
@@ -1098,6 +1657,13 @@ async function finalizeRunpodDiarizeJob(params: {
         updated_at: new Date().toISOString()
       })
       .eq("id", params.job.id);
+    await notifyPipelineFailed({
+      admin: params.admin,
+      requestId: params.job.request_id,
+      customerEmail: params.customerEmail,
+      jobId: params.job.id,
+      userId: params.job.user_id
+    });
     return { ok: false, jobId: params.job.id, status: "failed", error: msg };
   }
   if (st !== "COMPLETED" || !rp.output) {
@@ -1120,6 +1686,13 @@ async function finalizeRunpodDiarizeJob(params: {
       .from("media_pipeline_jobs")
       .update({ status: "failed", step: "error", error: msg, updated_at: new Date().toISOString() })
       .eq("id", params.job.id);
+    await notifyPipelineFailed({
+      admin: params.admin,
+      requestId: params.job.request_id,
+      customerEmail: params.customerEmail,
+      jobId: params.job.id,
+      userId: params.job.user_id
+    });
     return { ok: false, jobId: params.job.id, status: "failed", error: msg };
   }
   const segments = Array.isArray(diarize.segments) ? diarize.segments : [];
@@ -1144,7 +1717,22 @@ async function finalizeRunpodDiarizeJob(params: {
   let adrProjectId: string | null = null;
   const reqId = String(params.job.request_id || "").trim();
   if (reqId) {
-    const originalAudioUrl = originalAudioFromJobModels(params.job.models);
+    const jobModels = (params.job.models || {}) as Record<string, unknown>;
+    const originalAudioUrl = originalAudioFromJobModels(jobModels);
+    const storedMeta =
+      jobModels.extractMeta && typeof jobModels.extractMeta === "object"
+        ? (jobModels.extractMeta as Record<string, unknown>)
+        : {};
+    const extractMeta = {
+      ...storedMeta,
+      targetLang,
+      targetAudioUrl: String(params.job.audio_url || storedMeta.targetAudioUrl || ""),
+      originalAudioUrl: originalAudioUrl || storedMeta.originalAudioUrl || null,
+      diarizeAudioSource: storedMeta.diarizeAudioSource || "original",
+      diarizeAudioUrl:
+        storedMeta.diarizeAudioUrl || jobModels.diarizeAudioUrl || originalAudioUrl || null
+    };
+    const audioDurationSec = Number(extractMeta.audioDurationSec);
     adrProjectId = await upsertAdrProject({
       admin: params.admin,
       requestId: reqId,
@@ -1154,11 +1742,8 @@ async function finalizeRunpodDiarizeJob(params: {
       targetLang,
       audioUrl: String(params.job.audio_url || ""),
       originalAudioUrl,
-      extractMeta: {
-        targetLang,
-        targetAudioUrl: String(params.job.audio_url || ""),
-        originalAudioUrl: originalAudioUrl || null
-      },
+      extractMeta,
+      audioDurationSec: audioDurationSec > 0 ? audioDurationSec : null,
       pipelineJobId: params.job.id,
       segments
     });
@@ -1187,6 +1772,7 @@ async function backgroundDiarizeJob(params: {
   admin: ReturnType<typeof createClient>;
   jobId: string;
   audioUrl: string;
+  diarizeAudioUrl: string;
   originalAudioUrl?: string | null;
   extractMeta?: Record<string, unknown> | null;
   audioDurationSec?: number | null;
@@ -1199,7 +1785,11 @@ async function backgroundDiarizeJob(params: {
   startedMs: number;
 }): Promise<void> {
   try {
-    const diarize = await diarizeWithServiceFromUrl(params.audioUrl);
+    const diarizeAudioUrl = resolveAdrDiarizeAudioUrl({
+      originalAudioUrl: params.diarizeAudioUrl || params.originalAudioUrl,
+      targetAudioUrl: params.audioUrl
+    });
+    const diarize = await diarizeWithServiceFromUrl(diarizeAudioUrl);
     const segments = Array.isArray(diarize.segments) ? diarize.segments : [];
     if (!segments.length) throw new Error("話者分離の結果が空でした。");
     await persistDiarizeJob({
@@ -1213,7 +1803,9 @@ async function backgroundDiarizeJob(params: {
       durationMs: Date.now() - params.startedMs,
       models: {
         originalAudioUrl: params.originalAudioUrl || null,
-        extractMeta: params.extractMeta || null
+        extractMeta: params.extractMeta || null,
+        diarizeAudioSource: "original",
+        diarizeAudioUrl
       }
     });
     if (params.requestId) {
@@ -1239,7 +1831,7 @@ async function backgroundDiarizeJob(params: {
       });
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = redactRunpodHtmlError(e instanceof Error ? e.message : String(e));
     await params.admin
       .from("media_pipeline_jobs")
       .update({
@@ -1249,6 +1841,13 @@ async function backgroundDiarizeJob(params: {
         updated_at: new Date().toISOString()
       })
       .eq("id", params.jobId);
+    await notifyPipelineFailed({
+      admin: params.admin,
+      requestId: params.requestId,
+      customerEmail: params.customerEmail,
+      jobId: params.jobId,
+      userId: params.customerUserId
+    });
   }
 }
 
@@ -2356,7 +2955,9 @@ Deno.serve(async (req) => {
           ok: false,
           jobId: row.id,
           status: "failed",
-          error: row.error || (isV3Diarize ? "話者分離に失敗しました。" : "文字起こしに失敗しました。")
+          error: isV3Diarize
+            ? redactRunpodHtmlError(row.error || "話者分離に失敗しました。")
+            : (row.error || "文字起こしに失敗しました。")
         },
         422
       );
@@ -2412,7 +3013,7 @@ Deno.serve(async (req) => {
       return jsonResponse({ ok: false, error: "adr-prepare には videoUrl が必要です。" }, 400);
     }
     if (!extractYouTubeVideoId(videoUrl)) {
-      return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。" }, 400);
+      return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。", errorCode: "INVALID_VIDEO_URL" }, 400);
     }
     if (!requestId) {
       return jsonResponse({ ok: false, error: "adr-prepare には requestId が必要です。" }, 400);
@@ -2430,6 +3031,13 @@ Deno.serve(async (req) => {
       );
     }
 
+    const adrGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId);
+    if (!adrGuard.ok) {
+      const extra =
+        adrGuard.retryAfterSec != null ? rateLimitResponseHeaders(adrGuard.retryAfterSec) : {};
+      return jsonResponse(adrGuard.body, adrGuard.status, extra);
+    }
+
     const { data: adrJob, error: adrInsErr } = await admin
       .from("media_pipeline_jobs")
       .insert({
@@ -2441,7 +3049,8 @@ Deno.serve(async (req) => {
         status: "running",
         step: "extract",
         pipeline_kind: "v3_diarize",
-        target_lang: targetLang
+        target_lang: targetLang,
+        models: customerEmail ? { customerEmail } : {}
       })
       .select("id")
       .single();
@@ -2455,67 +3064,137 @@ Deno.serve(async (req) => {
     const adrTargetPath = pipelineRawAudioPath(userId, adrJobId, `${adrVideoId}_${targetLang}`);
     const adrOriginalPath = pipelineRawAudioPath(userId, adrJobId, `${adrVideoId}_original`);
 
-    try {
-      // 1) 翻訳先吹替トラック（必須・原盤と別物） 2) オリジナル（比較・切替用）
-      const extracted = await fetchProxyAudioToStorage(
-        admin,
-        videoUrl,
-        adrTargetPath,
-        false,
-        targetLang,
-        { requireDubTrack: true }
-      );
-      const originalExtracted = await fetchProxyAudioToStorage(
-        admin,
-        videoUrl,
-        adrOriginalPath,
-        false
-      );
-      assertDistinctTargetLangAudio(targetLang, extracted, originalExtracted);
+    const adrPrepareErrorCode = (msg: string): string | undefined => {
+      if (msg.includes("WRONG_LANGUAGE_TRACK")) return "WRONG_LANGUAGE_TRACK";
+      if (msg.includes("INVALID_AUDIO")) return "INVALID_AUDIO";
+      if (msg.includes("NO_ORIGINAL_TRACK")) return "NO_ORIGINAL_TRACK";
+      if (msg.includes("SAME_AS_ORIGINAL")) return "SAME_AS_ORIGINAL";
+      if (msg.includes("NO_LANGUAGE_TRACK")) return "NO_LANGUAGE_TRACK";
+      if (msg.includes("[BUSY]") || /\bBUSY\b/.test(msg)) return "BUSY";
+      if (/音声プロキシがタイムアウト/.test(msg)) return "PROXY_TIMEOUT";
+      return undefined;
+    };
 
-      const originalAudioUrl =
-        originalExtracted.publicUrl && originalExtracted.publicUrl !== extracted.publicUrl
-          ? originalExtracted.publicUrl
-          : null;
-      const extractMeta = {
-        targetLang,
-        targetAudioUrl: extracted.publicUrl,
-        originalAudioUrl,
-        audioDurationSec: extracted.audioDurationSec ?? null,
-        originalAudioDurationSec: originalExtracted.audioDurationSec ?? null,
-        targetByteLength: extracted.byteLength ?? null,
-        originalByteLength: originalExtracted.byteLength ?? null,
-        targetFormatId: extracted.selectedFormatId ?? null,
-        originalFormatId: originalExtracted.selectedFormatId ?? null
-      };
+    // Dual YouTube extract often exceeds Edge HTTP wall-clock. Return jobId
+    // immediately and finish extract → language gate → diarize in waitUntil.
+    const runAdrPrepareBackground = async (): Promise<void> => {
+      try {
+        const dubAudit = {
+          userId,
+          channelId: adrGuard.channelId,
+          videoId: adrVideoId
+        };
 
-      await admin
-        .from("media_pipeline_jobs")
-        .update({
-          status: "audio_ready",
-          step: "audio_ready",
-          audio_url: extracted.publicUrl,
-          audio_source: "youtube_proxy_storage",
-          error: null,
-          models: {
-            originalAudioUrl,
-            extractMeta,
-            dualExtract: true
-          },
-          updated_at: new Date().toISOString()
-        })
-        .eq("id", adrJobId);
+        // Dub + original in parallel so waitUntil pays one extract wall-clock,
+        // not the sum. Busy slots return 503 quickly and retry with Retry-After.
+        const originalPromise = fetchProxyAudioToStorageCached(
+          admin,
+          videoUrl,
+          adrOriginalPath,
+          false,
+          undefined,
+          undefined,
+          {
+            userId,
+            channelId: adrGuard.channelId,
+            videoId: adrVideoId
+          }
+        );
 
-      if (isDiarizeAsyncCapable()) {
-        const submitted = await submitRunpodDiarizeAsync(extracted.publicUrl);
+        let extracted: (ProxyStorageResult & { cached?: boolean }) | undefined;
+        let dubErr: unknown = null;
+        try {
+          extracted = await fetchProxyAudioToStorageCached(
+            admin,
+            videoUrl,
+            adrTargetPath,
+            false,
+            targetLang,
+            { requireDubTrack: true },
+            dubAudit
+          );
+        } catch (firstErr) {
+          const firstMsg =
+            firstErr instanceof Error ? firstErr.message : String(firstErr);
+          if (
+            isYouTubeExtractTestMode() &&
+            firstMsg.includes("NO_LANGUAGE_TRACK")
+          ) {
+            console.warn(
+              "[media-pipeline] test mode — retry adr dub extract without requireDubTrack"
+            );
+            try {
+              extracted = await fetchProxyAudioToStorageCached(
+                admin,
+                videoUrl,
+                adrTargetPath,
+                false,
+                targetLang,
+                { requireDubTrack: false },
+                dubAudit
+              );
+            } catch (retryErr) {
+              dubErr = retryErr;
+            }
+          } else {
+            dubErr = firstErr;
+          }
+        }
+
+        let originalExtracted: ProxyStorageResult & { cached?: boolean };
+        try {
+          originalExtracted = await originalPromise;
+        } catch (origErr) {
+          if (dubErr) throw dubErr;
+          throw origErr;
+        }
+        if (dubErr) throw dubErr;
+        if (!extracted) {
+          throw new Error("吹替音声の抽出に失敗しました。");
+        }
+        if (!originalExtracted.publicUrl) {
+          throw new Error(
+            "[NO_ORIGINAL_TRACK] オリジナル（原盤）音声の抽出に失敗しました。URL が空です。"
+          );
+        }
+        assertDistinctTargetLangAudio(targetLang, extracted, originalExtracted);
+
+        const originalAudioUrl =
+          originalExtracted.publicUrl && originalExtracted.publicUrl !== extracted.publicUrl
+            ? originalExtracted.publicUrl
+            : null;
+        if (!originalAudioUrl) {
+          throw new Error(
+            "[NO_ORIGINAL_TRACK] オリジナル音声 URL が翻訳先音声と同じでした。原盤トラックの取得に失敗しています。"
+          );
+        }
+        const diarizeAudioUrl = resolveAdrDiarizeAudioUrl({
+          originalAudioUrl,
+          targetAudioUrl: extracted.publicUrl
+        });
+        const extractMeta = {
+          targetLang,
+          targetAudioUrl: extracted.publicUrl,
+          originalAudioUrl,
+          diarizeAudioSource: "original",
+          diarizeAudioUrl,
+          audioDurationSec: extracted.audioDurationSec ?? null,
+          originalAudioDurationSec: originalExtracted.audioDurationSec ?? null,
+          targetByteLength: extracted.byteLength ?? null,
+          originalByteLength: originalExtracted.byteLength ?? null,
+          targetFormatId: extracted.selectedFormatId ?? null,
+          originalFormatId: originalExtracted.selectedFormatId ?? null
+        };
+
         await admin
           .from("media_pipeline_jobs")
           .update({
-            status: "running",
-            step: "diarize",
+            status: "audio_ready",
+            step: "audio_ready",
+            audio_url: extracted.publicUrl,
+            audio_source: "youtube_proxy_storage",
+            error: null,
             models: {
-              runpodJobId: submitted.id,
-              diarizeMode: "async",
               originalAudioUrl,
               extractMeta,
               dualExtract: true
@@ -2524,121 +3203,162 @@ Deno.serve(async (req) => {
           })
           .eq("id", adrJobId);
 
-        return jsonResponse({
-          ok: true,
-          jobId: adrJobId,
-          mode: "adr-prepare",
-          pipelineKind: "v3_diarize",
-          status: "running",
-          async: true,
+        await ensureAdrProjectStub({
+          admin,
+          requestId,
+          customerUserId: userId,
+          customerEmail,
+          videoUrl,
           targetLang,
-          rawAudioUrl: extracted.publicUrl,
-          originalAudioUrl,
-          audioDurationSec: extracted.audioDurationSec ?? null,
-          requestId
-        });
-      }
-
-      await admin
-        .from("media_pipeline_jobs")
-        .update({ step: "diarize", updated_at: new Date().toISOString() })
-        .eq("id", adrJobId);
-
-      if (typeof EdgeRuntime !== "undefined") {
-        EdgeRuntime.waitUntil(
-          backgroundDiarizeJob({
-            admin,
-            jobId: adrJobId,
-            audioUrl: extracted.publicUrl,
-            originalAudioUrl,
-            extractMeta,
-            audioDurationSec: extracted.audioDurationSec ?? null,
-            videoUrl,
-            targetLang,
-            audioSource: "youtube_proxy_storage",
-            requestId,
-            customerEmail,
-            customerUserId: userId,
-            startedMs: started
-          })
-        );
-        return jsonResponse({
-          ok: true,
-          jobId: adrJobId,
-          mode: "adr-prepare",
-          pipelineKind: "v3_diarize",
-          status: "running",
-          async: true,
-          targetLang,
-          rawAudioUrl: extracted.publicUrl,
-          originalAudioUrl,
-          requestId
-        });
-      }
-
-      const diarize = await diarizeWithServiceFromUrl(extracted.publicUrl);
-      const segments = Array.isArray(diarize.segments) ? diarize.segments : [];
-      if (!segments.length) throw new Error("話者分離の結果が空でした。");
-      const durationMs = Date.now() - started;
-      await persistDiarizeJob({
-        admin,
-        jobId: adrJobId,
-        diarize,
-        audioSource: "youtube_proxy_storage",
-        videoUrl,
-        audioUrl: extracted.publicUrl,
-        targetLang,
-        durationMs,
-        models: {
+          audioUrl: extracted.publicUrl,
           originalAudioUrl,
           extractMeta,
-          dualExtract: true
-        }
-      });
-      const adrProjectId = await upsertAdrProject({
-        admin,
-        requestId,
-        customerUserId: userId,
-        customerEmail,
-        videoUrl,
-        targetLang,
-        audioUrl: extracted.publicUrl,
-        originalAudioUrl,
-        extractMeta,
-        audioDurationSec: extracted.audioDurationSec ?? null,
-        pipelineJobId: adrJobId,
-        segments
-      });
-      await notifyAdrReady({ admin, requestId, customerEmail, targetLang });
+          audioDurationSec: extracted.audioDurationSec ?? null,
+          pipelineJobId: adrJobId
+        });
+        await admin
+          .from("media_pipeline_jobs")
+          .update({
+            status: "running",
+            step: "language_gate",
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", adrJobId);
 
+        await gateAdrTargetAudioLanguage({
+          admin,
+          requestId,
+          audioUrl: extracted.publicUrl,
+          targetLang,
+          selectedFormatId: extracted.selectedFormatId
+        });
+
+        if (isDiarizeAsyncCapable()) {
+          const submitted = await submitRunpodDiarizeAsync(diarizeAudioUrl);
+          await admin
+            .from("media_pipeline_jobs")
+            .update({
+              status: "running",
+              step: "diarize",
+              models: {
+                runpodJobId: submitted.id,
+                diarizeMode: "async",
+                diarizeAudioSource: "original",
+                diarizeAudioUrl,
+                originalAudioUrl,
+                extractMeta,
+                dualExtract: true,
+                languageGate: "passed"
+              },
+              updated_at: new Date().toISOString()
+            })
+            .eq("id", adrJobId);
+          return;
+        }
+
+        await admin
+          .from("media_pipeline_jobs")
+          .update({ step: "diarize", updated_at: new Date().toISOString() })
+          .eq("id", adrJobId);
+
+        await backgroundDiarizeJob({
+          admin,
+          jobId: adrJobId,
+          audioUrl: extracted.publicUrl,
+          diarizeAudioUrl,
+          originalAudioUrl,
+          extractMeta,
+          audioDurationSec: extracted.audioDurationSec ?? null,
+          videoUrl,
+          targetLang,
+          audioSource: "youtube_proxy_storage",
+          requestId,
+          customerEmail,
+          customerUserId: userId,
+          startedMs: started
+        });
+      } catch (e) {
+        const msg = redactRunpodHtmlError(e instanceof Error ? e.message : String(e));
+        console.error("[media-pipeline] adr-prepare background failed", msg);
+        await admin
+          .from("media_pipeline_jobs")
+          .update({
+            status: "failed",
+            step: "error",
+            error: msg,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", adrJobId);
+        await failAdrProject({ admin, requestId, error: msg });
+        await notifyPipelineFailed({
+          admin,
+          requestId,
+          customerEmail,
+          jobId: adrJobId,
+          userId
+        });
+      }
+    };
+
+    if (typeof EdgeRuntime !== "undefined") {
+      EdgeRuntime.waitUntil(runAdrPrepareBackground());
       return jsonResponse({
-        ...diarizeJsonResponseFromJob(
-          {
-            id: adrJobId,
-            audio_url: extracted.publicUrl,
-            video_url: videoUrl,
-            target_lang: targetLang,
-            diarization_raw: diarize,
-            duration_ms: durationMs
-          },
-          adrProjectId
-        ),
+        ok: true,
+        jobId: adrJobId,
+        mode: "adr-prepare",
+        pipelineKind: "v3_diarize",
+        status: "running",
+        step: "extract",
+        async: true,
+        targetLang,
+        requestId
+      });
+    }
+
+    await runAdrPrepareBackground();
+    const { data: doneJob } = await admin
+      .from("media_pipeline_jobs")
+      .select(
+        "id, status, step, error, audio_url, video_url, target_lang, diarization_raw, duration_ms, models"
+      )
+      .eq("id", adrJobId)
+      .maybeSingle();
+    if (!doneJob || doneJob.status === "failed") {
+      const msg = String(doneJob?.error || "ADR 準備に失敗しました。");
+      const errorCode = adrPrepareErrorCode(msg);
+      return jsonResponse(
+        { ok: false, jobId: adrJobId, error: msg, ...(errorCode ? { errorCode } : {}) },
+        422
+      );
+    }
+    const models = (doneJob.models || {}) as Record<string, unknown>;
+    const originalAudioUrl = String(models.originalAudioUrl || "").trim() || null;
+    const extractMeta = (models.extractMeta as Record<string, unknown> | undefined) || undefined;
+    if (doneJob.status === "completed" && doneJob.diarization_raw) {
+      const { data: proj } = await admin
+        .from("adr_projects")
+        .select("id")
+        .eq("request_id", requestId)
+        .maybeSingle();
+      return jsonResponse({
+        ...diarizeJsonResponseFromJob(doneJob as PipelineJobRow, (proj?.id as string) || null),
         originalAudioUrl,
         extractMeta
       });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      await admin
-        .from("media_pipeline_jobs")
-        .update({
-          status: "failed",
-          step: "error",
-          error: msg,
-          updated_at: new Date().toISOString()
-        })
-        .eq("id", adrJobId);
-      return jsonResponse({ ok: false, jobId: adrJobId, error: msg }, 422);
     }
+    return jsonResponse({
+      ok: true,
+      jobId: adrJobId,
+      mode: "adr-prepare",
+      pipelineKind: "v3_diarize",
+      status: doneJob.status || "running",
+      step: doneJob.step || "extract",
+      async: true,
+      targetLang,
+      rawAudioUrl: doneJob.audio_url || null,
+      originalAudioUrl,
+      requestId
+    });
   }
 
   if (mode === "script-reconcile") {
@@ -2817,13 +3537,22 @@ Deno.serve(async (req) => {
       return jsonResponse({ ok: false, error: "prepare-audio には videoUrl が必要です。" }, 400);
     }
     if (!extractYouTubeVideoId(videoUrl)) {
-      return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。" }, 400);
+      return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。", errorCode: "INVALID_VIDEO_URL" }, 400);
     }
     if (!isRunpodWhisperxMode()) {
       return jsonResponse(
         { ok: false, error: "prepare-audio は RunPod 設定時のみ利用できます。" },
         400
       );
+    }
+
+    const prepGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId);
+    if (!prepGuard.ok) {
+      const extra =
+        prepGuard.retryAfterSec != null
+          ? rateLimitResponseHeaders(prepGuard.retryAfterSec)
+          : {};
+      return jsonResponse(prepGuard.body, prepGuard.status, extra);
     }
 
     const { data: prepJob, error: prepInsErr } = await admin
@@ -2849,19 +3578,81 @@ Deno.serve(async (req) => {
     const prepStoragePath = pipelineRawAudioPath(userId, prepJobId, prepVideoId);
 
     try {
-      const extracted = await fetchProxyAudioToStorage(admin, videoUrl, prepStoragePath, false);
+      const preferOriginal = Boolean(body.preferOriginalTrack || body.preferOriginal);
+      let extracted: ProxyStorageResult & { cached?: boolean };
+      try {
+        extracted = await fetchProxyAudioToStorageCached(
+          admin,
+          videoUrl,
+          prepStoragePath,
+          false,
+          undefined,
+          preferOriginal ? { preferOriginalTrack: true } : undefined,
+          {
+            userId,
+            channelId: prepGuard.channelId,
+            videoId: prepVideoId
+          }
+        );
+      } catch (firstErr) {
+        const firstMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+        if (
+          preferOriginal &&
+          isYouTubeExtractTestMode() &&
+          firstMsg.includes("NO_ORIGINAL_TRACK")
+        ) {
+          console.warn(
+            "[media-pipeline] test mode — retry prepare-audio without preferOriginalTrack"
+          );
+          extracted = await fetchProxyAudioToStorageCached(
+            admin,
+            videoUrl,
+            prepStoragePath,
+            false,
+            undefined,
+            undefined,
+            {
+              userId,
+              channelId: prepGuard.channelId,
+              videoId: prepVideoId
+            }
+          );
+        } else {
+          throw firstErr;
+        }
+      }
+      if (preferOriginal && String(extracted.trackRole || "") !== "original") {
+        if (isYouTubeExtractTestMode() && extracted.publicUrl) {
+          console.warn(
+            "[media-pipeline] test mode — accepting non-original trackRole",
+            extracted.trackRole
+          );
+        } else {
+          throw new Error(
+            `[NO_ORIGINAL_TRACK] オリジナル音声を確定できませんでした` +
+              `（role=${extracted.trackRole || "?"} format=${extracted.selectedFormatId || "?"}）。`
+          );
+        }
+      }
       const durationMs = Date.now() - started;
+      const updatePayload: Record<string, unknown> = {
+        status: "audio_ready",
+        step: "audio_ready",
+        audio_url: extracted.publicUrl,
+        audio_source: preferOriginal ? "youtube_proxy_original" : "youtube_proxy_storage",
+        error: null,
+        duration_ms: durationMs,
+        updated_at: new Date().toISOString()
+      };
+      if (preferOriginal) {
+        updatePayload.models = {
+          trackRole: "original",
+          selectedFormatId: extracted.selectedFormatId || null
+        };
+      }
       await admin
         .from("media_pipeline_jobs")
-        .update({
-          status: "audio_ready",
-          step: "audio_ready",
-          audio_url: extracted.publicUrl,
-          audio_source: "youtube_proxy_storage",
-          error: null,
-          duration_ms: durationMs,
-          updated_at: new Date().toISOString()
-        })
+        .update(updatePayload)
         .eq("id", prepJobId);
 
       return jsonResponse({
@@ -2871,10 +3662,21 @@ Deno.serve(async (req) => {
         rawAudioUrl: extracted.publicUrl,
         audioDurationSec: extracted.audioDurationSec ?? null,
         durationMs,
+        trackRole: extracted.trackRole || (preferOriginal ? "original" : null),
+        selectedFormatId: extracted.selectedFormatId ?? null,
+        cached: Boolean(extracted.cached),
         transcribeBuild: WAVRICK_TRANSCRIBE_BUILD
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      const errorCode = classifyYouTubeExtractError(msg);
+      await logYouTubeExtractEvent(admin, {
+        userId,
+        videoId: prepVideoId,
+        channelId: prepGuard.channelId,
+        success: false,
+        errorCode: errorCode || "EXTRACT_FAILED"
+      });
       await admin
         .from("media_pipeline_jobs")
         .update({
@@ -2884,7 +3686,15 @@ Deno.serve(async (req) => {
           updated_at: new Date().toISOString()
         })
         .eq("id", prepJobId);
-      return jsonResponse({ ok: false, jobId: prepJobId, error: msg }, 422);
+      return jsonResponse(
+        {
+          ok: false,
+          jobId: prepJobId,
+          error: msg,
+          errorCode: errorCode || undefined
+        },
+        errorCode === "YT_EXTRACT_BLOCKED" ? 502 : 422
+      );
     }
   }
 
@@ -2893,7 +3703,7 @@ Deno.serve(async (req) => {
   }
 
   if (videoUrl && !extractYouTubeVideoId(videoUrl)) {
-    return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。" }, 400);
+    return jsonResponse({ ok: false, error: "YouTube の動画URLとして解釈できませんでした。", errorCode: "INVALID_VIDEO_URL" }, 400);
   }
 
   const existingJobId = (body.existingJobId || "").trim();
@@ -2978,10 +3788,41 @@ Deno.serve(async (req) => {
           "YouTube の videoUrl のみでは音声を取得できません。Supabase secrets に YOUTUBE_AUDIO_PROXY_URL を設定するか、抽出済み音声の audioUrl を指定してください。"
         );
       }
+
+      const fullGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId);
+      if (!fullGuard.ok) {
+        await admin
+          .from("media_pipeline_jobs")
+          .update({
+            status: "failed",
+            step: "error",
+            error: String(fullGuard.body.error || "YouTube 取得が拒否されました。"),
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", jobId);
+        const extra =
+          fullGuard.retryAfterSec != null
+            ? rateLimitResponseHeaders(fullGuard.retryAfterSec)
+            : {};
+        return jsonResponse(fullGuard.body, fullGuard.status, extra);
+      }
+
       await admin.from("media_pipeline_jobs").update({ step: "extract", audio_source: audioSource }).eq("id", jobId);
 
       if (isRunpodWhisperxMode()) {
-        const streamed = await fetchProxyAudioToStorage(admin, videoUrl, rawStoragePath, false);
+        const streamed = await fetchProxyAudioToStorageCached(
+          admin,
+          videoUrl,
+          rawStoragePath,
+          false,
+          undefined,
+          undefined,
+          {
+            userId,
+            channelId: fullGuard.channelId,
+            videoId
+          }
+        );
         rawAudioStorageUrl = streamed.publicUrl;
         whisperPassthroughUrl = streamed.publicUrl;
       } else {

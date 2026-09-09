@@ -1,6 +1,12 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeadersForRequest } from "../_shared/cors.ts";
 import {
+  fetchYoutubeProxy,
+  isAbortTimeoutError,
+  PROXY_META_TIMEOUT_MS,
+  proxyTimeoutUserMessage
+} from "../_shared/youtube-proxy-timeout.ts";
+import {
   clientIpFromRequest,
   enforceRateLimit,
   parsePositiveInt,
@@ -93,22 +99,30 @@ Deno.serve(async (req) => {
   if (secret) headers.Authorization = `Bearer ${secret}`;
 
   try {
-    const r = await fetch(`${proxyBase}/video-meta`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ videoUrl })
-    });
+    const r = await fetchYoutubeProxy(
+      `${proxyBase}/video-meta`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ videoUrl })
+      },
+      { timeoutMs: PROXY_META_TIMEOUT_MS, busyRetryMs: 30_000 }
+    );
     const text = await r.text();
     return new Response(text, {
       status: r.status,
       headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = isAbortTimeoutError(e)
+      ? proxyTimeoutUserMessage(PROXY_META_TIMEOUT_MS)
+      : e instanceof Error
+        ? e.message
+        : String(e);
     return new Response(
       JSON.stringify({
         ok: false,
-        error: `音声プロキシに接続できません: ${msg}`
+        error: /音声プロキシ/.test(msg) ? msg : `音声プロキシに接続できません: ${msg}`
       }),
       {
         status: 502,

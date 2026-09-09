@@ -16,4 +16,14 @@ fi
 
 export PATH="/usr/local/bin:${PATH}"
 
-exec gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 1 --timeout 300 app:app
+# gthread: /health and 503 BUSY stay responsive while yt-dlp holds a thread.
+# timeout 240s must stay below Edge PROXY_EXTRACT_TIMEOUT_MS (250s) so gunicorn
+# can finish/fail the HTTP request instead of Deno aborting with "Signal timed out".
+THREADS="${WAVRICK_GUNICORN_THREADS:-4}"
+GUNICORN_TIMEOUT="${WAVRICK_GUNICORN_TIMEOUT:-240}"
+exec gunicorn --bind "0.0.0.0:${PORT:-8080}" \
+  --worker-class gthread \
+  --workers 1 \
+  --threads "${THREADS}" \
+  --timeout "${GUNICORN_TIMEOUT}" \
+  app:app

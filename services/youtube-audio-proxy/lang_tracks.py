@@ -46,6 +46,16 @@ _LANG_NAME_TO_CODE: tuple[tuple[str, str], ...] = (
 )
 
 
+def _format_id_is_hls(fmt_id: str) -> bool:
+    head = str(fmt_id or "").strip().split("-", 1)[0]
+    return head.isdigit() and 91 <= int(head) <= 96
+
+
+def _url_looks_hls(url: str) -> bool:
+    u = str(url or "").lower()
+    return ".m3u8" in u or "/manifest" in u or "playlist/index" in u
+
+
 def normalize_lang_code(raw: str | None) -> str:
     return (raw or "").strip().lower().split("-")[0].split("_")[0]
 
@@ -201,6 +211,11 @@ def pick_best_track_for_format(
             s += 10.0
         if t.get("hasUrl"):
             s += 5.0
+        fid = str(t.get("formatId") or t.get("format_id") or "")
+        if _format_id_is_hls(fid) or _url_looks_hls(str(t.get("downloadUrl") or "")):
+            s -= 25.0
+        else:
+            s += 8.0
         if strong_lang_signals(t):
             s += 30.0
         if "dub" in note or "dubbed" in xt:
@@ -242,6 +257,11 @@ def resolve_target_tracks(
         s = 0.0
         if t.get("hasUrl"):
             s += 5.0
+        fid = str(t.get("formatId") or t.get("format_id") or "")
+        if _format_id_is_hls(fid) or _url_looks_hls(str(t.get("downloadUrl") or "")):
+            s -= 25.0
+        else:
+            s += 8.0
         if "dub" in note or "dubbed" in xt:
             s += 20.0
         if "original" in note or "acont=original" in xt:

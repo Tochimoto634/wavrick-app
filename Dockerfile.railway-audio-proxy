@@ -27,12 +27,13 @@ COPY services/youtube-audio-proxy/requirements-railway.txt requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY services/youtube-audio-proxy/app.py \
-     services/youtube-audio-proxy/cors_utils.py \
-     services/youtube-audio-proxy/rate_limit.py \
-     services/youtube-audio-proxy/run_demucs.py \
-     services/youtube-audio-proxy/lang_tracks.py \
-     services/youtube-audio-proxy/start-railway.sh \
-     ./
+    services/youtube-audio-proxy/cors_utils.py \
+    services/youtube-audio-proxy/rate_limit.py \
+    services/youtube-audio-proxy/run_demucs.py \
+    services/youtube-audio-proxy/lang_tracks.py \
+    services/youtube-audio-proxy/extract_slot.py \
+    services/youtube-audio-proxy/start-railway.sh \
+    ./
 RUN chmod +x /app/start-railway.sh
 
 ENV WAVRICK_VOCAL_SEPARATION=0
