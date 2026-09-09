@@ -12,6 +12,7 @@ import {
   parsePositiveInt,
   rateLimitResponseHeaders
 } from "../_shared/rate-limit.ts";
+import { fetchVideoMetaFromDataApi } from "../_shared/youtube-channel-guard.ts";
 
 type Body = { videoUrl?: string; url?: string };
 
@@ -73,6 +74,15 @@ Deno.serve(async (req) => {
         }
       }
     );
+  }
+
+  // Data API で解決できる公開・限定公開動画は、ここで返して yt-dlp を一切呼ばない。
+  const viaApi = await fetchVideoMetaFromDataApi(videoUrl);
+  if (viaApi) {
+    return new Response(JSON.stringify(viaApi), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
+    });
   }
 
   let proxyBase = (Deno.env.get("YOUTUBE_AUDIO_PROXY_URL") || "").trim().replace(/\/$/, "");

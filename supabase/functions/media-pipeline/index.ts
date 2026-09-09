@@ -87,6 +87,7 @@ import {
 } from "../_shared/youtube-channel-guard.ts";
 import {
   cacheStemFromOpts,
+  lookupCachedChannelId,
   lookupYouTubeAudioCache,
   saveYouTubeAudioCache,
   youtubeCacheStoragePath,
@@ -163,6 +164,10 @@ type PipelineBody = {
   scriptLanguage?: string;
   /** v3 ADR: 抽出する吹替トラックの言語（現状 ja のみ） */
   targetLang?: string;
+  /** prepare-audio: 吹替ではなく原音トラックを取る */
+  preferOriginalTrack?: boolean;
+  /** preferOriginalTrack の旧名（フロント互換） */
+  preferOriginal?: boolean;
   customerEmail?: string;
 };
 
@@ -638,12 +643,39 @@ async function guardYouTubeVideoExtract(
   req: Request,
   admin: ReturnType<typeof createClient>,
   videoUrl: string,
-  userId: string | null
+  userId: string | null,
+  /** このリクエストが必要とする音声（lang/stem）の一覧。全部キャッシュ済みなら YouTube に触らない。 */
+  opts?: { cacheKeys?: Array<{ targetLang?: string; stem?: CacheStem }> }
 ): Promise<
-  | { ok: true; channelId?: string }
+  | { ok: true; channelId?: string; cacheHit?: boolean }
   | { ok: false; status: number; body: Record<string, unknown>; retryAfterSec?: number }
 > {
-  const guard = await assertYouTubeExtractAllowed(req, admin, videoUrl);
+  const guardVideoId = extractYouTubeVideoId(videoUrl) || "";
+  const cacheEnabled = Boolean(guardVideoId) && Deno.env.get("WAVRICK_YT_CACHE_DISABLE") !== "1";
+
+  // 既に抽出済みの動画は所有チャンネルが判明しているので、meta 取得（= yt-dlp）を省く。
+  const knownChannelId = cacheEnabled ? await lookupCachedChannelId(admin, guardVideoId) : "";
+
+  // 必要な音声が全て Storage にあるなら YouTube への通信は発生しないので、
+  // 抽出レート制限も消費させない。1 つでも欠けていれば通常どおり課金する。
+  const cacheKeys = opts?.cacheKeys || [];
+  const cacheHit =
+    cacheEnabled && Boolean(knownChannelId) && cacheKeys.length > 0
+      ? (
+          await Promise.all(
+            cacheKeys.map((k) =>
+              lookupYouTubeAudioCache(
+                admin,
+                guardVideoId,
+                (k.targetLang || "").trim(),
+                k.stem || "default"
+              )
+            )
+          )
+        ).every(Boolean)
+      : false;
+
+  const guard = await assertYouTubeExtractAllowed(req, admin, videoUrl, { knownChannelId });
   if (!guard.ok) {
     await logYouTubeExtractEvent(admin, {
       userId,
@@ -659,7 +691,8 @@ async function guardYouTubeVideoExtract(
     };
   }
 
-  if (!isYouTubeExtractTestMode()) {
+  // cacheHit のときは YouTube を叩かないので、日次/時間あたりの抽出枠は消費しない。
+  if (!isYouTubeExtractTestMode() && !cacheHit) {
     const ytRl = await enforceYouTubeExtractRateLimits(admin, userId);
     if (!ytRl.ok) {
       return {
@@ -676,7 +709,7 @@ async function guardYouTubeVideoExtract(
     }
   }
 
-  return { ok: true, channelId: guard.channelId };
+  return { ok: true, channelId: guard.channelId || knownChannelId || undefined, cacheHit };
 }
 
 async function streamAudioUrlToStorage(
@@ -3031,7 +3064,13 @@ Deno.serve(async (req) => {
       );
     }
 
-    const adrGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId);
+    // ADR は吹替 + 原音の二重抽出。両方キャッシュ済みのときだけ YouTube に触らない。
+    const adrGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId, {
+      cacheKeys: [
+        { targetLang, stem: "default" },
+        { targetLang: "", stem: "default" }
+      ]
+    });
     if (!adrGuard.ok) {
       const extra =
         adrGuard.retryAfterSec != null ? rateLimitResponseHeaders(adrGuard.retryAfterSec) : {};
@@ -3546,7 +3585,12 @@ Deno.serve(async (req) => {
       );
     }
 
-    const prepGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId);
+    const prepPreferOriginal = Boolean(body.preferOriginalTrack || body.preferOriginal);
+    const prepGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId, {
+      cacheKeys: [
+        { targetLang: "", stem: prepPreferOriginal ? "original" : "default" }
+      ]
+    });
     if (!prepGuard.ok) {
       const extra =
         prepGuard.retryAfterSec != null
@@ -3578,7 +3622,7 @@ Deno.serve(async (req) => {
     const prepStoragePath = pipelineRawAudioPath(userId, prepJobId, prepVideoId);
 
     try {
-      const preferOriginal = Boolean(body.preferOriginalTrack || body.preferOriginal);
+      const preferOriginal = prepPreferOriginal;
       let extracted: ProxyStorageResult & { cached?: boolean };
       try {
         extracted = await fetchProxyAudioToStorageCached(
@@ -3789,7 +3833,10 @@ Deno.serve(async (req) => {
         );
       }
 
-      const fullGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId);
+      // 非 RunPod 経路はキャッシュを通さず毎回プロキシから取るので、cacheKeys を渡さない。
+      const fullGuard = await guardYouTubeVideoExtract(req, admin, videoUrl, userId, {
+        cacheKeys: isRunpodWhisperxMode() ? [{ targetLang: "", stem: "default" }] : []
+      });
       if (!fullGuard.ok) {
         await admin
           .from("media_pipeline_jobs")
