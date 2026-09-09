@@ -80,7 +80,7 @@ _VIDEO_FORMAT_720P = (
 )
 _VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 43
+_EXTRACT_BUILD = 44
 
 
 def _pot_provider_enabled() -> bool:
@@ -737,6 +737,7 @@ def _probe_video_info(url: str) -> dict:
                     return info
             except Exception as exc:
                 last_err = exc
+                _abort_on_bot_block(exc)
                 if not _is_format_or_challenge_error(exc):
                     logger.warning("video info probe failed (%s)", exc)
                 continue
@@ -1694,6 +1695,7 @@ def probe_youtube_audio_tracks(
                         break  # move to next client; don't thrash IP families
                 except Exception as exc:
                     last_err = exc
+                    _abort_on_bot_block(exc)
                     if _is_yt_rate_limit_error(str(exc)):
                         logger.warning(
                             "YouTube rate limit during probe — stopping immediately (%s)",
@@ -2087,9 +2089,7 @@ def _download_youtube_audio_by_language_legacy(
                         msg = str(exc)
                         if _is_yt_rate_limit_error(msg):
                             raise RuntimeError(f"FETCH_FAILED: {_friendly_yt_extract_error(msg)}") from exc
-                        if "Sign in to confirm" in msg or "not a bot" in msg.lower():
-                            drop_this_cookie_mode = True
-                            break
+                        _abort_on_bot_block(exc)
                         if _is_format_or_challenge_error(exc):
                             continue
                         raise
@@ -2314,14 +2314,7 @@ def download_youtube_audio_by_language(
                     )
                 except Exception as exc:
                     last_err = exc
-                    msg = str(exc)
-                    if "Sign in to confirm" in msg or "not a bot" in msg.lower():
-                        logger.warning(
-                            "re-probe bot check cookies=%s — skip this cookie mode",
-                            use_cookies,
-                        )
-                        drop_this_cookie_mode = True
-                        break
+                    _abort_on_bot_block(exc)
                     logger.warning(
                         "re-probe failed cookies=%s clients=%s ip=%s (%s)",
                         use_cookies,
@@ -2482,14 +2475,7 @@ def download_youtube_audio_by_language(
                     except Exception as exc:
                         last_err = exc
                         msg = str(exc)
-                        is_bot = "Sign in to confirm" in msg or "not a bot" in msg.lower()
-                        if is_bot:
-                            logger.warning(
-                                "YouTube bot check cookies=%s — switching cookie mode",
-                                use_cookies,
-                            )
-                            drop_this_cookie_mode = True
-                            break
+                        _abort_on_bot_block(exc)
                         if _is_format_or_challenge_error(exc):
                             logger.warning(
                                 "language download retry (%s) format=%s clients=%s ip=%s cookies=%s",
@@ -2701,8 +2687,25 @@ def _extract_error_code(detail: str) -> str:
     return "FETCH_FAILED"
 
 
+def _abort_on_bot_block(exc: BaseException) -> None:
+    """YouTube bot / IP block は即打ち切り。別 client 総当たりは評価を悪化させるだけ。"""
+    detail = str(exc).strip() or exc.__class__.__name__
+    if not _is_bot_or_block_error(detail):
+        return
+    logger.warning(
+        "YouTube bot/block — aborting without further retries (%s)",
+        detail[:160],
+    )
+    raise RuntimeError(f"FETCH_FAILED: {_friendly_yt_extract_error(detail)}") from exc
+
+
 def _is_format_or_challenge_error(exc: BaseException) -> bool:
-    """True when the next format / player_client / cookie mode should be tried."""
+    """True when the next format / player_client / cookie mode should be tried.
+
+    Bot / IP blocks must NOT be retried here — use _abort_on_bot_block instead.
+    """
+    if _is_bot_or_block_error(str(exc)):
+        return False
     msg = str(exc).lower()
     return any(
         token in msg
@@ -2711,14 +2714,8 @@ def _is_format_or_challenge_error(exc: BaseException) -> bool:
             "requested format is not available",
             "invalid format specification",
             "unexpected (",
-            "http error 403",
-            "forbidden",
-            "sign in to confirm",
-            "not a bot",
             "challenge solving failed",
             "only images are available",
-            "rate-limited",
-            "try again later",
             # yt-dlp raise_no_formats when SABR/cookies leave zero playable URLs
             "page needs to be reloaded",
             "the page needs to be reloaded",
@@ -2930,6 +2927,7 @@ def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, flo
                     break
                 except Exception as exc:
                     last_err = exc
+                    _abort_on_bot_block(exc)
                     if _is_format_or_challenge_error(exc) and idx < len(format_attempts) - 1:
                         logger.warning(
                             "audio download failed (%s) — retry format %s (clients=%s cookies=%s)",
@@ -2960,6 +2958,7 @@ def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, flo
                 break
             except Exception as exc:
                 last_err = exc
+                _abort_on_bot_block(exc)
                 if _is_format_or_challenge_error(exc):
                     logger.warning(
                         "probed audio download failed (%s) — try next client/cookie mode",
@@ -3232,22 +3231,7 @@ def extract():
         shutil.rmtree(out_dir, ignore_errors=True)
         return _busy_response("YouTube 音声取得が混雑しています。しばらく待ってから再試行してください。")
     try:
-        last_dl_err: Exception | None = None
-        for attempt in range(2):
-            try:
-                _perform_download()
-                last_dl_err = None
-                break
-            except Exception as exc:
-                last_dl_err = exc
-                detail = str(exc).strip() or exc.__class__.__name__
-                if attempt == 0 and _is_bot_or_block_error(detail):
-                    logger.warning("extract bot/block — retry after backoff (%s)", detail[:120])
-                    time.sleep(2.0)
-                    continue
-                raise
-        if last_dl_err:
-            raise last_dl_err
+        _perform_download()
 
         mime = _guess_mimetype(path)
         file_size = os.path.getsize(path)
@@ -3403,22 +3387,7 @@ def extract_video():
     try:
         path = ""
         video_dur = 0.0
-        last_err: Exception | None = None
-        for attempt in range(2):
-            try:
-                path, video_dur = download_youtube_video_720p(url, out_dir)
-                last_err = None
-                break
-            except Exception as exc:
-                last_err = exc
-                detail = str(exc).strip() or exc.__class__.__name__
-                if attempt == 0 and _is_bot_or_block_error(detail):
-                    logger.warning("extract-video bot/block — retry after backoff (%s)", detail[:120])
-                    time.sleep(2.0)
-                    continue
-                raise
-        if last_err:
-            raise last_err
+        path, video_dur = download_youtube_video_720p(url, out_dir)
 
         mime = _guess_video_mimetype(path)
         file_size = os.path.getsize(path)

@@ -584,7 +584,24 @@ async function fetchProxyAudioToStorageCached(
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
       const code = classifyYouTubeExtractError(lastErr.message);
-      if (code === "YT_EXTRACT_BLOCKED" && attempt === 0) continue;
+      const msg = lastErr.message.toLowerCase();
+      // Bot / IP block: never hammer YouTube again from Edge.
+      const retryable =
+        code !== "YT_EXTRACT_BLOCKED" &&
+        (code === "RATE_LIMIT" ||
+          code === "BUSY" ||
+          /page needs to be reloaded|fetch_failed|502/.test(msg));
+      if (retryable && attempt === 0) continue;
+      await logYouTubeExtractEvent(admin, {
+        userId: audit?.userId,
+        videoId,
+        channelId: audit?.channelId,
+        targetLang: langKey,
+        stem,
+        success: false,
+        errorCode: code || "FETCH_FAILED",
+        cached: false
+      });
       throw lastErr;
     }
   }
