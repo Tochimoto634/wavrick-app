@@ -1,0 +1,61 @@
+name: Bump yt-dlp nightly pin
+
+# YouTube の extractor 変更で本番が壊れる前にピンを上げる。
+# 自動マージはしない（PR を人が見てから main へ = Railway 自動デプロイへ）。
+on:
+  schedule:
+    - cron: "0 21 * * 1" # 毎週火曜 06:00 JST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check PyPI for a newer nightly
+        id: bump
+        run: |
+          set +e
+          python3 scripts/bump-yt-dlp-pin.py
+          code=$?
+          set -e
+          if [ "$code" = "10" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" = "0" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Read the new pin
+        if: steps.bump.outputs.changed == 'true'
+        id: pin
+        run: |
+          version=$(sed -n 's/^yt-dlp==\(.*\)$/\1/p' services/youtube-audio-proxy/requirements-railway.txt)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/yt-dlp-nightly
+          title: "Bump yt-dlp nightly pin to ${{ steps.pin.outputs.version }}"
+          commit-message: "Bump yt-dlp nightly pin to ${{ steps.pin.outputs.version }}."
+          body: |
+            PyPI に新しい yt-dlp nightly が出たのでピンを上げます。
+
+            マージすると Railway の `handsome-warmth` が自動で再ビルドされます。
+            デプロイ後は `/health` を確認してください:
+
+            ```bash
+            curl -sS "https://handsome-warmth-production-d61f.up.railway.app/health" \
+              | python3 -m json.tool | grep -E 'ytDlpVersion|extractBuild|imageBuiltAt'
+            ```
+
+            `ytDlpVersion` が `${{ steps.pin.outputs.version }}` の `.dev0` を除いた形
+            になっていれば反映済みです。

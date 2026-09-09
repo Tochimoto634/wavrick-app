@@ -80,7 +80,7 @@ _VIDEO_FORMAT_720P = (
 )
 _VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 41
+_EXTRACT_BUILD = 42
 
 
 def _pot_provider_enabled() -> bool:
@@ -231,8 +231,70 @@ def _guess_video_mimetype(path: str) -> str:
 _COOKIE_CACHE_PATH: str | None = None
 
 
+def _image_built_at() -> str:
+    """
+    イメージのビルド時刻。失敗時に「版が古いのか IP が焼けたのか」を切り分けるため、
+    Dockerfile の最後で /app/BUILD_AT に書き込んでいる。
+    """
+    env = os.environ.get("WAVRICK_IMAGE_BUILT_AT", "").strip()
+    if env:
+        return env
+    try:
+        with open("/app/BUILD_AT", "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
 def _yt_proxy() -> str:
     return os.environ.get("WAVRICK_YT_PROXY", "").strip()
+
+
+def _yt_proxy_scheme() -> str:
+    proxy = _yt_proxy()
+    if not proxy:
+        return ""
+    try:
+        return (urlparse(proxy).scheme or "").lower()
+    except Exception:
+        return ""
+
+
+def _yt_proxy_label() -> str:
+    """認証情報を落としたプロキシ表示名（/health 用）。"""
+    proxy = _yt_proxy()
+    if not proxy:
+        return ""
+    try:
+        parsed = urlparse(proxy)
+        host = parsed.hostname or "?"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except Exception:
+        return "set"
+
+
+def _direct_download_supported() -> bool:
+    """
+    probe が発行した googlevideo URL は、その probe を行った出口 IP に紐づく。
+    直 URL ダウンロードを yt-dlp と別の経路で行うと必ず HTTP 403 になるため、
+    urllib で同じプロキシを通せるときだけこの近道を許可する。
+    socks は urllib が扱えないので、その場合は yt-dlp 経由に落とす。
+    """
+    scheme = _yt_proxy_scheme()
+    if not scheme:
+        return True
+    return scheme in ("http", "https")
+
+
+def _direct_url_opener() -> urllib.request.OpenerDirector:
+    """yt-dlp と同じ出口 IP を使うための opener。プロキシ未設定なら直結。"""
+    proxy = _yt_proxy()
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _resolve_yt_cookiefile() -> str | None:
@@ -1762,6 +1824,12 @@ def _download_direct_media_url(
     """
     if _url_is_hls_or_playlist(media_url):
         raise RuntimeError("INVALID_AUDIO: direct URL is an HLS playlist, not media")
+    if not _direct_download_supported():
+        # 呼び出し側は例外を捕まえて yt-dlp ダウンロードにフォールバックする。
+        raise RuntimeError(
+            f"DIRECT_URL_UNSUPPORTED_PROXY: urllib cannot route {_yt_proxy_scheme()};"
+            " falling back to yt-dlp so probe and download share one exit IP"
+        )
     clear_download_proxies()
     ext = (ext_hint or "webm").lstrip(".") or "webm"
     raw_path = os.path.join(out_dir, f"direct.{ext}")
@@ -1780,7 +1848,7 @@ def _download_direct_media_url(
             if v:
                 headers[str(k)] = str(v)
     req = urllib.request.Request(media_url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=ydl_socket_timeout()) as resp:
+    with _direct_url_opener().open(req, timeout=ydl_socket_timeout()) as resp:
         with open(raw_path, "wb") as fh:
             while True:
                 chunk = resp.read(1024 * 256)
@@ -3496,7 +3564,11 @@ def health():
             "busyWaitSec": busy_wait_sec(),
             "ydlSocketTimeout": ydl_socket_timeout(),
             "remoteComponents": _remote_components(),
+            "ytProxyConfigured": bool(_yt_proxy()),
+            "ytProxy": _yt_proxy_label() or None,
+            "ytProxyDirectDownload": _direct_download_supported(),
             "ytDlpVersion": yt_dlp.version.__version__,
+            "imageBuiltAt": _image_built_at() or None,
             "nodePath": shutil.which("node"),
             "denoPath": shutil.which("deno"),
             "extractBuild": _EXTRACT_BUILD,

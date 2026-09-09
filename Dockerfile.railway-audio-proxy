@@ -1,5 +1,10 @@
 # Railway: deploy from repo root when Root Directory UI is unavailable.
 # Settings → Build → Dockerfile path: Dockerfile.railway-audio-proxy
+#
+# THIS IS THE PRODUCTION BUILD for the handsome-warmth service. The repo-root
+# railway.toml points here and overrides the Railway UI setting, so
+# services/youtube-audio-proxy/Dockerfile.railway is NOT what production runs.
+# Keep the two in sync, or change railway.toml if that ever stops being true.
 FROM node:20-bookworm-slim
 
 RUN apt-get update \
@@ -41,5 +46,9 @@ ENV WAVRICK_YT_POT_ENABLED=1
 ENV WAVRICK_YT_POT_PORT=4416
 ENV WAVRICK_YT_POT_SERVER_HOME=/opt/bgutil/server
 ENV WAVRICK_NODE_PATH=/usr/local/bin/node
+
+# 最後に置くことで、上のどれかが変わって再ビルドされたときだけ更新される。
+# /health の imageBuiltAt に出る。
+RUN date -u +%Y-%m-%dT%H:%M:%SZ > /app/BUILD_AT
 
 CMD ["/app/start-railway.sh"]
