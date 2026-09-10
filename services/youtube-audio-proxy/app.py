@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import glob
+import json
 import logging
 import os
 import re
@@ -26,9 +27,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from urllib.parse import quote, urlparse
 
 from flask import Flask, Response, abort, jsonify, request
@@ -80,7 +83,7 @@ _VIDEO_FORMAT_720P = (
 )
 _VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 44
+_EXTRACT_BUILD = 47
 
 
 def _pot_provider_enabled() -> bool:
@@ -276,11 +279,15 @@ def _yt_proxy_label() -> str:
 
 def _direct_download_supported() -> bool:
     """
-    probe が発行した googlevideo URL は、その probe を行った出口 IP に紐づく。
-    直 URL ダウンロードを yt-dlp と別の経路で行うと必ず HTTP 403 になるため、
-    urllib で同じプロキシを通せるときだけこの近道を許可する。
-    socks は urllib が扱えないので、その場合は yt-dlp 経由に落とす。
+    Default OFF. probe が発行した googlevideo URL を urllib で直接取りに行く近道は、
+    実測（2026-09-10, 住宅 IP）で 403 か 250 秒級のストールになった。yt-dlp 本体の
+    ダウンローダは同じ URL を 1 秒で取れるので、近道は損しかしない。
+    どうしても比較したいときだけ WAVRICK_YT_DIRECT_URL=1 で有効化する。
     """
+    flag = os.environ.get("WAVRICK_YT_DIRECT_URL", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return False
+    # urllib は socks を扱えない。probe と出口 IP がずれると必ず 403 になる。
     scheme = _yt_proxy_scheme()
     if not scheme:
         return True
@@ -405,42 +412,27 @@ def _normalize_player_clients(clients: list[str], *, use_cookies: bool) -> list[
 
 def _player_client_attempts(*, use_cookies: bool = False) -> list[list[str]]:
     """
-    No-cookie production default: web_safari first, minimal client fan-out.
-    Opt-in cookies (WAVRICK_YT_USE_COOKIES=1) keeps legacy multi-client fallbacks.
+    Wavrick policy: web_embedded only.
+
+    Measured 2026-09-10 on a residential exit with the pinned yt-dlp: web_embedded
+    returned 89 audio formats (all with playable URLs, ja included) in ~4s, while
+    web / mweb / tv / tv_simply each returned zero usable formats (GVS PO token,
+    "page needs to be reloaded", bot check). Extra clients only burn IP reputation
+    and the 250s Edge budget. Override with WAVRICK_YT_PLAYER_CLIENT if YouTube
+    changes again.
     """
     raw = os.environ.get("WAVRICK_YT_PLAYER_CLIENT", "").strip()
     primary = _normalize_player_clients(
         [c.strip() for c in raw.split(",") if c.strip()],
         use_cookies=use_cookies,
     )
-    cookies_on = use_cookies and _cookies_enabled()
-    if cookies_on:
-        # Prefer web_embedded / web_safari first. tv_downgraded + cookies often
-        # yields yt-dlp "The page needs to be reloaded." (no formats / SABR).
-        defaults: list[list[str]] = [
-            ["web_embedded", "web"],
-            ["web_safari", "web"],
-            ["web"],
-            ["mweb", "web"],
-            ["tv", "web"],
-            ["tv_downgraded", "web"],
-            ["ios", "web"],
-        ]
-    else:
-        defaults = [
-            ["web_safari"],
-            ["web_embedded", "web"],
-            ["web_safari", "android", "web"],
-            ["android", "web"],
-            ["web"],
-        ]
     if primary:
-        return [primary] + [d for d in defaults if d != primary]
-    return defaults
+        return [primary]
+    return [["web_embedded"]]
 
 
 def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[str]]:
-    """Clients that are most likely to expose multi-language / dubbed audio tracks."""
+    """Language-track probe: same single client as download (see _player_client_attempts)."""
     raw = os.environ.get("WAVRICK_YT_LANG_PLAYER_CLIENT", "").strip()
     if raw:
         primary = _normalize_player_clients(
@@ -449,34 +441,7 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
         )
         if primary:
             return [primary]
-    if _legacy_lightweight_extract():
-        # web_embedded exposes multi-audio when web_safari hits SABR-only (0 audio).
-        preferred = [
-            ["web_embedded"],
-            ["mweb"],
-            ["web_safari"],
-            ["android"],
-        ]
-        if use_cookies and _cookies_enabled():
-            preferred.extend([["web_safari", "web"], ["tv_downgraded"]])
-    elif use_cookies and _cookies_enabled():
-        preferred = [
-            ["tv", "web"],
-            ["tv_downgraded"],
-            ["web_safari", "web"],
-            ["web"],
-            ["mweb", "web"],
-            ["ios", "web"],
-        ]
-    else:
-        # No cookies: minimize probe churn (P4).
-        preferred = [
-            ["web_safari"],
-        ]
-    return [
-        _normalize_player_clients(clients, use_cookies=use_cookies) or clients
-        for clients in preferred
-    ]
+    return [["web_embedded"]]
 
 
 def _needs_full_player_response(clients: list[str]) -> bool:
@@ -590,6 +555,139 @@ def _ydl_options(
             }
         ]
     return opts
+
+
+# --- probe info reuse -------------------------------------------------------
+# probe が返す info には、そのまま再生できる googlevideo URL が入っている。
+# yt-dlp に info を渡し直せば player API を叩かずにダウンロードできるので、
+# ADR の「原音 + ja」でも YouTube への player 接触は 1 回で済む。
+_PROBE_INFO_LOCK = threading.Lock()
+_PROBE_INFO_CACHE: OrderedDict[tuple, dict] = OrderedDict()
+_PROBE_INFO_CACHE_MAX = 8
+
+
+def probe_ctx_key(
+    url: str, clients: list[str] | None, use_cookies: bool, ip_label: str
+) -> tuple:
+    return (
+        url,
+        ",".join(clients or []),
+        bool(use_cookies),
+        str(ip_label or "auto"),
+    )
+
+
+def remember_probe_info(key: tuple, info: dict | None) -> None:
+    if not info:
+        return
+    with _PROBE_INFO_LOCK:
+        _PROBE_INFO_CACHE[key] = info
+        _PROBE_INFO_CACHE.move_to_end(key)
+        while len(_PROBE_INFO_CACHE) > _PROBE_INFO_CACHE_MAX:
+            _PROBE_INFO_CACHE.popitem(last=False)
+
+
+def recall_probe_info(key: tuple) -> dict | None:
+    with _PROBE_INFO_LOCK:
+        return _PROBE_INFO_CACHE.get(key)
+
+
+def download_audio_from_probe_info(
+    url: str,
+    out_dir: str,
+    *,
+    format_id: str,
+    player_clients: list[str] | None,
+    use_cookies: bool,
+    ip_label: str = "auto",
+) -> str:
+    """
+    Download using the info dict the probe already fetched — no second player call.
+
+    Raises when the probe context is unknown, so callers can fall back to the
+    normal (re-extracting) yt-dlp path.
+    """
+    info = recall_probe_info(probe_ctx_key(url, player_clients, use_cookies, ip_label))
+    if not info:
+        raise RuntimeError("PROBE_INFO_MISS: no cached probe info for this context")
+
+    clear_download_proxies()
+    _clear_out_files(out_dir)
+    # With a proxy, force_ipv4/6 applies to the proxy host, not to googlevideo.
+    # Forcing IPv6 at a proxy without an AAAA record just fails the download.
+    ip_kw = (
+        {"force_ipv4": None, "force_ipv6": False}
+        if _yt_proxy()
+        else _download_ip_kwargs(ip_label)
+    )
+    opts = _base_ydl_opts(
+        use_cookies=use_cookies,
+        player_clients=player_clients,
+        force_ipv4=ip_kw["force_ipv4"],
+        force_ipv6=ip_kw["force_ipv6"],
+        format=format_id,
+        outtmpl=os.path.join(out_dir, "out.%(ext)s"),
+        no_warnings=False,
+        nopart=True,
+        retries=3,
+        fragment_retries=5,
+    )
+    if shutil.which("ffmpeg"):
+        opts["postprocessors"] = [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "128",
+            }
+        ]
+
+    info_path = os.path.join(out_dir, "probe-info.json")
+    with open(info_path, "w", encoding="utf-8") as fh:
+        json.dump(yt_dlp.YoutubeDL.sanitize_info(info), fh)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download_with_info_file(info_path)
+    finally:
+        try:
+            os.remove(info_path)
+        except OSError:
+            pass
+
+    files = [p for p in glob.glob(os.path.join(out_dir, "out.*")) if os.path.isfile(p)]
+    if not files:
+        raise RuntimeError("yt-dlp produced no output file from cached probe info")
+    return files[0]
+
+
+def track_source_ctx(
+    track: dict, *, default_clients: list[str]
+) -> tuple[list[str], bool, str]:
+    """(player_clients, use_cookies, ip_label) of the probe that found this track."""
+    clients = [
+        c.strip() for c in str(track.get("sourceClient") or "").split(",") if c.strip()
+    ] or list(default_clients)
+    return clients, bool(track.get("sourceUseCookies")), str(
+        track.get("sourceIpFamily") or "auto"
+    )
+
+
+def download_track_from_probe_info(
+    url: str, out_dir: str, track: dict, *, default_clients: list[str]
+) -> str:
+    fid = str(track.get("formatId") or "").strip()
+    if not fid:
+        raise RuntimeError("PROBE_INFO_MISS: track has no format_id")
+    clients, use_cookies, ip_label = track_source_ctx(
+        track, default_clients=default_clients
+    )
+    return download_audio_from_probe_info(
+        url,
+        out_dir,
+        format_id=fid,
+        player_clients=clients,
+        use_cookies=use_cookies,
+        ip_label=ip_label,
+    )
 
 
 from cors_utils import resolve_cors_origin
@@ -1572,7 +1670,7 @@ def probe_youtube_audio_tracks(
         cookie_modes = (False,)
 
     # Try IPv6 first (legacy caps to auto IP only to limit YouTube churn).
-    if _legacy_lightweight_extract() and want:
+    if _yt_proxy() or (_legacy_lightweight_extract() and want):
         ip_modes = [(False, False, "auto")]
     else:
         ip_modes = [
@@ -1620,6 +1718,9 @@ def probe_youtube_audio_tracks(
                         continue
                     if best_info is None:
                         best_info = info
+                    remember_probe_info(
+                        probe_ctx_key(url, clients, use_cookies, ip_label), info
+                    )
                     tracks = _audio_tracks_from_info(info)
                     for t in tracks:
                         t["sourceClient"] = ",".join(clients)
@@ -1717,7 +1818,7 @@ def probe_youtube_audio_tracks(
     if not merged and _pot_script_ready():
         # Stale Railway cookies often break POT + web_embedded; try without cookies first.
         for use_cookies in (False,):
-            for clients in (["web_embedded"], ["mweb"], ["web_safari"]):
+            for clients in (["web_embedded"],):
                 try:
                     logger.info(
                         "probe POT fallback clients=%s cookies=%s",
@@ -1744,6 +1845,9 @@ def probe_youtube_audio_tracks(
                         continue
                     if best_info is None:
                         best_info = info
+                    remember_probe_info(
+                        probe_ctx_key(url, clients, use_cookies, "auto"), info
+                    )
                     tracks = _audio_tracks_from_info(info)
                     for t in tracks:
                         t["sourceClient"] = ",".join(clients)
@@ -1925,6 +2029,7 @@ def _probe_tracks_single_context(
         info = ydl.extract_info(url, download=False)
     if not info:
         return []
+    remember_probe_info(probe_ctx_key(url, player_clients, use_cookies, ip_label), info)
     tracks = _audio_tracks_from_info(info)
     for t in tracks:
         t["sourceClient"] = ",".join(player_clients)
@@ -2014,31 +2119,69 @@ def _download_youtube_audio_by_language_legacy(
     )
     selected_attempt: str | None = None
 
+    # Path A: reuse the probe's own info dict — no second YouTube player request.
     for t in lang_tracks:
         if not _track_confirms_target_lang(t, target_lang):
             continue
         xt_lang = _track_xtags_lang(t)
         if xt_lang and _normalize_lang_code(xt_lang) != _normalize_lang_code(target_lang):
             continue
-        direct = str(t.get("downloadUrl") or "").strip()
-        if not direct.startswith("http"):
+        if _track_is_hls(t):
             continue
-        if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
-            continue
+        fid = str(t.get("formatId") or "").strip()
         try:
-            _clear_out_files(out_dir)
-            path = _download_direct_media_url(
-                direct,
-                out_dir,
-                ext_hint=str(t.get("ext") or "webm"),
-                http_headers=t.get("httpHeaders") if isinstance(t.get("httpHeaders"), dict) else None,
+            path = download_track_from_probe_info(
+                url, out_dir, t, default_clients=preferred_clients
             )
-            selected_attempt = str(t.get("formatId") or "") or None
-            success_ctx = (preferred_cookies, preferred_clients, preferred_ip)
+            selected_attempt = fid or None
+            clients, ctx_cookies, ctx_ip = track_source_ctx(
+                t, default_clients=preferred_clients
+            )
+            success_ctx = (ctx_cookies, clients, ctx_ip)
+            logger.info(
+                "language audio from cached probe info lang=%s format=%s clients=%s",
+                target_lang,
+                fid,
+                clients,
+            )
             break
         except Exception as exc:
             last_err = exc
             path = ""
+            logger.warning(
+                "cached probe info download failed lang=%s format=%s (%s)",
+                target_lang,
+                fid,
+                exc,
+            )
+
+    # Path A': legacy urllib shortcut. Default OFF (403 / multi-minute stalls).
+    if not path and _direct_download_supported():
+        for t in lang_tracks:
+            if not _track_confirms_target_lang(t, target_lang):
+                continue
+            xt_lang = _track_xtags_lang(t)
+            if xt_lang and _normalize_lang_code(xt_lang) != _normalize_lang_code(target_lang):
+                continue
+            direct = str(t.get("downloadUrl") or "").strip()
+            if not direct.startswith("http"):
+                continue
+            if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
+                continue
+            try:
+                _clear_out_files(out_dir)
+                path = _download_direct_media_url(
+                    direct,
+                    out_dir,
+                    ext_hint=str(t.get("ext") or "webm"),
+                    http_headers=t.get("httpHeaders") if isinstance(t.get("httpHeaders"), dict) else None,
+                )
+                selected_attempt = str(t.get("formatId") or "") or None
+                success_ctx = (preferred_cookies, preferred_clients, preferred_ip)
+                break
+            except Exception as exc:
+                last_err = exc
+                path = ""
 
     for use_cookies in cookie_modes:
         if path:
@@ -2232,33 +2375,20 @@ def download_youtube_audio_by_language(
                 want,
             )
             continue
-        direct = str(t.get("downloadUrl") or "").strip()
-        if not direct.startswith("http"):
-            continue
-        if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
+        if _track_is_hls(t):
             continue
         try:
-            _clear_out_files(out_dir)
-            path = _download_direct_media_url(
-                direct,
-                out_dir,
-                ext_hint=str(t.get("ext") or "webm"),
-                http_headers=t.get("httpHeaders") if isinstance(t.get("httpHeaders"), dict) else None,
+            path = download_track_from_probe_info(
+                url, out_dir, t, default_clients=preferred_clients
             )
             selected_attempt = fid
-            success_ctx = (
-                bool(t.get("sourceUseCookies")),
-                [
-                    c.strip()
-                    for c in str(t.get("sourceClient") or "tv_downgraded").split(",")
-                    if c.strip()
-                ]
-                or preferred_clients,
-                str(t.get("sourceIpFamily") or preferred_ip),
+            clients, ctx_cookies, ctx_ip = track_source_ctx(
+                t, default_clients=preferred_clients
             )
+            success_ctx = (ctx_cookies, clients, ctx_ip)
             assert_tracks = tracks
-            logger.warning(
-                "language audio direct URL succeeded lang=%s format=%s xtags_lang=%s size=%s",
+            logger.info(
+                "language audio from cached probe info lang=%s format=%s xtags_lang=%s size=%s",
                 target_lang,
                 selected_attempt,
                 xt_lang,
@@ -2376,7 +2506,7 @@ def download_youtube_audio_by_language(
                     ip_label,
                 )
 
-                # Prefer direct URL from THIS context (xtags-matched).
+                # Download from THIS context's probe info (xtags-matched).
                 for t in ctx_resolved:
                     if path:
                         break
@@ -2389,26 +2519,17 @@ def download_youtube_audio_by_language(
                             continue
                     elif xt != want:
                         continue
-                    direct = str(t.get("downloadUrl") or "").strip()
-                    if not direct.startswith("http"):
-                        continue
-                    if _track_is_hls(t) or _url_is_hls_or_playlist(direct):
+                    if _track_is_hls(t):
                         continue
                     try:
-                        _clear_out_files(out_dir)
-                        path = _download_direct_media_url(
-                            direct,
-                            out_dir,
-                            ext_hint=str(t.get("ext") or "webm"),
-                            http_headers=t.get("httpHeaders")
-                            if isinstance(t.get("httpHeaders"), dict)
-                            else None,
+                        path = download_track_from_probe_info(
+                            url, out_dir, t, default_clients=clients
                         )
                         selected_attempt = fid
                         success_ctx = (use_cookies, clients, ip_label)
                         assert_tracks = ctx_tracks
-                        logger.warning(
-                            "context direct URL succeeded lang=%s format=%s xtags=%s cookies=%s",
+                        logger.info(
+                            "context probe info download succeeded lang=%s format=%s xtags=%s cookies=%s",
                             want,
                             fid,
                             xt,
@@ -2417,7 +2538,7 @@ def download_youtube_audio_by_language(
                     except Exception as exc:
                         last_err = exc
                         logger.warning(
-                            "context direct URL failed format=%s (%s)",
+                            "context probe info download failed format=%s (%s)",
                             fid,
                             exc,
                         )
@@ -2826,30 +2947,25 @@ def download_youtube_audio_original_track(
         fid = str(t.get("formatId") or "").strip()
         if not fid:
             continue
-        # Prefer direct CDN URL when available (progressive audio only).
-        direct = str(t.get("downloadUrl") or "").strip()
+        clients, use_cookies, ip_label = track_source_ctx(
+            t, default_clients=["web_embedded"]
+        )
         try:
             _clear_out_files(out_dir)
-            if (
-                direct.startswith("http")
-                and not _track_is_hls(t)
-                and not _url_is_hls_or_playlist(direct)
-            ):
-                path = _download_direct_media_url(
-                    direct,
-                    out_dir,
-                    ext_hint=str(t.get("ext") or "webm"),
-                    http_headers=t.get("httpHeaders")
-                    if isinstance(t.get("httpHeaders"), dict)
-                    else None,
+            try:
+                # Reuse the probe's info dict — no second YouTube player request.
+                path = download_track_from_probe_info(
+                    url, out_dir, t, default_clients=["web_embedded"]
                 )
-            else:
-                use_cookies = bool(t.get("sourceUseCookies"))
-                clients = [
-                    c.strip()
-                    for c in str(t.get("sourceClient") or "web_embedded").split(",")
-                    if c.strip()
-                ] or ["web_embedded", "web"]
+                logger.info(
+                    "original audio from cached probe info format=%s clients=%s", fid, clients
+                )
+            except Exception as reuse_err:
+                logger.warning(
+                    "cached probe info download failed format=%s (%s) — re-extracting",
+                    fid,
+                    reuse_err,
+                )
                 path = download_youtube_audio(
                     url,
                     out_dir,
@@ -2889,12 +3005,10 @@ def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, flo
     Returns (path, audio_duration_sec, video_duration_sec).
     """
     expected = youtube_video_duration_sec(url)
+    # Policy: audio-only selectors. Never fall through to video "best" (IP + timeout risk).
     format_attempts = [
         _AUDIO_FORMAT,
         _AUDIO_FORMAT_FALLBACK,
-        _AUDIO_FORMAT_ANY,
-        _AUDIO_FORMAT_MUX,
-        _AUDIO_FORMAT_BEST,
         _AUDIO_FORMAT_LAST_RESORT,
     ]
 
@@ -3536,6 +3650,8 @@ def health():
             "ytProxyConfigured": bool(_yt_proxy()),
             "ytProxy": _yt_proxy_label() or None,
             "ytProxyDirectDownload": _direct_download_supported(),
+            "probeInfoReuse": True,
+            "playerClients": _player_client_attempts()[0],
             "ytDlpVersion": yt_dlp.version.__version__,
             "imageBuiltAt": _image_built_at() or None,
             "nodePath": shutil.which("node"),

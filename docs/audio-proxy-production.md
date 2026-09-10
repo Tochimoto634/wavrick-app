@@ -88,6 +88,71 @@ socks では同じプロキシを通せません。socks を指定した場合�
 - **キャッシュ:** 同一動画は Supabase `youtube_audio_cache` に 30 日残り、
   ユーザー横断で再利用されます。キャッシュヒット時は YouTube に一切触りません。
 
+## 2-c. YouTube 接触方針（必須）
+
+Wavrick は「通すためなら何度でも試す」ではなく、**接触を抑えて通す**を方針にします。
+
+1. **player_client は `web_embedded` 1つだけ** — 総当たりしない。
+2. **probe は 1 回だけ。その info を使い回してダウンロードする** — ADR の
+   「原音 + ja」でも YouTube の player API 接触は合計 1 回。
+3. **format は probe が返した `format_id` を直接指定** — `bestaudio…/best` の
+   カスケードに落とさない（`best` は映像込みで重い）。
+4. **キャッシュを本線にする** — 同一 `video_id` + 言語トラックは Storage 再利用。
+5. **再試行を前提にする** — ADR で片方だけ成功した場合、再試行は未取得側だけになり
+   YouTube 接触が減る。タイムアウト文言でも再試行を案内する。
+6. **タイムアウト延長や深追い総当たりで粘らない** — IP 評判悪化・250秒切れの元凶になる。
+
+### 実測（2026-09-10 / 住宅 IP 出口 / yt-dlp 2026.08.30 pin / 8分47秒の動画）
+
+player_client 別 probe:
+
+| client | 所要 | URL 付き音声形式 | ja |
+|---|---|---|---|
+| `web_embedded` | 4.0s | **89** | あり |
+| `web` | 2.7s | 0（GVS PO Token / Visitor Data 不足） | なし |
+| `tv` | 1.5s | 0（page needs to be reloaded） | なし |
+| `tv_simply` | 1.4s | 0（bot 判定） | なし |
+| `mweb` | 3.3s | 0（PO Token 必須） | なし |
+
+ダウンロード方式別:
+
+| 方式 | 所要 | 結果 |
+|---|---|---|
+| yt-dlp（トラックごとに再抽出） | 8.3〜9.0s | 成功 |
+| yt-dlp（probe の info を再利用） | **0.7〜1.3s** | 成功 |
+| urllib で直 googlevideo URL | 255s 無応答→0バイト / 403 | **失敗** |
+
+直 URL の近道は **既定 OFF**（`WAVRICK_YT_DIRECT_URL=1` で比較用に復活）。
+250 秒 PROXY_TIMEOUT の主因はこの経路でした。
+
+### 等価な yt-dlp コマンド
+
+```bash
+# 1. probe（YouTube への player 接触はこの 1 回だけ）
+yt-dlp -J --skip-download \
+  --proxy "$WAVRICK_YT_PROXY" --no-playlist --socket-timeout 90 \
+  --extractor-args "youtube:player_client=web_embedded;player_skip=webpage" \
+  "https://www.youtube.com/watch?v=<id>" > info.json
+
+# 2. トラックごとに info.json から取得（YouTube に再接触しない）
+yt-dlp --load-info-json info.json \
+  --proxy "$WAVRICK_YT_PROXY" --no-playlist --socket-timeout 90 \
+  --retries 3 --fragment-retries 5 --nopart \
+  -f 140-9 \
+  -x --audio-format mp3 --audio-quality 128 -o "out.%(ext)s"
+```
+
+プロキシ利用時は `--force-ipv4` / `--force-ipv6` を **付けない**。IP ファミリの指定は
+googlevideo ではなくプロキシホストへの接続に効くため、AAAA を持たないプロキシでは
+ダウンロードごと失敗します。
+
+上書きが必要なときだけ:
+
+```env
+WAVRICK_YT_PLAYER_CLIENT=web_embedded
+WAVRICK_YT_LANG_PLAYER_CLIENT=web_embedded
+```
+
 ### Cookies（非推奨・任意）
 
 **本番では運営 Google アカウントの cookies 共有（`WAVRICK_YT_COOKIES_B64`）は使わないでください。**
