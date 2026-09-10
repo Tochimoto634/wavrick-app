@@ -581,11 +581,12 @@ async function fetchProxyAudioToStorageCached(
       lastErr = e instanceof Error ? e : new Error(String(e));
       const code = classifyYouTubeExtractError(lastErr.message);
       const msg = lastErr.message.toLowerCase();
+      // Bot / IP block: never hammer YouTube again from Edge.
       const retryable =
-        code === "YT_EXTRACT_BLOCKED" ||
-        code === "RATE_LIMIT" ||
-        code === "BUSY" ||
-        /page needs to be reloaded|fetch_failed|502/.test(msg);
+        code !== "YT_EXTRACT_BLOCKED" &&
+        (code === "RATE_LIMIT" ||
+          code === "BUSY" ||
+          /page needs to be reloaded|fetch_failed|502/.test(msg));
       if (retryable && attempt === 0) continue;
       await logYouTubeExtractEvent(admin, {
         userId: audit?.userId,
@@ -3187,7 +3188,19 @@ Deno.serve(async (req) => {
           if (dubErr) throw dubErr;
           throw origErr;
         }
-        if (dubErr) throw dubErr;
+        if (dubErr) {
+          const dubMsg = dubErr instanceof Error ? dubErr.message : String(dubErr);
+          if (
+            originalExtracted?.publicUrl &&
+            (/音声プロキシがタイムアウト|PROXY_TIMEOUT|timed\s*out|timeout/i.test(dubMsg))
+          ) {
+            throw new Error(
+              `${dubMsg} ` +
+                `原音は取得済みの可能性があります。同じ URL で再試行すると吹替のみの取得になり、成功しやすいです。`
+            );
+          }
+          throw dubErr;
+        }
         if (!extracted) {
           throw new Error("吹替音声の抽出に失敗しました。");
         }

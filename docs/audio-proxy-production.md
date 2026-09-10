@@ -88,6 +88,24 @@ socks では同じプロキシを通せません。socks を指定した場合�
 - **キャッシュ:** 同一動画は Supabase `youtube_audio_cache` に 30 日残り、
   ユーザー横断で再利用されます。キャッシュヒット時は YouTube に一切触りません。
 
+## 2-c. YouTube 接触方針（必須）
+
+Wavrick は「通すためなら何度でも試す」ではなく、**接触を抑えて通す**を方針にします。
+
+1. **総当たりを減らす** — player_client は `web_embedded` / `web` 中心。format は軽い
+   bestaudio 系のみ（映像寄りの `best` / `ba/b/w` へ落とさない）。
+2. **キャッシュを本線にする** — 同一 `video_id` + 言語トラックは Storage 再利用。
+3. **再試行を前提にする** — ADR で片方だけ成功した場合、再試行は未取得側だけになり
+   YouTube 接触が減る。タイムアウト文言でも再試行を案内する。
+4. **タイムアウト延長や深追い総当たりで粘らない** — IP 評判悪化・250秒切れの元凶になる。
+
+上書きが必要なときだけ:
+
+```env
+WAVRICK_YT_PLAYER_CLIENT=web_embedded,web
+WAVRICK_YT_LANG_PLAYER_CLIENT=web_embedded
+```
+
 ### Cookies（非推奨・任意）
 
 **本番では運営 Google アカウントの cookies 共有（`WAVRICK_YT_COOKIES_B64`）は使わないでください。**

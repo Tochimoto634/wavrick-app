@@ -27,7 +27,8 @@ export function proxyTimeoutUserMessage(timeoutMs = PROXY_EXTRACT_TIMEOUT_MS): s
   return (
     `音声プロキシがタイムアウトしました（${sec}秒）。` +
     `混雑しているか、動画の取得に時間がかかっています。` +
-    `少し待って再試行するか、音声ファイルをアップロードしてください。`
+    `少し待って再試行してください（取得済みトラックはキャッシュされ、再試行時は YouTube 接触が減ります）。` +
+    `急ぐ場合は音声ファイルをアップロードしてください。`
   );
 }
 

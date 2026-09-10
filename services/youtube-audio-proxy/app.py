@@ -80,7 +80,7 @@ _VIDEO_FORMAT_720P = (
 )
 _VIDEO_FORMAT_720P_FALLBACK = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b"
 # health の extractBuild と揃える（Railway で新コードが載ったか確認用）
-_EXTRACT_BUILD = 42
+_EXTRACT_BUILD = 46
 
 
 def _pot_provider_enabled() -> bool:
@@ -405,42 +405,26 @@ def _normalize_player_clients(clients: list[str], *, use_cookies: bool) -> list[
 
 def _player_client_attempts(*, use_cookies: bool = False) -> list[list[str]]:
     """
-    No-cookie production default: web_safari first, minimal client fan-out.
-    Opt-in cookies (WAVRICK_YT_USE_COOKIES=1) keeps legacy multi-client fallbacks.
+    Wavrick policy: few high-yield clients only (avoid YouTube probe storms).
+    Override with WAVRICK_YT_PLAYER_CLIENT=client1,client2 if needed.
     """
     raw = os.environ.get("WAVRICK_YT_PLAYER_CLIENT", "").strip()
     primary = _normalize_player_clients(
         [c.strip() for c in raw.split(",") if c.strip()],
         use_cookies=use_cookies,
     )
-    cookies_on = use_cookies and _cookies_enabled()
-    if cookies_on:
-        # Prefer web_embedded / web_safari first. tv_downgraded + cookies often
-        # yields yt-dlp "The page needs to be reloaded." (no formats / SABR).
-        defaults: list[list[str]] = [
-            ["web_embedded", "web"],
-            ["web_safari", "web"],
-            ["web"],
-            ["mweb", "web"],
-            ["tv", "web"],
-            ["tv_downgraded", "web"],
-            ["ios", "web"],
-        ]
-    else:
-        defaults = [
-            ["web_safari"],
-            ["web_embedded", "web"],
-            ["web_safari", "android", "web"],
-            ["android", "web"],
-            ["web"],
-        ]
+    # Empirically web_embedded exposes audio; deep fan-out burns IP reputation.
+    defaults: list[list[str]] = [
+        ["web_embedded", "web"],
+        ["web"],
+    ]
     if primary:
         return [primary] + [d for d in defaults if d != primary]
     return defaults
 
 
 def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[str]]:
-    """Clients that are most likely to expose multi-language / dubbed audio tracks."""
+    """Language-track probe: same short list as download (policy: low YouTube contact)."""
     raw = os.environ.get("WAVRICK_YT_LANG_PLAYER_CLIENT", "").strip()
     if raw:
         primary = _normalize_player_clients(
@@ -449,33 +433,9 @@ def _language_probe_client_attempts(*, use_cookies: bool = False) -> list[list[s
         )
         if primary:
             return [primary]
-    if _legacy_lightweight_extract():
-        # web_embedded exposes multi-audio when web_safari hits SABR-only (0 audio).
-        preferred = [
-            ["web_embedded"],
-            ["mweb"],
-            ["web_safari"],
-            ["android"],
-        ]
-        if use_cookies and _cookies_enabled():
-            preferred.extend([["web_safari", "web"], ["tv_downgraded"]])
-    elif use_cookies and _cookies_enabled():
-        preferred = [
-            ["tv", "web"],
-            ["tv_downgraded"],
-            ["web_safari", "web"],
-            ["web"],
-            ["mweb", "web"],
-            ["ios", "web"],
-        ]
-    else:
-        # No cookies: minimize probe churn (P4).
-        preferred = [
-            ["web_safari"],
-        ]
     return [
-        _normalize_player_clients(clients, use_cookies=use_cookies) or clients
-        for clients in preferred
+        ["web_embedded"],
+        ["web"],
     ]
 
 
@@ -1715,7 +1675,7 @@ def probe_youtube_audio_tracks(
     if not merged and _pot_script_ready():
         # Stale Railway cookies often break POT + web_embedded; try without cookies first.
         for use_cookies in (False,):
-            for clients in (["web_embedded"], ["mweb"], ["web_safari"]):
+            for clients in (["web_embedded"], ["web"]):
                 try:
                     logger.info(
                         "probe POT fallback clients=%s cookies=%s",
@@ -2892,12 +2852,10 @@ def download_youtube_audio_full_length(url: str, out_dir: str) -> tuple[str, flo
     Returns (path, audio_duration_sec, video_duration_sec).
     """
     expected = youtube_video_duration_sec(url)
+    # Policy: audio-only selectors. Never fall through to video "best" (IP + timeout risk).
     format_attempts = [
         _AUDIO_FORMAT,
         _AUDIO_FORMAT_FALLBACK,
-        _AUDIO_FORMAT_ANY,
-        _AUDIO_FORMAT_MUX,
-        _AUDIO_FORMAT_BEST,
         _AUDIO_FORMAT_LAST_RESORT,
     ]
 
